@@ -4,9 +4,9 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260718-6') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260719-03') }}">
   </head>
-  <body>
+  <body class="theme-dark">
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark">T</div>
@@ -27,10 +27,17 @@
         </button>
       </nav>
 
-      <button id="shutdown-button" class="shutdown-button" type="button">
-        <span class="nav-icon">⏻</span>
-        <span>退出系统</span>
-      </button>
+      <div class="sidebar-actions">
+        <button id="theme-toggle" class="sidebar-icon-button" type="button" title="切换夜间模式" aria-label="切换夜间模式">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.5 6.5 0 0 0 9.8 9.8z" />
+          </svg>
+        </button>
+        <button id="shutdown-button" class="shutdown-button" type="button">
+          <span class="nav-icon">⏻</span>
+          <span>退出系统</span>
+        </button>
+      </div>
     </aside>
 
     <main class="workspace">
@@ -45,18 +52,41 @@
         <header class="page-header">
           <div>
             <h2>查看行情</h2>
-            <p id="market-subtitle">最近一年日线 OHLCV</p>
+            <p id="market-subtitle">2020年以来行情数据</p>
           </div>
           <form id="symbol-form" class="search-bar">
-            <input id="symbol-input" type="text" value="SPY" autocomplete="off" spellcheck="false" aria-label="股票代码">
+            <input id="symbol-input" type="text" placeholder="输入代码" autocomplete="off" spellcheck="false" aria-label="股票代码">
             <button type="submit">查询</button>
           </form>
         </header>
 
         <div id="market-status" class="status neutral">准备就绪</div>
-        <section class="panel chart-panel">
+        <section id="market-overview-panel" class="panel overview-panel">
           <div class="panel-title">
-            <h3 id="chart-title">SPY 日线行情</h3>
+            <h3>行情总览</h3>
+            <span id="overview-summary">加载中</span>
+          </div>
+          <div class="overview-table-wrap">
+            <table id="overview-table" class="overview-table"></table>
+          </div>
+          <div id="overview-pagination" class="overview-pagination" hidden>
+            <button id="overview-prev" type="button">上一页</button>
+            <span id="overview-page-text">第 1 页 / 共 1 页</span>
+            <button id="overview-next" type="button">下一页</button>
+          </div>
+        </section>
+
+        <section id="market-detail-panel" class="panel chart-panel" hidden>
+          <div class="panel-title">
+            <div class="detail-title">
+              <button id="back-to-overview" class="tool-icon-button" type="button" title="返回总览" aria-label="返回总览">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M19 12H5" />
+                  <path d="M12 19l-7-7 7-7" />
+                </svg>
+              </button>
+              <h3 id="chart-title">行情详情</h3>
+            </div>
             <div class="chart-actions">
               <div class="period-switch" aria-label="K线周期">
                 <button class="period-button active" type="button" data-period="1D">日K</button>
@@ -64,7 +94,29 @@
                 <button class="period-button" type="button" data-period="1W">周K</button>
                 <button class="period-button" type="button" data-period="1M">月K</button>
               </div>
-              <button id="indicator-panel-toggle" class="subtle-button" type="button">指标</button>
+              <button id="indicator-panel-toggle" class="tool-icon-button" type="button" title="指标" aria-label="指标">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 14a8 8 0 0 1 16 0" />
+                  <path d="M12 14l4-5" />
+                  <path d="M5 18h14" />
+                  <path d="M7 14h.01" />
+                  <path d="M17 14h.01" />
+                </svg>
+              </button>
+              <button id="update-data-button" class="tool-icon-button" type="button" title="更新数据" aria-label="更新数据">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M21 12a9 9 0 0 1-15.2 6.5" />
+                  <path d="M3 12A9 9 0 0 1 18.2 5.5" />
+                  <path d="M18 2v4h-4" />
+                  <path d="M6 22v-4h4" />
+                </svg>
+              </button>
+              <button id="symbol-settings-toggle" class="tool-icon-button" type="button" title="设置" aria-label="设置">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z" />
+                  <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 0 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 0 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8 1.7 1.7 0 0 0 1.5 1h.2a2 2 0 0 1 0 4h-.2a1.7 1.7 0 0 0-1.4 1z" />
+                </svg>
+              </button>
               <span id="chart-source">等待查询</span>
             </div>
           </div>
@@ -98,6 +150,17 @@
             </form>
           </section>
         </aside>
+
+        <aside id="symbol-settings-panel" class="symbol-settings-panel" hidden>
+          <div class="indicator-panel-header">
+            <h3>标的设置</h3>
+            <button id="symbol-settings-close" class="icon-button" type="button" aria-label="关闭标的设置">×</button>
+          </div>
+          <label class="setting-row">
+            <input id="show-weekend-data" type="checkbox" checked>
+            <span>显示周末 K 线</span>
+          </label>
+        </aside>
       </section>
 
       <section id="database-view" class="view">
@@ -118,6 +181,11 @@
         <section class="panel table-panel">
           <div class="table-toolbar">
             <span id="table-summary">请选择数据表</span>
+            <form id="db-search-form" class="db-search">
+              <input id="db-search-input" type="search" placeholder="搜索当前表" autocomplete="off">
+              <button id="db-search-button" type="submit">搜索</button>
+              <button id="db-search-clear" type="button">清空</button>
+            </form>
             <div class="pagination">
               <button id="prev-page" type="button">上一页</button>
               <label>
@@ -137,8 +205,8 @@
       </section>
     </main>
 
-    <script src="{{ url_for('static', filename='js/chart.js', v='20260718-7') }}"></script>
-    <script src="{{ url_for('static', filename='js/database_browser.js', v='20260718-7') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260718-7') }}"></script>
+    <script src="{{ url_for('static', filename='js/chart.js', v='20260719-03') }}"></script>
+    <script src="{{ url_for('static', filename='js/database_browser.js', v='20260719-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260719-03') }}"></script>
   </body>
 </html>

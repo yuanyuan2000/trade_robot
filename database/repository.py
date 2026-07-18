@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import math
 import sqlite3
@@ -42,10 +42,14 @@ def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
     metadata = metadata or {}
     now = utc_now_iso()
     with get_connection() as conn:
+        next_order = conn.execute(
+            "SELECT COALESCE(MAX(display_order), 0) + 1 AS next_order FROM symbols"
+        ).fetchone()["next_order"]
         conn.execute(
             """
-            INSERT INTO symbols (symbol, name, exchange_name, currency, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO symbols
+                (symbol, name, exchange_name, currency, show_weekend_data, display_order, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 name = COALESCE(excluded.name, symbols.name),
                 exchange_name = COALESCE(excluded.exchange_name, symbols.exchange_name),
@@ -57,6 +61,7 @@ def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
                 metadata.get("name"),
                 metadata.get("exchange"),
                 metadata.get("currency"),
+                next_order,
                 now,
                 now,
             ),
@@ -94,6 +99,166 @@ def ensure_symbol_chart_views(symbol: str) -> list[dict]:
                 ),
             )
     return list_symbol_chart_views(symbol)
+
+
+def get_symbol(symbol: str) -> dict:
+    symbol_id = upsert_symbol(symbol)
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, symbol, name, exchange_name, currency, show_weekend_data, created_at, updated_at
+            FROM symbols
+            WHERE id = ?
+            """,
+            (symbol_id,),
+        ).fetchone()
+    data = dict(row)
+    data["show_weekend_data"] = bool(data["show_weekend_data"])
+    return data
+
+
+def get_symbol_price_snapshot(symbol: str) -> dict:
+    year_start = f"{date.today().year}-01-01"
+    with get_connection() as conn:
+        latest_rows = conn.execute(
+            """
+            SELECT date, open, high, low, close, volume
+            FROM daily_prices
+            WHERE symbol = ?
+            ORDER BY date DESC
+            LIMIT 2
+            """,
+            (symbol,),
+        ).fetchall()
+        ytd_row = conn.execute(
+            """
+            SELECT date, close
+            FROM daily_prices
+            WHERE symbol = ? AND date >= ?
+            ORDER BY date ASC
+            LIMIT 1
+            """,
+            (symbol, year_start),
+        ).fetchone()
+
+    latest = dict(latest_rows[0]) if latest_rows else None
+    previous = dict(latest_rows[1]) if len(latest_rows) > 1 else None
+    latest_price = latest["close"] if latest else None
+    previous_close = previous["close"] if previous else None
+    daily_change = None
+    daily_change_percent = None
+    if latest_price is not None and previous_close not in {None, 0}:
+        daily_change = latest_price - previous_close
+        daily_change_percent = daily_change / previous_close * 100
+
+    ytd_base = ytd_row["close"] if ytd_row else None
+    ytd_percent = None
+    if latest_price is not None and ytd_base not in {None, 0}:
+        ytd_percent = (latest_price - ytd_base) / ytd_base * 100
+
+    return {
+        "latest_date": latest["date"] if latest else None,
+        "latest_price": latest_price,
+        "previous_close": previous_close,
+        "daily_change": daily_change,
+        "daily_change_percent": daily_change_percent,
+        "ytd_base_date": ytd_row["date"] if ytd_row else None,
+        "ytd_base_price": ytd_base,
+        "ytd_percent": ytd_percent,
+    }
+
+
+def list_market_overview(page: int = 1, page_size: int = 100) -> dict:
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+    with get_connection() as conn:
+        total_rows = conn.execute("SELECT COUNT(*) AS count FROM symbols").fetchone()["count"]
+        total_pages = max(1, math.ceil(total_rows / page_size))
+        page = min(page, total_pages)
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            """
+            SELECT id, symbol, name, display_order, updated_at
+            FROM symbols
+            ORDER BY display_order ASC, id ASC
+            LIMIT ? OFFSET ?
+            """,
+            (page_size, offset),
+        ).fetchall()
+
+    items = []
+    for row in rows:
+        item = dict(row)
+        item.update(get_symbol_price_snapshot(item["symbol"]))
+        items.append(item)
+
+    return {
+        "items": items,
+        "page": page,
+        "page_size": page_size,
+        "total_rows": total_rows,
+        "total_pages": total_pages,
+    }
+
+
+def update_symbol_display_order(symbols: list[str]) -> dict:
+    normalized_symbols = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
+    if not normalized_symbols:
+        return list_market_overview()
+
+    now = utc_now_iso()
+    with get_connection() as conn:
+        current_rows = conn.execute(
+            """
+            SELECT symbol
+            FROM symbols
+            ORDER BY display_order ASC, id ASC
+            """
+        ).fetchall()
+        current_symbols = [row["symbol"] for row in current_rows]
+        known_order = [symbol for symbol in normalized_symbols if symbol in current_symbols]
+        if not known_order:
+            return list_market_overview()
+
+        current_indexes = [current_symbols.index(symbol) for symbol in known_order]
+        insert_at = min(current_indexes)
+        remaining_symbols = [symbol for symbol in current_symbols if symbol not in set(known_order)]
+        next_symbols = [
+            *remaining_symbols[:insert_at],
+            *known_order,
+            *remaining_symbols[insert_at:],
+        ]
+
+        for index, symbol in enumerate(next_symbols, start=1):
+            conn.execute(
+                """
+                UPDATE symbols
+                SET display_order = ?, updated_at = ?
+                WHERE symbol = ?
+                """,
+                (index, now, symbol),
+            )
+
+    return list_market_overview()
+
+
+def update_symbol_settings(symbol: str, payload: dict) -> dict:
+    symbol_id = upsert_symbol(symbol)
+    allowed: dict[str, object] = {}
+    if "show_weekend_data" in payload:
+        allowed["show_weekend_data"] = 1 if bool(payload["show_weekend_data"]) else 0
+
+    if allowed:
+        allowed["updated_at"] = utc_now_iso()
+        set_clause = ", ".join(f"{key} = ?" for key in allowed)
+        values = list(allowed.values()) + [symbol_id]
+        with get_connection() as conn:
+            conn.execute(
+                f"UPDATE symbols SET {set_clause} WHERE id = ?",
+                values,
+            )
+
+    return get_symbol(symbol)
 
 
 def get_chart_view(symbol: str, view_code: str) -> dict:
@@ -440,6 +605,7 @@ def upsert_daily_prices(symbol: str, rows: list[dict]) -> int:
             row["close"],
             row.get("volume", 0),
             now,
+            now,
         )
         for row in rows
     ]
@@ -447,14 +613,15 @@ def upsert_daily_prices(symbol: str, rows: list[dict]) -> int:
         conn.executemany(
             """
             INSERT INTO daily_prices
-                (symbol, date, open, high, low, close, volume, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (symbol, date, open, high, low, close, volume, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol, date) DO UPDATE SET
                 open = excluded.open,
                 high = excluded.high,
                 low = excluded.low,
                 close = excluded.close,
-                volume = excluded.volume
+                volume = excluded.volume,
+                updated_at = excluded.updated_at
             """,
             payload,
         )
@@ -486,6 +653,28 @@ def get_symbol_date_bounds(symbol: str) -> dict | None:
         row = conn.execute(
             """
             SELECT MIN(date) AS min_date, MAX(date) AS max_date, COUNT(*) AS row_count
+            FROM daily_prices
+            WHERE symbol = ?
+            """,
+            (symbol,),
+        ).fetchone()
+    if not row or row["row_count"] == 0:
+        return None
+    return dict(row)
+
+
+def get_symbol_history_coverage(symbol: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                MIN(date) AS min_date,
+                MAX(CASE
+                    WHEN date(COALESCE(updated_at, created_at)) = date THEN NULL
+                    ELSE date
+                END) AS max_complete_date,
+                MAX(date) AS max_date,
+                COUNT(*) AS row_count
             FROM daily_prices
             WHERE symbol = ?
             """,
@@ -528,31 +717,49 @@ def list_tables() -> list[str]:
     return [row["name"] for row in rows]
 
 
-def get_table_page(table_name: str, page: int, page_size: int) -> dict:
+def quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def get_table_page(table_name: str, page: int, page_size: int, search: str = "") -> dict:
     allowed_tables = set(list_tables())
     if table_name not in allowed_tables:
         raise ValueError("Unknown table")
 
     page = max(1, page)
     page_size = min(max(1, page_size), MAX_DB_PAGE_SIZE)
+    search = search.strip()
     with get_connection() as conn:
-        total_rows = conn.execute(f'SELECT COUNT(*) AS count FROM "{table_name}"').fetchone()[
-            "count"
+        columns = [
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({quote_identifier(table_name)})").fetchall()
         ]
+
+        where = ""
+        query_params: list[str | int] = []
+        if search:
+            predicates = [
+                f"CAST({quote_identifier(column)} AS TEXT) LIKE ?"
+                for column in columns
+            ]
+            where = "WHERE " + " OR ".join(predicates)
+            query_params.extend([f"%{search}%"] * len(columns))
+
+        total_rows = conn.execute(
+            f"SELECT COUNT(*) AS count FROM {quote_identifier(table_name)} {where}",
+            query_params,
+        ).fetchone()["count"]
         total_pages = max(1, math.ceil(total_rows / page_size))
         page = min(page, total_pages)
         offset = (page - 1) * page_size
-        columns = [
-            row["name"]
-            for row in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
-        ]
         rows = conn.execute(
-            f'SELECT * FROM "{table_name}" LIMIT ? OFFSET ?',
-            (page_size, offset),
+            f"SELECT * FROM {quote_identifier(table_name)} {where} LIMIT ? OFFSET ?",
+            [*query_params, page_size, offset],
         ).fetchall()
 
     return {
         "table": table_name,
+        "search": search,
         "page": page,
         "page_size": page_size,
         "total_rows": total_rows,

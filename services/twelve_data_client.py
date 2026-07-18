@@ -7,6 +7,7 @@ import requests
 
 from config import (
     API_OUTPUT_SIZE,
+    FULL_HISTORY_OUTPUT_SIZE,
     MARKET_INTERVAL,
     REQUEST_TIMEOUT_SECONDS,
     TWELVEDATA_API_KEY,
@@ -44,16 +45,22 @@ def _raise_for_twelve_data_error(payload: dict) -> None:
     raise InvalidResponseError(detail=message or str(payload)[:300])
 
 
-def fetch_daily_prices(symbol: str, lookback_days: int) -> list[dict]:
+def fetch_daily_prices(
+    symbol: str,
+    lookback_days: int | None = None,
+    start_date: date | None = None,
+) -> list[dict]:
     if not TWELVEDATA_API_KEY:
         raise MissingApiKeyError()
 
     params = {
         "symbol": symbol,
         "interval": MARKET_INTERVAL,
-        "outputsize": API_OUTPUT_SIZE,
+        "outputsize": FULL_HISTORY_OUTPUT_SIZE if start_date else API_OUTPUT_SIZE,
         "apikey": TWELVEDATA_API_KEY,
     }
+    if start_date:
+        params["start_date"] = start_date.isoformat()
 
     try:
         response = requests.get(
@@ -104,8 +111,11 @@ def fetch_daily_prices(symbol: str, lookback_days: int) -> list[dict]:
             df[column] = pd.to_numeric(df[column], errors="coerce")
 
         df["date"] = pd.to_datetime(df["date"]).dt.date
-        start = date.today() - timedelta(days=lookback_days)
-        df = df[df["date"] >= start]
+        if start_date:
+            df = df[df["date"] >= start_date]
+        elif lookback_days is not None:
+            start = date.today() - timedelta(days=lookback_days)
+            df = df[df["date"] >= start]
         df = df.dropna(subset=["open", "high", "low", "close"])
         df = df.sort_values("date")
     except DataParseError:

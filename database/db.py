@@ -18,9 +18,59 @@ def init_database() -> None:
     schema = Path(SCHEMA_PATH).read_text(encoding="utf-8")
     with get_connection() as conn:
         conn.executescript(schema)
+        migrate_database(conn)
     from database.repository import seed_default_indicators
 
     seed_default_indicators()
+
+
+def migrate_database(conn: sqlite3.Connection) -> None:
+    ensure_column(
+        conn,
+        table_name="symbols",
+        column_name="show_weekend_data",
+        definition="INTEGER NOT NULL DEFAULT 1",
+    )
+    ensure_column(
+        conn,
+        table_name="symbols",
+        column_name="display_order",
+        definition="INTEGER NOT NULL DEFAULT 0",
+    )
+    conn.execute(
+        """
+        UPDATE symbols
+        SET display_order = id
+        WHERE display_order IS NULL OR display_order = 0
+        """
+    )
+    ensure_column(
+        conn,
+        table_name="daily_prices",
+        column_name="updated_at",
+        definition="TEXT",
+    )
+    conn.execute(
+        """
+        UPDATE daily_prices
+        SET updated_at = created_at
+        WHERE updated_at IS NULL OR updated_at = ''
+        """
+    )
+
+
+def ensure_column(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    definition: str,
+) -> None:
+    columns = {
+        row["name"]
+        for row in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+    }
+    if column_name not in columns:
+        conn.execute(f'ALTER TABLE "{table_name}" ADD COLUMN {column_name} {definition}')
 
 
 def backup_database() -> Path:

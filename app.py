@@ -24,7 +24,7 @@ from config import (
 from database.db import backup_database, init_database
 from database import repository
 from services.api_errors import MarketDataError
-from services.market_data_service import get_market_data
+from services.market_data_service import get_market_data, update_full_market_data
 
 
 app = Flask(__name__)
@@ -50,8 +50,17 @@ def index():
     return render_template("index.html", app_name=APP_NAME)
 
 
-@app.route("/api/market-data/<symbol>")
+@app.route("/api/market-data")
+def market_data_query():
+    return market_data_response(request.args.get("symbol", ""))
+
+
+@app.route("/api/market-data/<path:symbol>")
 def market_data(symbol: str):
+    return market_data_response(symbol)
+
+
+def market_data_response(symbol: str):
     try:
         return jsonify(get_market_data(symbol))
     except ValueError as exc:
@@ -87,6 +96,114 @@ def market_data(symbol: str):
         )
 
 
+@app.route("/api/market-data/update", methods=["POST"])
+def update_market_data():
+    payload = request.get_json(silent=True) or {}
+    symbol = payload.get("symbol") or request.args.get("symbol", "")
+    try:
+        return jsonify(update_full_market_data(symbol))
+    except ValueError as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "INVALID_INPUT",
+                        "message": str(exc),
+                        "detail": None,
+                    },
+                }
+            ),
+            400,
+        )
+    except MarketDataError as exc:
+        repository.log_api_request(
+            provider="twelvedata",
+            status="error",
+            symbol=symbol.strip().upper(),
+            error_code=exc.code,
+            message=exc.detail or exc.message,
+        )
+        return jsonify({"ok": False, "error": exc.to_dict()}), 502
+    except Exception as exc:
+        app.logger.exception("Unexpected market data update error")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "UNKNOWN_ERROR",
+                        "message": "系统更新行情数据时发生未知错误。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            500,
+        )
+
+
+@app.route("/api/market-overview")
+def market_overview():
+    try:
+        page = int(request.args.get("page", "1"))
+        page_size = int(request.args.get("page_size", "100"))
+        return jsonify({"ok": True, **repository.list_market_overview(page, page_size)})
+    except Exception as exc:
+        app.logger.exception("Unexpected market overview error")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "UNKNOWN_ERROR",
+                        "message": "系统读取行情总览时发生未知错误。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            500,
+        )
+
+
+@app.route("/api/market-overview/order", methods=["PATCH"])
+def market_overview_order():
+    payload = request.get_json(silent=True) or {}
+    try:
+        symbols = payload.get("symbols") or []
+        if not isinstance(symbols, list):
+            raise ValueError("symbols must be a list")
+        return jsonify({"ok": True, **repository.update_symbol_display_order(symbols)})
+    except ValueError as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "INVALID_ORDER",
+                        "message": "行情总览排序请求无效。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            400,
+        )
+    except Exception as exc:
+        app.logger.exception("Unexpected market overview order error")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "UNKNOWN_ERROR",
+                        "message": "系统保存行情总览排序时发生未知错误。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            500,
+        )
+
+
 @app.route("/api/db/tables")
 def db_tables():
     return jsonify({"ok": True, "tables": repository.list_tables()})
@@ -97,7 +214,8 @@ def db_table(table_name: str):
     try:
         page = int(request.args.get("page", "1"))
         page_size = int(request.args.get("page_size", str(MAX_DB_PAGE_SIZE)))
-        return jsonify({"ok": True, **repository.get_table_page(table_name, page, page_size)})
+        search = request.args.get("search", "")
+        return jsonify({"ok": True, **repository.get_table_page(table_name, page, page_size, search)})
     except ValueError as exc:
         return (
             jsonify(
@@ -175,13 +293,24 @@ def patch_indicator(indicator_id: int):
         return jsonify({"ok": False, "error": {"code": "INVALID_INDICATOR", "message": str(exc)}}), 400
 
 
-@app.route("/api/symbols/<symbol>/chart-views")
+@app.route("/api/symbols/<path:symbol>/chart-views")
 def symbol_chart_views(symbol: str):
     normalized = symbol.strip().upper()
     return jsonify({"ok": True, "views": repository.ensure_symbol_chart_views(normalized)})
 
 
-@app.route("/api/symbols/<symbol>/chart-views/<view_code>/indicators")
+@app.route("/api/symbols/<path:symbol>/settings", methods=["PATCH"])
+def patch_symbol_settings(symbol: str):
+    payload = request.get_json(silent=True) or {}
+    try:
+        normalized = symbol.strip().upper()
+        settings = repository.update_symbol_settings(normalized, payload)
+        return jsonify({"ok": True, "symbol_settings": settings})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": {"code": "INVALID_SYMBOL_SETTINGS", "message": str(exc)}}), 400
+
+
+@app.route("/api/symbols/<path:symbol>/chart-views/<view_code>/indicators")
 def symbol_view_indicators(symbol: str, view_code: str):
     try:
         normalized = symbol.strip().upper()
@@ -195,7 +324,7 @@ def symbol_view_indicators(symbol: str, view_code: str):
         return jsonify({"ok": False, "error": {"code": "INVALID_VIEW", "message": str(exc)}}), 400
 
 
-@app.route("/api/symbols/<symbol>/chart-views/<view_code>/indicators", methods=["POST"])
+@app.route("/api/symbols/<path:symbol>/chart-views/<view_code>/indicators", methods=["POST"])
 def add_symbol_view_indicator(symbol: str, view_code: str):
     payload = request.get_json(silent=True) or {}
     try:
@@ -214,7 +343,7 @@ def add_symbol_view_indicator(symbol: str, view_code: str):
 
 
 @app.route(
-    "/api/symbols/<symbol>/chart-views/<view_code>/indicators/<int:symbol_indicator_id>",
+    "/api/symbols/<path:symbol>/chart-views/<view_code>/indicators/<int:symbol_indicator_id>",
     methods=["PATCH"],
 )
 def patch_symbol_view_indicator(symbol: str, view_code: str, symbol_indicator_id: int):
@@ -233,7 +362,7 @@ def patch_symbol_view_indicator(symbol: str, view_code: str, symbol_indicator_id
 
 
 @app.route(
-    "/api/symbols/<symbol>/chart-views/<view_code>/indicators/<int:symbol_indicator_id>",
+    "/api/symbols/<path:symbol>/chart-views/<view_code>/indicators/<int:symbol_indicator_id>",
     methods=["DELETE"],
 )
 def delete_symbol_view_indicator(symbol: str, view_code: str, symbol_indicator_id: int):

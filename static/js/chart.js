@@ -17,8 +17,9 @@ const chartState = {
   isDragging: false,
   hoverIndex: null,
   dpr: 1,
+  defaultVisibleCount: 150,
   layout: {
-    left: 14,
+    left: 72,
     top: 14,
     right: 72,
     bottom: 34,
@@ -257,7 +258,7 @@ function getWeekKey(dateText) {
 
 function resetViewportToFullRange() {
   chartState.visibleCount = getDefaultVisibleCount();
-  chartState.firstVisible = 0;
+  chartState.firstVisible = Math.max(0, chartState.candles.length - chartState.visibleCount);
   clampViewport();
 }
 
@@ -275,12 +276,13 @@ function drawChart() {
   const ctx = chartState.ctx;
   const width = chartState.canvas.clientWidth;
   const height = chartState.canvas.clientHeight;
+  const theme = getChartTheme();
   ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#ffffff";
+  ctx.fillStyle = theme.background;
   ctx.fillRect(0, 0, width, height);
 
   const plot = getPlotArea();
-  drawGrid(ctx, plot);
+  drawGrid(ctx, plot, theme);
 
   if (!chartState.candles.length) {
     drawEmptyState(ctx, width, height);
@@ -289,16 +291,29 @@ function drawChart() {
 
   const visible = getVisibleCandles();
   const priceRange = getPriceRange(visible);
-  drawPriceAxis(ctx, plot, priceRange);
-  drawTimeAxis(ctx, plot, visible);
-  drawCandleSeries(ctx, plot, visible, priceRange);
+  drawValueAxes(ctx, plot, visible, priceRange, theme);
+  drawTimeAxis(ctx, plot, visible, theme);
+  drawCandleSeries(ctx, plot, visible, priceRange, theme);
   drawIndicators(ctx, plot, priceRange);
-  drawCrosshair(ctx, plot, visible, priceRange);
+  drawCrosshair(ctx, plot, visible, priceRange, theme);
   renderIndicatorLegend();
 }
 
-function drawGrid(ctx, plot) {
-  ctx.strokeStyle = "#edf2f5";
+function getChartTheme() {
+  const styles = getComputedStyle(document.body);
+  return {
+    background: styles.getPropertyValue("--chart-bg").trim() || "#ffffff",
+    grid: styles.getPropertyValue("--chart-grid").trim() || "#edf2f5",
+    axis: styles.getPropertyValue("--chart-axis").trim() || "#d9e0e6",
+    label: styles.getPropertyValue("--chart-label").trim() || "#65717f",
+    crosshair: styles.getPropertyValue("--chart-crosshair").trim() || "rgba(28, 38, 48, 0.35)",
+    up: styles.getPropertyValue("--success").trim() || "#23745a",
+    down: styles.getPropertyValue("--danger").trim() || "#b54747",
+  };
+}
+
+function drawGrid(ctx, plot, theme) {
+  ctx.strokeStyle = theme.grid;
   ctx.lineWidth = 1;
 
   for (let i = 0; i <= 4; i += 1) {
@@ -311,12 +326,13 @@ function drawGrid(ctx, plot) {
     drawLine(ctx, x, plot.top, x, plot.bottom);
   }
 
-  ctx.strokeStyle = "#d9e0e6";
+  ctx.strokeStyle = theme.axis;
   drawLine(ctx, plot.left, plot.bottom, plot.right, plot.bottom);
+  drawLine(ctx, plot.left, plot.top, plot.left, plot.bottom);
   drawLine(ctx, plot.right, plot.top, plot.right, plot.bottom);
 }
 
-function drawCandleSeries(ctx, plot, visible, priceRange) {
+function drawCandleSeries(ctx, plot, visible, priceRange, theme) {
   const slot = plot.width / chartState.visibleCount;
   const candleWidth = Math.max(2, Math.min(12, slot * 0.62));
 
@@ -327,7 +343,7 @@ function drawCandleSeries(ctx, plot, visible, priceRange) {
     const highY = priceToY(candle.high, plot, priceRange);
     const lowY = priceToY(candle.low, plot, priceRange);
     const isUp = candle.close >= candle.open;
-    const color = isUp ? "#23745a" : "#b54747";
+    const color = isUp ? theme.up : theme.down;
 
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
@@ -338,6 +354,24 @@ function drawCandleSeries(ctx, plot, visible, priceRange) {
     const bodyHeight = Math.max(1, Math.abs(closeY - openY));
     ctx.fillRect(x - candleWidth / 2, bodyTop, candleWidth, bodyHeight);
   });
+}
+
+function drawValueAxes(ctx, plot, visible, range, theme) {
+  const basePrice = visible[0]?.open || 0;
+  ctx.fillStyle = theme.label;
+  ctx.font = "12px system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+
+  for (let i = 0; i <= 4; i += 1) {
+    const price = range.max - (range.max - range.min) * (i / 4);
+    const y = plot.top + (plot.height * i) / 4;
+    ctx.textAlign = "right";
+    ctx.fillText(formatPrice(price), plot.left - 10, y);
+
+    ctx.textAlign = "left";
+    const percent = basePrice ? (price / basePrice - 1) * 100 : 0;
+    ctx.fillText(formatPercent(percent), plot.right + 10, y);
+  }
 }
 
 function drawPriceAxis(ctx, plot, range) {
@@ -353,8 +387,8 @@ function drawPriceAxis(ctx, plot, range) {
   }
 }
 
-function drawTimeAxis(ctx, plot, visible) {
-  ctx.fillStyle = "#65717f";
+function drawTimeAxis(ctx, plot, visible, theme) {
+  ctx.fillStyle = theme.label;
   ctx.font = "12px system-ui, sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
@@ -367,11 +401,11 @@ function drawTimeAxis(ctx, plot, visible) {
   const ticks = getTimeTicks(visible);
   for (const tick of ticks) {
     const x = plot.left + slot * (tick.index + 0.5);
-    ctx.fillText(formatDateLabel(tick.candle), x, plot.bottom + 10);
+    ctx.fillText(tick.label, x, plot.bottom + 10);
   }
 }
 
-function drawCrosshair(ctx, plot, visible, priceRange) {
+function drawCrosshair(ctx, plot, visible, priceRange, theme) {
   if (chartState.hoverIndex === null) {
     return;
   }
@@ -386,7 +420,7 @@ function drawCrosshair(ctx, plot, visible, priceRange) {
   const x = plot.left + slot * (visibleIndex + 0.5);
   const y = priceToY(candle.close, plot, priceRange);
 
-  ctx.strokeStyle = "rgba(28, 38, 48, 0.35)";
+  ctx.strokeStyle = theme.crosshair;
   ctx.setLineDash([4, 4]);
   drawLine(ctx, x, plot.top, x, plot.bottom);
   drawLine(ctx, plot.left, y, plot.right, y);
@@ -427,7 +461,7 @@ function drawIndicators(ctx, plot, priceRange) {
 }
 
 function drawEmptyState(ctx, width, height) {
-  ctx.fillStyle = "#65717f";
+  ctx.fillStyle = getChartTheme().label;
   ctx.font = "14px system-ui, sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
@@ -645,15 +679,30 @@ function getPlotArea() {
 function getTimeTicks(visible) {
   const maxTicks = 6;
   const step = Math.max(1, Math.ceil(visible.length / maxTicks));
-  const ticks = [];
+  const tickMap = new Map();
   for (let index = 0; index < visible.length; index += step) {
-    ticks.push({ index, candle: visible[index] });
+    tickMap.set(index, { index, candle: visible[index], forceYear: false });
   }
+
+  for (let index = 0; index < visible.length; index += 1) {
+    const currentYear = getCandleYear(visible[index]);
+    const previousYear = index > 0 ? getCandleYear(visible[index - 1]) : null;
+    if (index === 0 || currentYear !== previousYear) {
+      tickMap.set(index, { index, candle: visible[index], forceYear: true });
+    }
+  }
+
   const lastIndex = visible.length - 1;
-  if (ticks.length && ticks[ticks.length - 1].index !== lastIndex) {
-    ticks.push({ index: lastIndex, candle: visible[lastIndex] });
+  if (!tickMap.has(lastIndex)) {
+    tickMap.set(lastIndex, { index: lastIndex, candle: visible[lastIndex], forceYear: false });
   }
-  return ticks;
+
+  return Array.from(tickMap.values())
+    .sort((a, b) => a.index - b.index)
+    .map((tick) => ({
+      ...tick,
+      label: formatDateLabel(tick.candle, tick.forceYear),
+    }));
 }
 
 function priceToY(price, plot, range) {
@@ -671,14 +720,10 @@ function getCandleSlotWidth() {
 }
 
 function getDefaultVisibleCount() {
-  const minimumSlotsByPeriod = {
-    "1D": 80,
-    "3D": 84,
-    "1W": 52,
-    "1M": 24,
-  };
-  const minimumSlots = minimumSlotsByPeriod[chartState.period] || 80;
-  return Math.max(chartState.candles.length, minimumSlots);
+  if (!chartState.candles.length) {
+    return chartState.minVisibleCount;
+  }
+  return Math.min(chartState.candles.length, chartState.defaultVisibleCount);
 }
 
 function getMinimumVisibleCount() {
@@ -686,7 +731,7 @@ function getMinimumVisibleCount() {
 }
 
 function getMaximumVisibleCount() {
-  return Math.max(chartState.candles.length, getDefaultVisibleCount());
+  return Math.max(chartState.candles.length, chartState.defaultVisibleCount);
 }
 
 function clampViewport() {
@@ -713,6 +758,11 @@ function formatPrice(value) {
   });
 }
 
+function formatPercent(value) {
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(2)}%`;
+}
+
 function formatVolume(value) {
   if (value >= 1_000_000_000) {
     return `${(value / 1_000_000_000).toFixed(2)}B`;
@@ -726,12 +776,20 @@ function formatVolume(value) {
   return String(Math.round(value));
 }
 
-function formatDateLabel(candle) {
+function formatDateLabel(candle, forceYear = false) {
   const source = candle.endDate || candle.date;
-  if (chartState.period === "1M") {
+  if (forceYear) {
     return source.slice(0, 7);
   }
+  if (chartState.period === "1M") {
+    return source.slice(5, 7);
+  }
   return source.slice(5);
+}
+
+function getCandleYear(candle) {
+  const source = candle.endDate || candle.date;
+  return source.slice(0, 4);
 }
 
 function drawLine(ctx, x1, y1, x2, y2) {

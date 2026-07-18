@@ -3,6 +3,7 @@ const dbState = {
   page: 1,
   totalPages: 1,
   pageSize: 50,
+  search: "",
 };
 
 function setDbStatus(message, type = "neutral") {
@@ -43,6 +44,9 @@ async function loadTablePage() {
     page: String(dbState.page),
     page_size: String(dbState.pageSize),
   });
+  if (dbState.search) {
+    params.set("search", dbState.search);
+  }
   const response = await fetch(`/api/db/table/${encodeURIComponent(dbState.table)}?${params}`);
   const payload = await response.json();
 
@@ -55,8 +59,9 @@ async function loadTablePage() {
   dbState.totalPages = payload.total_pages;
   document.getElementById("page-input").value = String(payload.page);
   document.getElementById("page-total").textContent = `/ ${payload.total_pages}`;
+  document.getElementById("db-search-input").value = payload.search || "";
   document.getElementById("table-summary").textContent =
-    `${payload.table} · 共 ${payload.total_rows} 行 · 每页最多 ${payload.page_size} 行`;
+    `${payload.table} · ${payload.search ? `匹配 ${payload.total_rows} 行` : `共 ${payload.total_rows} 行`} · 每页最多 ${payload.page_size} 行`;
   renderTable(payload.columns, payload.rows);
   updatePagerButtons();
 }
@@ -133,6 +138,20 @@ function bindDatabaseBrowser() {
 
   document.getElementById("reload-table").addEventListener("click", loadTables);
   document.getElementById("backup-db").addEventListener("click", backupDatabase);
+
+  document.getElementById("db-search-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    dbState.search = document.getElementById("db-search-input").value.trim();
+    dbState.page = 1;
+    await loadTablePage();
+  });
+
+  document.getElementById("db-search-clear").addEventListener("click", async () => {
+    dbState.search = "";
+    dbState.page = 1;
+    document.getElementById("db-search-input").value = "";
+    await loadTablePage();
+  });
 
   document.getElementById("prev-page").addEventListener("click", async () => {
     dbState.page = Math.max(1, dbState.page - 1);

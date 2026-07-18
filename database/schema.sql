@@ -4,6 +4,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     name TEXT,
     exchange_name TEXT,
     currency TEXT,
+    show_weekend_data INTEGER NOT NULL DEFAULT 1,
+    display_order INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -18,6 +20,7 @@ CREATE TABLE IF NOT EXISTS daily_prices (
     close REAL NOT NULL,
     volume REAL DEFAULT 0,
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
     UNIQUE(symbol, date)
 );
 
