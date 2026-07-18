@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ app_name }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260718-6') }}">
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">T</div>
+        <div>
+          <h1>{{ app_name }}</h1>
+          <p>v0.1 本地分析台</p>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <button class="nav-item active" type="button" data-view="market-view">
+          <span class="nav-icon">⌁</span>
+          <span>查看行情</span>
+        </button>
+        <button class="nav-item" type="button" data-view="database-view">
+          <span class="nav-icon">▤</span>
+          <span>数据库浏览</span>
+        </button>
+      </nav>
+
+      <button id="shutdown-button" class="shutdown-button" type="button">
+        <span class="nav-icon">⏻</span>
+        <span>退出系统</span>
+      </button>
+    </aside>
+
+    <main class="workspace">
+      <div id="shutdown-notice" class="shutdown-notice" hidden>
+        <div>
+          <h2>系统已退出</h2>
+          <p>后端服务已停止。你可以手动关闭这个浏览器页面。</p>
+        </div>
+      </div>
+
+      <section id="market-view" class="view active">
+        <header class="page-header">
+          <div>
+            <h2>查看行情</h2>
+            <p id="market-subtitle">最近一年日线 OHLCV</p>
+          </div>
+          <form id="symbol-form" class="search-bar">
+            <input id="symbol-input" type="text" value="SPY" autocomplete="off" spellcheck="false" aria-label="股票代码">
+            <button type="submit">查询</button>
+          </form>
+        </header>
+
+        <div id="market-status" class="status neutral">准备就绪</div>
+        <section class="panel chart-panel">
+          <div class="panel-title">
+            <h3 id="chart-title">SPY 日线行情</h3>
+            <div class="chart-actions">
+              <div class="period-switch" aria-label="K线周期">
+                <button class="period-button active" type="button" data-period="1D">日K</button>
+                <button class="period-button" type="button" data-period="3D">3日K</button>
+                <button class="period-button" type="button" data-period="1W">周K</button>
+                <button class="period-button" type="button" data-period="1M">月K</button>
+              </div>
+              <button id="indicator-panel-toggle" class="subtle-button" type="button">指标</button>
+              <span id="chart-source">等待查询</span>
+            </div>
+          </div>
+          <div id="chart" class="chart">
+            <canvas id="kline-canvas" class="kline-canvas"></canvas>
+            <div id="indicator-legend" class="indicator-legend"></div>
+            <div id="ohlcv-tooltip" class="ohlcv-tooltip" hidden></div>
+          </div>
+        </section>
+
+        <aside id="indicator-panel" class="indicator-panel" hidden>
+          <div class="indicator-panel-header">
+            <h3>指标</h3>
+            <button id="indicator-panel-close" class="icon-button" type="button" aria-label="关闭指标面板">×</button>
+          </div>
+
+          <section class="indicator-section">
+            <h4>收藏指标</h4>
+            <div id="favorite-indicators" class="favorite-indicators"></div>
+          </section>
+
+          <section class="indicator-section">
+            <h4>创建指标</h4>
+            <form id="custom-indicator-form" class="custom-indicator-form">
+              <select id="custom-indicator-type" aria-label="指标类型">
+                <option value="MA">MA</option>
+                <option value="EMA">EMA</option>
+              </select>
+              <input id="custom-indicator-period" type="number" min="2" max="500" value="20" aria-label="指标周期">
+              <button type="submit">添加</button>
+            </form>
+          </section>
+        </aside>
+      </section>
+
+      <section id="database-view" class="view">
+        <header class="page-header">
+          <div>
+            <h2>数据库浏览</h2>
+            <p>查看本地 SQLite 表内容</p>
+          </div>
+          <div class="db-controls">
+            <select id="table-select" aria-label="选择数据表"></select>
+            <button id="reload-table" type="button">刷新</button>
+          </div>
+        </header>
+
+        <section class="panel table-panel">
+          <div class="table-toolbar">
+            <span id="table-summary">请选择数据表</span>
+            <div class="pagination">
+              <button id="prev-page" type="button">上一页</button>
+              <label>
+                第
+                <input id="page-input" type="number" min="1" value="1">
+                页
+              </label>
+              <span id="page-total">/ 1</span>
+              <button id="jump-page" type="button">跳转</button>
+              <button id="next-page" type="button">下一页</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table id="data-table"></table>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='js/chart.js', v='20260718-6') }}"></script>
+    <script src="{{ url_for('static', filename='js/database_browser.js', v='20260718-6') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260718-6') }}"></script>
+  </body>
+</html>

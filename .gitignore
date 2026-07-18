@@ -1,9 +1,41 @@
-**/*.json
-**/*.log
-**/*.log.*
-**/*.db
-**/*.csv
-**/*.png
-**/*.pt
-**/__pycache__
-**/.venv
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment and secrets
+.env
+.env.*
+
+# Runtime data
+data/*.sqlite
+data/*.sqlite-*
+data/*.db
+data/*.db-*
+
+# Generated market data and charts
+data/*.csv
+charts/
+backtest_outputs/
+*.csv
+*.png
+
+# Logs
+*.log
+*.log.*
+
+# Local tool/cache files
+.codex
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
