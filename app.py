@@ -21,7 +21,7 @@ from config import (
     FLASK_PORT,
     MAX_DB_PAGE_SIZE,
 )
-from database.db import init_database
+from database.db import backup_database, init_database
 from database import repository
 from services.api_errors import MarketDataError
 from services.market_data_service import get_market_data
@@ -111,6 +111,35 @@ def db_table(table_name: str):
                 }
             ),
             400,
+        )
+
+
+@app.route("/api/db/backup", methods=["POST"])
+def db_backup():
+    try:
+        backup_path = backup_database()
+        return jsonify(
+            {
+                "ok": True,
+                "message": "数据库备份完成。",
+                "path": str(backup_path),
+                "filename": backup_path.name,
+            }
+        )
+    except Exception as exc:
+        app.logger.exception("Database backup failed")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "BACKUP_FAILED",
+                        "message": "数据库备份失败。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            500,
         )
 
 

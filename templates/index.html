@@ -108,9 +108,12 @@
           </div>
           <div class="db-controls">
             <select id="table-select" aria-label="选择数据表"></select>
+            <button id="backup-db" type="button">备份</button>
             <button id="reload-table" type="button">刷新</button>
           </div>
         </header>
+
+        <div id="db-status" class="status neutral">准备就绪</div>
 
         <section class="panel table-panel">
           <div class="table-toolbar">
@@ -134,8 +137,8 @@
       </section>
     </main>
 
-    <script src="{{ url_for('static', filename='js/chart.js', v='20260718-6') }}"></script>
-    <script src="{{ url_for('static', filename='js/database_browser.js', v='20260718-6') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260718-6') }}"></script>
+    <script src="{{ url_for('static', filename='js/chart.js', v='20260718-7') }}"></script>
+    <script src="{{ url_for('static', filename='js/database_browser.js', v='20260718-7') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260718-7') }}"></script>
   </body>
 </html>

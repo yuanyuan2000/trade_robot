@@ -5,6 +5,12 @@ const dbState = {
   pageSize: 50,
 };
 
+function setDbStatus(message, type = "neutral") {
+  const status = document.getElementById("db-status");
+  status.textContent = message;
+  status.className = `status ${type}`;
+}
+
 async function loadTables() {
   const response = await fetch("/api/db/tables");
   const payload = await response.json();
@@ -53,6 +59,26 @@ async function loadTablePage() {
     `${payload.table} · 共 ${payload.total_rows} 行 · 每页最多 ${payload.page_size} 行`;
   renderTable(payload.columns, payload.rows);
   updatePagerButtons();
+}
+
+async function backupDatabase() {
+  const button = document.getElementById("backup-db");
+  button.disabled = true;
+  setDbStatus("正在备份数据库...", "neutral");
+
+  try {
+    const response = await fetch("/api/db/backup", { method: "POST" });
+    const payload = await response.json();
+    if (!payload.ok) {
+      setDbStatus(payload.error?.message || "数据库备份失败。", "error");
+      return;
+    }
+    setDbStatus(`备份完成：${payload.path}`, "success");
+  } catch (error) {
+    setDbStatus("无法连接后端，数据库备份失败。", "error");
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function renderTable(columns, rows) {
@@ -106,6 +132,7 @@ function bindDatabaseBrowser() {
   });
 
   document.getElementById("reload-table").addEventListener("click", loadTables);
+  document.getElementById("backup-db").addEventListener("click", backupDatabase);
 
   document.getElementById("prev-page").addEventListener("click", async () => {
     dbState.page = Math.max(1, dbState.page - 1);

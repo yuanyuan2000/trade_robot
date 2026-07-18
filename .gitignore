@@ -17,6 +17,7 @@ data/*.sqlite
 data/*.sqlite-*
 data/*.db
 data/*.db-*
+data/backups/
 
 # Generated market data and charts
 data/*.csv
