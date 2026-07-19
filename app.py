@@ -118,7 +118,7 @@ def update_market_data():
         )
     except MarketDataError as exc:
         repository.log_api_request(
-            provider="twelvedata",
+            provider="market_data",
             status="error",
             symbol=symbol.strip().upper(),
             error_code=exc.code,

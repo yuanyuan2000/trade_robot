@@ -19,12 +19,39 @@ def init_database() -> None:
     with get_connection() as conn:
         conn.executescript(schema)
         migrate_database(conn)
-    from database.repository import seed_default_indicators
+    from database.repository import seed_default_indicators, seed_symbol_aliases
 
+    seed_symbol_aliases()
     seed_default_indicators()
 
 
 def migrate_database(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS symbol_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            common_symbol TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            yahoo_symbol TEXT,
+            twelvedata_symbol TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_symbol_aliases_yahoo
+        ON symbol_aliases(yahoo_symbol)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_symbol_aliases_twelvedata
+        ON symbol_aliases(twelvedata_symbol)
+        """
+    )
     ensure_column(
         conn,
         table_name="symbols",

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 import math
 import sqlite3
@@ -29,6 +29,79 @@ INDICATOR_COLORS = [
     "#9b3d58",
 ]
 
+DEFAULT_SYMBOL_ALIASES = [
+    {
+        "common_symbol": "USDINDEX",
+        "display_name": "USDindex",
+        "yahoo_symbol": "DX-Y.NYB",
+        "twelvedata_symbol": None,
+        "notes": "US Dollar Index. Twelve Data 当前账号未验证到可用代码。",
+    },
+    {
+        "common_symbol": "XAU/USD",
+        "display_name": "XAU/USD",
+        "yahoo_symbol": None,
+        "twelvedata_symbol": "XAU/USD",
+        "notes": "现货黄金。Yahoo Finance 的 XAUUSD=X 当前 chart 接口无数据；GC=F 是黄金期货代理。",
+    },
+    {
+        "common_symbol": "GOLDFUTURES",
+        "display_name": "GoldFutures",
+        "yahoo_symbol": "GC=F",
+        "twelvedata_symbol": None,
+        "notes": "COMEX 黄金期货，可作为现货黄金代理。",
+    },
+    {
+        "common_symbol": "US2Y",
+        "display_name": "US2Y",
+        "yahoo_symbol": None,
+        "twelvedata_symbol": "US2Y",
+        "notes": "US Treasury Yield 2 Years. Yahoo Finance 的 ^UST2Y 当前 chart 接口无数据。",
+    },
+    {
+        "common_symbol": "US10Y",
+        "display_name": "US10Y",
+        "yahoo_symbol": "^TNX",
+        "twelvedata_symbol": None,
+        "notes": "CBOE Interest Rate 10 Year Treasury Note. Twelve Data 当前账号未验证到可用代码。",
+    },
+    {
+        "common_symbol": "SPX",
+        "display_name": "SPX",
+        "yahoo_symbol": "^GSPC",
+        "twelvedata_symbol": "SPX",
+        "notes": "S&P 500. Twelve Data 代码存在但当前套餐不可用。",
+    },
+    {
+        "common_symbol": "IXIC",
+        "display_name": "IXIC",
+        "yahoo_symbol": "^IXIC",
+        "twelvedata_symbol": None,
+        "notes": "NASDAQ Composite. Twelve Data 当前账号未验证到可用代码。",
+    },
+    {
+        "common_symbol": "NDX",
+        "display_name": "NDX",
+        "yahoo_symbol": "^NDX",
+        "twelvedata_symbol": "NDX",
+        "notes": "NASDAQ-100. Twelve Data 代码存在但当前套餐不可用。",
+    },
+    {
+        "common_symbol": "DJI",
+        "display_name": "DJI",
+        "yahoo_symbol": "^DJI",
+        "twelvedata_symbol": None,
+        "notes": "Dow Jones Industrial Average. Twelve Data 当前账号未验证到可用指数代码。",
+    },
+    {
+        "common_symbol": "RUT",
+        "display_name": "RUT",
+        "yahoo_symbol": "^RUT",
+        "twelvedata_symbol": None,
+        "notes": "Russell 2000. Twelve Data 当前账号未验证到可用代码。",
+    },
+]
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -36,6 +109,84 @@ def utc_now_iso() -> str:
 
 def normalize_params(params: dict) -> str:
     return json.dumps(params, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def normalize_symbol_key(symbol: str | None) -> str:
+    return (symbol or "").strip().upper()
+
+
+def seed_symbol_aliases() -> None:
+    now = utc_now_iso()
+    with get_connection() as conn:
+        for item in DEFAULT_SYMBOL_ALIASES:
+            conn.execute(
+                """
+                INSERT INTO symbol_aliases
+                    (common_symbol, display_name, yahoo_symbol, twelvedata_symbol, notes, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(common_symbol) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    yahoo_symbol = excluded.yahoo_symbol,
+                    twelvedata_symbol = excluded.twelvedata_symbol,
+                    notes = excluded.notes,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    item["common_symbol"],
+                    item["display_name"],
+                    item["yahoo_symbol"],
+                    item["twelvedata_symbol"],
+                    item["notes"],
+                    now,
+                    now,
+                ),
+            )
+
+
+def resolve_symbol_alias(symbol: str) -> dict:
+    normalized = normalize_symbol_key(symbol)
+    if not normalized:
+        raise ValueError("Symbol is required")
+
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT common_symbol, display_name, yahoo_symbol, twelvedata_symbol, notes
+            FROM symbol_aliases
+            WHERE UPPER(common_symbol) = ?
+               OR UPPER(display_name) = ?
+               OR UPPER(COALESCE(yahoo_symbol, '')) = ?
+               OR UPPER(COALESCE(twelvedata_symbol, '')) = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (normalized, normalized, normalized, normalized),
+        ).fetchone()
+
+    if row:
+        return dict(row)
+
+    return {
+        "common_symbol": normalized,
+        "display_name": normalized,
+        "yahoo_symbol": normalized,
+        "twelvedata_symbol": normalized,
+        "notes": None,
+    }
+
+
+def get_symbol_display_name(symbol: str) -> str:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT display_name
+            FROM symbol_aliases
+            WHERE UPPER(common_symbol) = ?
+            LIMIT 1
+            """,
+            (normalize_symbol_key(symbol),),
+        ).fetchone()
+    return row["display_name"] if row else symbol
 
 
 def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
@@ -114,6 +265,7 @@ def get_symbol(symbol: str) -> dict:
         ).fetchone()
     data = dict(row)
     data["show_weekend_data"] = bool(data["show_weekend_data"])
+    data["display_symbol"] = get_symbol_display_name(data["symbol"])
     return data
 
 
@@ -145,11 +297,41 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
     previous = dict(latest_rows[1]) if len(latest_rows) > 1 else None
     latest_price = latest["close"] if latest else None
     previous_close = previous["close"] if previous else None
+
+    def change_from(days: int) -> tuple[str | None, float | None, float | None]:
+        if not latest or latest_price is None:
+            return None, None, None
+
+        base_date = datetime.strptime(latest["date"], "%Y-%m-%d").date() - timedelta(days=days)
+        with get_connection() as conn:
+            base_row = conn.execute(
+                """
+                SELECT date, close
+                FROM daily_prices
+                WHERE symbol = ? AND date <= ?
+                ORDER BY date DESC
+                LIMIT 1
+                """,
+                (symbol, base_date.isoformat()),
+            ).fetchone()
+
+        base_price = base_row["close"] if base_row else None
+        if base_price in {None, 0}:
+            return (base_row["date"] if base_row else None), base_price, None
+        return (
+            base_row["date"],
+            base_price,
+            (latest_price - base_price) / base_price * 100,
+        )
+
     daily_change = None
     daily_change_percent = None
     if latest_price is not None and previous_close not in {None, 0}:
         daily_change = latest_price - previous_close
         daily_change_percent = daily_change / previous_close * 100
+
+    weekly_base_date, weekly_base_price, weekly_percent = change_from(7)
+    monthly_base_date, monthly_base_price, monthly_percent = change_from(30)
 
     ytd_base = ytd_row["close"] if ytd_row else None
     ytd_percent = None
@@ -162,6 +344,12 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
         "previous_close": previous_close,
         "daily_change": daily_change,
         "daily_change_percent": daily_change_percent,
+        "weekly_base_date": weekly_base_date,
+        "weekly_base_price": weekly_base_price,
+        "weekly_percent": weekly_percent,
+        "monthly_base_date": monthly_base_date,
+        "monthly_base_price": monthly_base_price,
+        "monthly_percent": monthly_percent,
         "ytd_base_date": ytd_row["date"] if ytd_row else None,
         "ytd_base_price": ytd_base,
         "ytd_percent": ytd_percent,
@@ -169,35 +357,29 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
 
 
 def list_market_overview(page: int = 1, page_size: int = 100) -> dict:
-    page = max(1, page)
-    page_size = min(max(1, page_size), 100)
     with get_connection() as conn:
         total_rows = conn.execute("SELECT COUNT(*) AS count FROM symbols").fetchone()["count"]
-        total_pages = max(1, math.ceil(total_rows / page_size))
-        page = min(page, total_pages)
-        offset = (page - 1) * page_size
         rows = conn.execute(
             """
             SELECT id, symbol, name, display_order, updated_at
             FROM symbols
             ORDER BY display_order ASC, id ASC
-            LIMIT ? OFFSET ?
-            """,
-            (page_size, offset),
+            """
         ).fetchall()
 
     items = []
     for row in rows:
         item = dict(row)
+        item["display_symbol"] = get_symbol_display_name(item["symbol"])
         item.update(get_symbol_price_snapshot(item["symbol"]))
         items.append(item)
 
     return {
         "items": items,
-        "page": page,
-        "page_size": page_size,
+        "page": 1,
+        "page_size": total_rows,
         "total_rows": total_rows,
-        "total_pages": total_pages,
+        "total_pages": 1,
     }
 
 

@@ -27,6 +27,23 @@ CREATE TABLE IF NOT EXISTS daily_prices (
 CREATE INDEX IF NOT EXISTS idx_daily_prices_symbol_date
 ON daily_prices(symbol, date);
 
+CREATE TABLE IF NOT EXISTS symbol_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    common_symbol TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    yahoo_symbol TEXT,
+    twelvedata_symbol TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_aliases_yahoo
+ON symbol_aliases(yahoo_symbol);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_aliases_twelvedata
+ON symbol_aliases(twelvedata_symbol);
+
 CREATE TABLE IF NOT EXISTS api_request_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider TEXT NOT NULL,

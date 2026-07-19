@@ -2,6 +2,8 @@
 
 一个本地运行的交易分析工具。当前版本支持行情缓存、K 线查看、MA/EMA 指标配置记忆，以及开发阶段的 SQLite 数据库浏览。
 
+本项目当前优先保证 Windows 原生环境可运行，后续更新应尽可能同时兼容 Windows 和 Linux/WSL；如两者存在差异，优先支持 Windows。
+
 ## 功能
 
 - Flask 本地 Web 应用，启动后可自动打开浏览器。
@@ -25,9 +27,30 @@
 
 ## 安装
 
+### Windows
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+如果 PowerShell 禁止执行激活脚本，可改用 CMD：
+
+```cmd
+py -3 -m venv .venv
+.venv\Scripts\activate.bat
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### Linux / WSL
+
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
@@ -39,14 +62,18 @@ TWELVEDATA_API_KEY=your_api_key_here
 
 ## 启动
 
-```bash
+### Windows
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 python app.py
 ```
 
-如果系统没有 `python` 命令：
+CMD：
 
-```bash
-.venv/bin/python app.py
+```cmd
+.venv\Scripts\activate.bat
+python app.py
 ```
 
 默认地址：
@@ -57,8 +84,29 @@ http://127.0.0.1:5000
 
 调试时不想自动打开浏览器：
 
+```powershell
+$env:AUTO_OPEN_BROWSER="false"
+python app.py
+```
+
+CMD：
+
+```cmd
+set AUTO_OPEN_BROWSER=false
+python app.py
+```
+
+### Linux / WSL
+
 ```bash
-AUTO_OPEN_BROWSER=false .venv/bin/python app.py
+source .venv/bin/activate
+python app.py
+```
+
+调试时不想自动打开浏览器：
+
+```bash
+AUTO_OPEN_BROWSER=false python app.py
 ```
 
 ## 配置

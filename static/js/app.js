@@ -36,6 +36,9 @@ let currentRawMarketData = [];
 let currentSymbolSettings = { show_weekend_data: true };
 let overviewPage = 1;
 let overviewTotalPages = 1;
+let overviewItems = [];
+const defaultOverviewSort = { key: "display_order", direction: "asc" };
+let overviewSort = { ...defaultOverviewSort };
 let draggedOverviewSymbol = "";
 
 function applyTheme(theme) {
@@ -67,6 +70,8 @@ function setStatus(message, type = "neutral") {
 function sourceText(source) {
   const labels = {
     database: "来自本地数据库",
+    yahoo: "来自 Yahoo Finance",
+    twelvedata: "来自 Twelve Data API",
     api: "来自 Twelve Data API",
     stale_cache: "来自本地旧缓存",
   };
@@ -102,6 +107,8 @@ async function loadMarketData(symbol) {
 
     currentRawMarketData = payload.data;
     currentSymbolSettings = payload.symbol_settings || { show_weekend_data: true };
+    currentSymbol = payload.canonical_symbol || payload.symbol || normalized;
+    symbolInput.value = payload.symbol || normalized;
     showWeekendData.checked = Boolean(currentSymbolSettings.show_weekend_data);
     renderCurrentMarketData();
     await loadSymbolIndicators();
@@ -131,11 +138,7 @@ async function loadMarketOverview(page = overviewPage) {
   setStatus("正在加载行情总览...", "neutral");
 
   try {
-    const params = new URLSearchParams({
-      page: String(overviewPage),
-      page_size: "100",
-    });
-    const response = await fetch(`/api/market-overview?${params}`);
+    const response = await fetch("/api/market-overview");
     const payload = await parseJsonResponse(response);
     if (!payload.ok) {
       setStatus(payload.error?.message || "行情总览加载失败。", "error");
@@ -145,16 +148,18 @@ async function loadMarketOverview(page = overviewPage) {
 
     overviewPage = payload.page;
     overviewTotalPages = payload.total_pages;
-    renderOverviewTable(payload.items || []);
+    overviewItems = payload.items || [];
+    renderOverviewTable(getSortedOverviewItems());
     overviewSummary.textContent = `共 ${payload.total_rows} 个标的`;
-    overviewPageText.textContent = `第 ${payload.page} 页 / 共 ${payload.total_pages} 页`;
-    overviewPagination.hidden = payload.total_rows <= payload.page_size;
-    overviewPrev.disabled = payload.page <= 1;
-    overviewNext.disabled = payload.page >= payload.total_pages;
+    overviewPageText.textContent = "";
+    overviewPagination.hidden = true;
+    overviewPrev.disabled = true;
+    overviewNext.disabled = true;
     setStatus("行情总览已加载。", "success");
   } catch (error) {
     setStatus(error.message || "行情总览加载失败。", "error");
     overviewSummary.textContent = "加载失败";
+    overviewItems = [];
     renderOverviewTable([]);
   }
 }
@@ -174,13 +179,15 @@ function showMarketDetail() {
 
 function renderOverviewTable(items) {
   const headers = [
-    "标的代码",
-    "最新价格",
-    "当日涨跌",
-    "YTD",
-    "",
+    { label: "标的代码", key: "display_order" },
+    { label: "最新价格", key: "latest_price" },
+    { label: "日涨跌", key: "daily_change_percent" },
+    { label: "周涨跌", key: "weekly_percent" },
+    { label: "月涨跌", key: "monthly_percent" },
+    { label: "YTD", key: "ytd_percent" },
+    { label: "", key: "" },
   ];
-  const thead = `<thead><tr>${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join("")}</tr></thead>`;
+  const thead = `<thead><tr>${headers.map(renderOverviewHeader).join("")}</tr></thead>`;
 
   if (!items.length) {
     overviewTable.innerHTML = `${thead}<tbody><tr><td class="empty-cell" colspan="${headers.length}">暂无标的。查询并保存行情后会显示在这里。</td></tr></tbody>`;
@@ -189,17 +196,21 @@ function renderOverviewTable(items) {
 
   const rows = items.map((item) => {
     const dailyClass = numberTone(item.daily_change);
+    const weeklyClass = numberTone(item.weekly_percent);
+    const monthlyClass = numberTone(item.monthly_percent);
     const ytdClass = numberTone(item.ytd_percent);
     return `
       <tr class="overview-row" draggable="true" data-symbol="${escapeHtml(item.symbol)}">
         <td>
-          <button class="symbol-link" type="button" data-symbol="${escapeHtml(item.symbol)}">${escapeHtml(item.symbol)}</button>
+          <button class="symbol-link" type="button" data-symbol="${escapeHtml(item.symbol)}">${escapeHtml(item.display_symbol || item.symbol)}</button>
         </td>
         <td class="${dailyClass}">${formatOverviewPrice(item.latest_price)}</td>
-        <td class="${dailyClass}">${formatOverviewSignedNumber(item.daily_change)} ${formatOverviewPercent(item.daily_change_percent)}</td>
+        <td class="${dailyClass}">${formatOverviewPercent(item.daily_change_percent)}</td>
+        <td class="${weeklyClass}">${formatOverviewPercent(item.weekly_percent)}</td>
+        <td class="${monthlyClass}">${formatOverviewPercent(item.monthly_percent)}</td>
         <td class="${ytdClass}">${formatOverviewPercent(item.ytd_percent)}</td>
         <td class="drag-cell">
-          <button class="drag-handle" type="button" title="拖动排序" aria-label="拖动排序" draggable="true" data-symbol="${escapeHtml(item.symbol)}">
+          <button class="drag-handle" type="button" title="${overviewDragTitle()}" aria-label="${overviewDragTitle()}" draggable="true" data-drag-disabled="${overviewDragDisabledText()}" data-symbol="${escapeHtml(item.symbol)}">
             <span></span><span></span><span></span>
           </button>
         </td>
@@ -207,6 +218,111 @@ function renderOverviewTable(items) {
     `;
   });
   overviewTable.innerHTML = `${thead}<tbody>${rows.join("")}</tbody>`;
+}
+
+function renderOverviewHeader(header) {
+  if (!header.key) {
+    return "<th></th>";
+  }
+  const isActive = overviewSort.key === header.key;
+  const direction = isActive ? overviewSort.direction : "";
+  const title = `${header.label}${isActive ? (direction === "asc" ? " 升序" : " 降序") : ""}`;
+  return `
+    <th>
+      <span class="overview-th-content">
+        <span>${escapeHtml(header.label)}</span>
+        <button
+          class="overview-sort-button ${isActive ? "is-active" : ""}"
+          type="button"
+          title="${escapeHtml(title)}"
+          aria-label="${escapeHtml(title)}"
+          data-sort-key="${escapeHtml(header.key)}"
+          data-sort-direction="${escapeHtml(direction)}"
+        >
+          <span class="sort-triangle sort-triangle-up"></span>
+          <span class="sort-triangle sort-triangle-down"></span>
+        </button>
+      </span>
+    </th>
+  `;
+}
+
+function getSortedOverviewItems() {
+  const direction = overviewSort.direction === "desc" ? -1 : 1;
+  return [...overviewItems].sort((left, right) => {
+    const result = compareOverviewValues(left, right, overviewSort.key);
+    return result * direction;
+  });
+}
+
+function compareOverviewValues(left, right, key) {
+  if (key === "display_order") {
+    return compareNullableNumbers(left.display_order, right.display_order)
+      || compareNullableNumbers(left.id, right.id)
+      || compareStrings(left.symbol, right.symbol);
+  }
+  if (key === "symbol") {
+    return compareStrings(left.symbol, right.symbol);
+  }
+  const numericResult = compareNullableNumbers(left[key], right[key]);
+  if (numericResult !== 0) {
+    return numericResult;
+  }
+  return compareStrings(left.symbol, right.symbol);
+}
+
+function compareNullableNumbers(left, right) {
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  const leftMissing = left === null || left === undefined || Number.isNaN(leftNumber);
+  const rightMissing = right === null || right === undefined || Number.isNaN(rightNumber);
+  if (leftMissing && rightMissing) {
+    return 0;
+  }
+  if (leftMissing) {
+    return 1;
+  }
+  if (rightMissing) {
+    return -1;
+  }
+  return leftNumber - rightNumber;
+}
+
+function compareStrings(left, right) {
+  return String(left || "").localeCompare(String(right || ""), "en-US", {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+function applyOverviewSort(key) {
+  if (key === defaultOverviewSort.key) {
+    const nextDirection = overviewSort.key === key && overviewSort.direction === "asc" ? "desc" : "asc";
+    overviewSort = { key, direction: nextDirection };
+    renderOverviewTable(getSortedOverviewItems());
+    return;
+  }
+
+  if (overviewSort.key !== key) {
+    overviewSort = { key, direction: "desc" };
+  } else if (overviewSort.direction === "desc") {
+    overviewSort = { key, direction: "asc" };
+  } else {
+    overviewSort = { ...defaultOverviewSort };
+  }
+  renderOverviewTable(getSortedOverviewItems());
+}
+
+function isOverviewManualOrderMode() {
+  return overviewSort.key === defaultOverviewSort.key && overviewSort.direction === defaultOverviewSort.direction;
+}
+
+function overviewDragTitle() {
+  return isOverviewManualOrderMode() ? "拖动排序" : "切回标的代码升序后可拖动排序";
+}
+
+function overviewDragDisabledText() {
+  return isOverviewManualOrderMode() ? "" : "true";
 }
 
 function numberTone(value) {
@@ -624,6 +740,12 @@ overviewNext.addEventListener("click", () => {
   loadMarketOverview(Math.min(overviewTotalPages, overviewPage + 1));
 });
 overviewTable.addEventListener("click", (event) => {
+  const sortButton = event.target.closest(".overview-sort-button");
+  if (sortButton) {
+    event.stopPropagation();
+    applyOverviewSort(sortButton.dataset.sortKey);
+    return;
+  }
   if (event.target.closest(".drag-handle")) {
     return;
   }
@@ -638,6 +760,11 @@ overviewTable.addEventListener("dragstart", (event) => {
   const row = event.target.closest("tr[data-symbol]");
   if (!handle || !row) {
     event.preventDefault();
+    return;
+  }
+  if (!isOverviewManualOrderMode()) {
+    event.preventDefault();
+    setStatus("请先切回标的代码升序，再拖动保存默认排序。", "neutral");
     return;
   }
   draggedOverviewSymbol = row.dataset.symbol;

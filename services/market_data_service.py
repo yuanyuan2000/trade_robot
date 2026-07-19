@@ -5,11 +5,55 @@ from datetime import date, timedelta
 from config import FULL_HISTORY_START_DATE
 from database import repository
 from services.api_errors import MarketDataError
-from services.twelve_data_client import fetch_daily_prices
+from services.twelve_data_client import fetch_daily_prices as fetch_twelve_data_daily_prices
+from services.yahoo_finance_client import fetch_daily_prices as fetch_yahoo_daily_prices
 
 
 def normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper()
+
+
+def _source_symbol(alias: dict, provider: str) -> str | None:
+    if provider == "yahoo":
+        return alias.get("yahoo_symbol")
+    if provider == "twelvedata":
+        return alias.get("twelvedata_symbol")
+    return alias.get("common_symbol")
+
+
+def _fetch_daily_prices_with_fallback(alias: dict, start_date: date) -> tuple[list[dict], str, str]:
+    attempts = [
+        ("yahoo", _source_symbol(alias, "yahoo"), fetch_yahoo_daily_prices),
+        ("twelvedata", _source_symbol(alias, "twelvedata"), fetch_twelve_data_daily_prices),
+    ]
+    first_error: MarketDataError | None = None
+
+    for provider, provider_symbol, fetcher in attempts:
+        if not provider_symbol:
+            continue
+        try:
+            rows = fetcher(provider_symbol, start_date=start_date)
+            repository.log_api_request(
+                provider=provider,
+                status="success",
+                symbol=alias["common_symbol"],
+                message=f"Fetched {len(rows)} daily rows from {provider_symbol} since {FULL_HISTORY_START_DATE}.",
+            )
+            return rows, provider, provider_symbol
+        except MarketDataError as exc:
+            if first_error is None:
+                first_error = exc
+            repository.log_api_request(
+                provider=provider,
+                status="error",
+                symbol=alias["common_symbol"],
+                error_code=exc.code,
+                message=f"{provider_symbol}: {exc.detail or exc.message}",
+            )
+
+    if first_error:
+        raise first_error
+    raise ValueError("Symbol is required")
 
 
 def _has_full_history(symbol: str, start_date: date) -> bool:
@@ -47,40 +91,27 @@ def latest_required_data_date(today: date) -> date:
 
 
 def get_market_data(symbol: str) -> dict:
-    normalized = normalize_symbol(symbol)
-    if not normalized:
+    if not normalize_symbol(symbol):
         raise ValueError("Symbol is required")
 
+    alias = repository.resolve_symbol_alias(symbol)
+    normalized = alias["common_symbol"]
+    display_symbol = alias["display_name"]
     start_date = date.fromisoformat(FULL_HISTORY_START_DATE)
     source = "database"
 
     if not _has_cached_prices(normalized):
-        try:
-            rows = fetch_daily_prices(normalized, start_date=start_date)
-            repository.upsert_symbol(normalized)
-            repository.upsert_daily_prices(normalized, rows)
-            repository.log_api_request(
-                provider="twelvedata",
-                status="success",
-                symbol=normalized,
-                message=f"Fetched {len(rows)} daily rows from {FULL_HISTORY_START_DATE}.",
-            )
-            source = "api"
-        except MarketDataError as exc:
-            repository.log_api_request(
-                provider="twelvedata",
-                status="error",
-                symbol=normalized,
-                error_code=exc.code,
-                message=exc.detail or exc.message,
-            )
-            raise
+        rows, provider, _provider_symbol = _fetch_daily_prices_with_fallback(alias, start_date)
+        repository.upsert_symbol(normalized)
+        repository.upsert_daily_prices(normalized, rows)
+        source = provider
 
     rows = repository.get_daily_prices(normalized, start_date.isoformat())
     if not rows:
         return {
             "ok": True,
-            "symbol": normalized,
+            "symbol": display_symbol,
+            "canonical_symbol": normalized,
             "source": source,
             "warning": f"没有可展示的 {FULL_HISTORY_START_DATE} 以来行情数据。",
             "symbol_settings": repository.get_symbol(normalized),
@@ -90,7 +121,8 @@ def get_market_data(symbol: str) -> dict:
 
     return {
         "ok": True,
-        "symbol": normalized,
+        "symbol": display_symbol,
+        "canonical_symbol": normalized,
         "source": source,
         "warning": None,
         "symbol_settings": repository.get_symbol(normalized),
@@ -100,29 +132,26 @@ def get_market_data(symbol: str) -> dict:
 
 
 def update_full_market_data(symbol: str) -> dict:
-    normalized = normalize_symbol(symbol)
-    if not normalized:
+    if not normalize_symbol(symbol):
         raise ValueError("Symbol is required")
 
+    alias = repository.resolve_symbol_alias(symbol)
+    normalized = alias["common_symbol"]
+    display_symbol = alias["display_name"]
     start_date = date.fromisoformat(FULL_HISTORY_START_DATE)
     source = "database"
 
     if not _has_full_history(normalized, start_date):
-        rows = fetch_daily_prices(normalized, start_date=start_date)
+        rows, provider, _provider_symbol = _fetch_daily_prices_with_fallback(alias, start_date)
         repository.upsert_symbol(normalized)
         repository.upsert_daily_prices(normalized, rows)
-        repository.log_api_request(
-            provider="twelvedata",
-            status="success",
-            symbol=normalized,
-            message=f"Updated full history with {len(rows)} daily rows from {FULL_HISTORY_START_DATE}.",
-        )
-        source = "api"
+        source = provider
 
     rows = repository.get_daily_prices(normalized, start_date.isoformat())
     return {
         "ok": True,
-        "symbol": normalized,
+        "symbol": display_symbol,
+        "canonical_symbol": normalized,
         "source": source,
         "warning": None,
         "symbol_settings": repository.get_symbol(normalized),
