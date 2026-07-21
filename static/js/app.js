@@ -1,6 +1,8 @@
 const statusEl = document.getElementById("market-status");
 const symbolForm = document.getElementById("symbol-form");
 const symbolInput = document.getElementById("symbol-input");
+const marketPageTitle = document.getElementById("market-page-title");
+const marketSubtitle = document.getElementById("market-subtitle");
 const chartTitle = document.getElementById("chart-title");
 const chartSource = document.getElementById("chart-source");
 const marketOverviewPanel = document.getElementById("market-overview-panel");
@@ -28,9 +30,14 @@ const symbolSettingsToggle = document.getElementById("symbol-settings-toggle");
 const symbolSettingsPanel = document.getElementById("symbol-settings-panel");
 const symbolSettingsClose = document.getElementById("symbol-settings-close");
 const showWeekendData = document.getElementById("show-weekend-data");
+const analysisControls = document.getElementById("analysis-controls");
+const analysisAlgorithm = document.getElementById("analysis-algorithm");
+const runAnalysisButton = document.getElementById("run-analysis-button");
+const trendlineLegend = document.getElementById("trendline-legend");
 let heartbeatTimer;
 let currentSymbol = "";
 let currentViewCode = "1D";
+let currentWorkspaceMode = "market";
 let currentSymbolIndicators = [];
 let indicatorCatalog = [];
 let currentRawMarketData = [];
@@ -68,6 +75,18 @@ function updateChartTitle(symbol) {
   chartTitle.textContent = `${symbol} ${getChartPeriodLabel()}`;
 }
 
+function applyWorkspaceMode(mode) {
+  currentWorkspaceMode = mode === "analysis" ? "analysis" : "market";
+  const isAnalysis = currentWorkspaceMode === "analysis";
+  marketPageTitle.textContent = isAnalysis ? "智能分析" : "查看行情";
+  marketSubtitle.textContent = isAnalysis ? "K线智能识别与算法分析" : "2020年以来行情数据";
+  analysisControls.hidden = !isAnalysis;
+  trendlineLegend.hidden = !isAnalysis || !trendlineLegend.innerHTML;
+  if (!isAnalysis) {
+    clearTrendlineAnalysis();
+  }
+}
+
 function setStatus(message, type = "neutral") {
   statusEl.textContent = message;
   statusEl.className = `status ${type}`;
@@ -96,6 +115,7 @@ async function loadMarketData(symbol) {
   showMarketDetail();
   updateChartTitle(normalized);
   chartSource.textContent = "加载中";
+  clearTrendlineAnalysis();
   setStatus(`正在加载 ${normalized} 2020年以来日线行情...`, "neutral");
 
   try {
@@ -123,6 +143,8 @@ async function loadMarketData(symbol) {
 
     if (payload.warning) {
       setStatus(payload.warning, "warning");
+    } else if (currentWorkspaceMode === "analysis") {
+      setStatus(`已加载 ${payload.symbol}，可点击智能识别直线趋势线。`, "success");
     } else {
       const firstDate = payload.data[0]?.date || "-";
       const lastDate = payload.data[payload.data.length - 1]?.date || "-";
@@ -245,6 +267,7 @@ function showMarketOverview() {
   marketDetailPanel.hidden = true;
   indicatorPanel.hidden = true;
   symbolSettingsPanel.hidden = true;
+  clearTrendlineAnalysis();
   chartSource.textContent = "等待查询";
 }
 
@@ -646,6 +669,117 @@ function renderCurrentMarketData() {
     ? currentRawMarketData
     : currentRawMarketData.filter((row) => !isWeekendDate(row.date));
   renderCandles(rows);
+  clearTrendlineAnalysis();
+}
+
+async function runTrendlineAnalysis() {
+  if (!currentSymbol) {
+    setStatus("请先输入并加载一个标的。", "error");
+    return;
+  }
+  if (analysisAlgorithm.value !== "trendlines") {
+    setStatus("当前算法暂未实现。", "error");
+    return;
+  }
+
+  runAnalysisButton.disabled = true;
+  setStatus(`正在识别 ${currentSymbol} 最新150根${getChartPeriodLabel()}的直线趋势线...`, "neutral");
+  try {
+    const params = new URLSearchParams({
+      symbol: currentSymbol,
+      period: getChartPeriod(),
+      limit: "150",
+      show_weekend_data: currentSymbolSettings.show_weekend_data ? "1" : "0",
+    });
+    const response = await fetch(`/api/analysis/trendlines?${params}`);
+    const payload = await parseJsonResponse(response);
+    if (!payload.ok) {
+      setStatus(payload.error?.message || "趋势线识别失败。", "error");
+      clearTrendlineAnalysis();
+      return;
+    }
+    const trendlines = decorateTrendlines(payload.trends || []);
+    setChartTrendlines(trendlines);
+    renderTrendlineLegend(trendlines);
+    const count = trendlines.length;
+    const suffix = payload.message ? ` ${payload.message}` : "";
+    setStatus(
+      count ? `已识别 ${count} 条直线趋势线。` : `未识别出满足阈值的趋势线。${suffix}`,
+      count ? "success" : "warning",
+    );
+  } catch (error) {
+    clearTrendlineAnalysis();
+    setStatus(error.message || "趋势线识别失败。", "error");
+  } finally {
+    runAnalysisButton.disabled = false;
+  }
+}
+
+function clearTrendlineAnalysis() {
+  if (typeof clearChartTrendlines === "function") {
+    clearChartTrendlines();
+  }
+  trendlineLegend.innerHTML = "";
+  trendlineLegend.hidden = true;
+}
+
+function renderTrendlineLegend(trendlines) {
+  if (!trendlines.length || currentWorkspaceMode !== "analysis") {
+    trendlineLegend.innerHTML = "";
+    trendlineLegend.hidden = true;
+    return;
+  }
+
+  trendlineLegend.innerHTML = trendlines.map((line) => `
+    <div class="trendline-row">
+      <span class="trendline-swatch trendline-${escapeHtml(line.tier)}" style="border-top-color:${escapeHtml(line.color)}"></span>
+      <span class="trendline-name">${escapeHtml(trendlineName(line))}</span>
+      <span class="trendline-value">${Number(line.tier_score).toFixed(1)}</span>
+    </div>
+  `).join("");
+  trendlineLegend.hidden = false;
+  if (typeof updateTrendlineLegendPlacement === "function") {
+    updateTrendlineLegendPlacement();
+  }
+}
+
+function decorateTrendlines(trendlines) {
+  const tierCounts = {};
+  return trendlines.map((line) => {
+    const key = `${line.tier}-${line.direction}`;
+    const index = tierCounts[key] || 0;
+    tierCounts[key] = index + 1;
+    return {
+      ...line,
+      color: trendlineColor(line, index),
+      color_index: index,
+    };
+  });
+}
+
+function trendlineColor(line, index) {
+  const palettes = {
+    "long-up": ["#2563eb", "#14b8a6", "#64748b"],
+    "long-down": ["#dc2626", "#f59e0b", "#9333ea"],
+    "medium-up": ["#06b6d4", "#22c55e", "#0ea5e9", "#84cc16"],
+    "medium-down": ["#f97316", "#ef4444", "#a855f7", "#eab308"],
+    "short-up": ["#8b5cf6", "#10b981"],
+    "short-down": ["#d946ef", "#fb7185"],
+  };
+  const colors = palettes[`${line.tier}-${line.direction}`] || ["#64748b"];
+  return colors[index % colors.length];
+}
+
+function trendlineName(line) {
+  const tierLabels = { long: "L", medium: "M", short: "S-now" };
+  const directionLabels = { up: "上涨", down: "下跌" };
+  const statusLabels = {
+    current: "当前",
+    historical: "历史",
+    valid: "有效",
+    challenging: "挑战中",
+  };
+  return `${tierLabels[line.tier] || line.tier} ${directionLabels[line.direction] || line.direction} ${statusLabels[line.status] || line.status}`;
 }
 
 function isWeekendDate(dateText) {
@@ -871,9 +1005,19 @@ function bindNavigation() {
       document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
       button.classList.add("active");
       document.getElementById(button.dataset.view).classList.add("active");
+      applyWorkspaceMode(button.dataset.mode || "market");
 
       if (button.dataset.view === "database-view") {
         loadTables();
+      } else if (button.dataset.view === "market-view" && currentWorkspaceMode === "analysis") {
+        marketOverviewPanel.hidden = true;
+        if (!currentSymbol) {
+          marketDetailPanel.hidden = true;
+          setStatus("请输入标的代码，加载K线后可执行智能识别。", "neutral");
+        } else {
+          showMarketDetail();
+          setStatus(`当前为智能分析模式，可对 ${currentSymbol} 执行趋势线识别。`, "neutral");
+        }
       } else if (button.dataset.view === "market-view" && marketOverviewPanel.hidden) {
         loadMarketOverview(overviewPage);
       }
@@ -923,6 +1067,7 @@ backToOverview.addEventListener("click", () => {
   symbolInput.value = "";
   renderCandles([]);
   setChartIndicators([]);
+  clearTrendlineAnalysis();
   loadMarketOverview(overviewPage);
 });
 overviewPrev.addEventListener("click", () => {
@@ -1014,6 +1159,7 @@ favoriteIndicators.addEventListener("click", (event) => {
 });
 customIndicatorForm.addEventListener("submit", createAndAddIndicator);
 updateDataButton.addEventListener("click", updateCurrentMarketData);
+runAnalysisButton.addEventListener("click", runTrendlineAnalysis);
 symbolSettingsToggle.addEventListener("click", () => {
   symbolSettingsPanel.hidden = !symbolSettingsPanel.hidden;
   indicatorPanel.hidden = true;
@@ -1026,7 +1172,11 @@ document.addEventListener("indicator-action", handleIndicatorAction);
 document.addEventListener("chart-period-change", async () => {
   updateChartTitle(symbolInput.value.trim().toUpperCase() || "行情");
   currentViewCode = getChartPeriod();
+  clearTrendlineAnalysis();
   await loadSymbolIndicators();
+  if (currentWorkspaceMode === "analysis" && currentSymbol) {
+    setStatus("K线周期已切换，请重新点击智能识别。", "neutral");
+  }
 });
 
 bindNavigation();

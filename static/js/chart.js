@@ -8,6 +8,7 @@ const chartState = {
   candles: [],
   indicators: [],
   indicatorSeries: [],
+  trendlines: [],
   period: "1D",
   firstVisible: 0,
   visibleCount: 0,
@@ -78,6 +79,15 @@ function setChartIndicators(indicators) {
   recalculateIndicators();
   renderIndicatorLegend();
   drawChart();
+}
+
+function setChartTrendlines(trendlines) {
+  chartState.trendlines = Array.isArray(trendlines) ? trendlines : [];
+  drawChart();
+}
+
+function clearChartTrendlines() {
+  setChartTrendlines([]);
 }
 
 function bindPeriodButtons() {
@@ -295,8 +305,10 @@ function drawChart() {
   drawTimeAxis(ctx, plot, visible, theme);
   drawCandleSeries(ctx, plot, visible, priceRange, theme);
   drawIndicators(ctx, plot, priceRange);
+  drawTrendlines(ctx, plot, priceRange, theme);
   drawCrosshair(ctx, plot, visible, priceRange, theme);
   renderIndicatorLegend();
+  updateTrendlineLegendPlacement();
 }
 
 function getChartTheme() {
@@ -309,6 +321,7 @@ function getChartTheme() {
     crosshair: styles.getPropertyValue("--chart-crosshair").trim() || "rgba(28, 38, 48, 0.35)",
     up: styles.getPropertyValue("--success").trim() || "#23745a",
     down: styles.getPropertyValue("--danger").trim() || "#b54747",
+    danger: styles.getPropertyValue("--danger").trim() || "#b54747",
   };
 }
 
@@ -458,6 +471,173 @@ function drawIndicators(ctx, plot, priceRange) {
     }
     ctx.stroke();
   }
+}
+
+function drawTrendlines(ctx, plot, priceRange, theme) {
+  if (!chartState.trendlines.length) {
+    return;
+  }
+
+  const slot = plot.width / chartState.visibleCount;
+  const visibleStart = chartState.firstVisible;
+  const visibleEnd = chartState.firstVisible + chartState.visibleCount - 1;
+
+  for (const line of chartState.trendlines) {
+    const startIndex = Number(line.start_index);
+    const endIndex = Number(line.end_index);
+    const projectionEndIndex = Number(line.projection_end_index ?? line.end_index);
+    if (!Number.isFinite(startIndex) || !Number.isFinite(endIndex) || !Number.isFinite(projectionEndIndex)) {
+      continue;
+    }
+    if (projectionEndIndex < visibleStart || startIndex > visibleEnd) {
+      continue;
+    }
+
+    const color = getTrendlineColor(line, theme);
+    const width = getTrendlineWidth(line.tier);
+    const dash = getTrendlineDash(line.tier);
+
+    drawTrendlineSegment(
+      ctx,
+      plot,
+      priceRange,
+      slot,
+      line,
+      startIndex,
+      Math.min(endIndex, projectionEndIndex),
+      color,
+      width,
+      dash,
+      0.94,
+    );
+
+    if (projectionEndIndex > endIndex) {
+      drawTrendlineSegment(
+        ctx,
+        plot,
+        priceRange,
+        slot,
+        line,
+        endIndex,
+        projectionEndIndex,
+        color,
+        Math.max(1.4, width - 0.7),
+        [2, 5],
+        0.42,
+      );
+    }
+  }
+  ctx.globalAlpha = 1;
+  ctx.setLineDash([]);
+}
+
+function drawTrendlineSegment(ctx, plot, priceRange, slot, line, fromIndex, toIndex, color, width, dash, alpha) {
+  const clippedStart = clamp(fromIndex, chartState.firstVisible, chartState.firstVisible + chartState.visibleCount - 1);
+  const clippedEnd = clamp(toIndex, chartState.firstVisible, chartState.firstVisible + chartState.visibleCount - 1);
+  if (clippedEnd < clippedStart) {
+    return;
+  }
+
+  const startY = trendlinePriceAt(line, clippedStart);
+  const endY = trendlinePriceAt(line, clippedEnd);
+  if (!Number.isFinite(startY) || !Number.isFinite(endY)) {
+    return;
+  }
+
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.globalAlpha = alpha;
+  ctx.setLineDash(dash);
+  ctx.beginPath();
+  ctx.moveTo(indexToX(clippedStart, plot, slot), priceToY(startY, plot, priceRange));
+  ctx.lineTo(indexToX(clippedEnd, plot, slot), priceToY(endY, plot, priceRange));
+  ctx.stroke();
+  ctx.restore();
+}
+
+function trendlinePriceAt(line, index) {
+  const startIndex = Number(line.start_index);
+  const startPrice = Number(line.start_price);
+  const slope = Number(line.slope);
+  return startPrice + slope * (index - startIndex);
+}
+
+function indexToX(index, plot, slot) {
+  return plot.left + slot * (index - chartState.firstVisible + 0.5);
+}
+
+function getTrendlineColor(line, theme) {
+  if (line.color) {
+    return line.color;
+  }
+  if (line.tier === "short") {
+    return line.direction === "up" ? "#8b5cf6" : "#d946ef";
+  }
+  if (line.tier === "medium") {
+    return line.direction === "up" ? "#06b6d4" : "#f97316";
+  }
+  return line.direction === "up" ? "#2563eb" : theme.danger || "#dc2626";
+}
+
+function getTrendlineWidth(tier) {
+  if (tier === "long") {
+    return 2.8;
+  }
+  if (tier === "short") {
+    return 2.5;
+  }
+  return 2;
+}
+
+function getTrendlineDash(tier) {
+  if (tier === "long") {
+    return [2, 6];
+  }
+  if (tier === "medium") {
+    return [8, 5];
+  }
+  return [];
+}
+
+function updateTrendlineLegendPlacement() {
+  const legend = document.getElementById("trendline-legend");
+  if (!legend || legend.hidden || !chartState.candles.length) {
+    return;
+  }
+
+  const plot = getPlotArea();
+  const visible = getVisibleCandles();
+  if (!visible.length) {
+    return;
+  }
+
+  const priceRange = getPriceRange(visible);
+  const scores = {
+    "top-left": 0,
+    "top-right": 0,
+    "bottom-left": 0,
+    "bottom-right": 0,
+  };
+
+  visible.forEach((candle, visibleIndex) => {
+    const horizontal = visibleIndex < visible.length / 2 ? "left" : "right";
+    const highY = priceToY(candle.high, plot, priceRange);
+    const lowY = priceToY(candle.low, plot, priceRange);
+    const midY = (highY + lowY) / 2;
+    const vertical = midY < plot.top + plot.height / 2 ? "top" : "bottom";
+    const spanWeight = 1 + Math.min(3, Math.abs(lowY - highY) / 22);
+    scores[`${vertical}-${horizontal}`] += spanWeight;
+  });
+
+  const placement = Object.entries(scores).sort((left, right) => left[1] - right[1])[0][0];
+  legend.classList.remove(
+    "trendline-legend-top-left",
+    "trendline-legend-top-right",
+    "trendline-legend-bottom-left",
+    "trendline-legend-bottom-right",
+  );
+  legend.classList.add(`trendline-legend-${placement}`);
 }
 
 function drawEmptyState(ctx, width, height) {
@@ -647,9 +827,20 @@ function getPriceRange(candles) {
       }
     }
   }
+  const visibleTrendlineValues = [];
+  for (const line of chartState.trendlines) {
+    const start = Math.max(chartState.firstVisible, Number(line.start_index));
+    const end = Math.min(
+      chartState.firstVisible + chartState.visibleCount - 1,
+      Number(line.projection_end_index ?? line.end_index),
+    );
+    if (Number.isFinite(start) && Number.isFinite(end) && end >= start) {
+      visibleTrendlineValues.push(trendlinePriceAt(line, start), trendlinePriceAt(line, end));
+    }
+  }
 
-  let min = Math.min(...lows, ...visibleIndicatorValues);
-  let max = Math.max(...highs, ...visibleIndicatorValues);
+  let min = Math.min(...lows, ...visibleIndicatorValues, ...visibleTrendlineValues);
+  let max = Math.max(...highs, ...visibleIndicatorValues, ...visibleTrendlineValues);
   if (!Number.isFinite(min) || !Number.isFinite(max)) {
     min = 0;
     max = 1;

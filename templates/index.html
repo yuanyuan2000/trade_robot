@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260721-03') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260722-02') }}">
   </head>
   <body class="theme-dark">
     <aside class="sidebar">
@@ -20,6 +20,10 @@
         <button class="nav-item active" type="button" data-view="market-view">
           <span class="nav-icon">⌁</span>
           <span>查看行情</span>
+        </button>
+        <button class="nav-item" type="button" data-view="market-view" data-mode="analysis">
+          <span class="nav-icon">⌬</span>
+          <span>智能分析</span>
         </button>
         <button class="nav-item" type="button" data-view="database-view">
           <span class="nav-icon">▤</span>
@@ -51,7 +55,7 @@
       <section id="market-view" class="view active">
         <header class="page-header">
           <div>
-            <h2>查看行情</h2>
+            <h2 id="market-page-title">查看行情</h2>
             <p id="market-subtitle">2020年以来行情数据</p>
           </div>
           <form id="symbol-form" class="search-bar">
@@ -110,6 +114,12 @@
                   <path d="M17 14h.01" />
                 </svg>
               </button>
+              <div id="analysis-controls" class="analysis-controls" hidden>
+                <select id="analysis-algorithm" aria-label="智能分析算法">
+                  <option value="trendlines">直线趋势线</option>
+                </select>
+                <button id="run-analysis-button" type="button">智能识别</button>
+              </div>
               <button id="update-data-button" class="tool-icon-button" type="button" title="更新数据" aria-label="更新数据">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M21 12a9 9 0 0 1-15.2 6.5" />
@@ -130,6 +140,7 @@
           <div id="chart" class="chart">
             <canvas id="kline-canvas" class="kline-canvas"></canvas>
             <div id="indicator-legend" class="indicator-legend"></div>
+            <div id="trendline-legend" class="trendline-legend" hidden></div>
             <div id="ohlcv-tooltip" class="ohlcv-tooltip" hidden></div>
           </div>
         </section>
@@ -212,8 +223,8 @@
       </section>
     </main>
 
-    <script src="{{ url_for('static', filename='js/chart.js', v='20260719-03') }}"></script>
+    <script src="{{ url_for('static', filename='js/chart.js', v='20260722-02') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260719-01') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260721-03') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260722-02') }}"></script>
   </body>
 </html>

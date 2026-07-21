@@ -29,6 +29,7 @@ from services.market_data_service import (
     sync_market_overview_daily_prices,
     update_full_market_data,
 )
+from services.trendline_analysis_service import analyze_symbol_trendlines
 
 
 app = Flask(__name__)
@@ -69,6 +70,59 @@ def market_data_query():
 @app.route("/api/market-data/<path:symbol>")
 def market_data(symbol: str):
     return market_data_response(symbol)
+
+
+@app.route("/api/analysis/trendlines")
+def trendline_analysis_query():
+    return trendline_analysis_response(request.args.get("symbol", ""))
+
+
+@app.route("/api/analysis/trendlines/<path:symbol>")
+def trendline_analysis(symbol: str):
+    return trendline_analysis_response(symbol)
+
+
+def trendline_analysis_response(symbol: str):
+    try:
+        return jsonify(
+            analyze_symbol_trendlines(
+                symbol,
+                period=request.args.get("period", "1D"),
+                limit=int(request.args.get("limit", "150")),
+                show_weekend_data=request.args.get("show_weekend_data"),
+            )
+        )
+    except ValueError as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "INVALID_INPUT",
+                        "message": str(exc),
+                        "detail": None,
+                    },
+                }
+            ),
+            400,
+        )
+    except MarketDataError as exc:
+        return jsonify({"ok": False, "error": exc.to_dict()}), 502
+    except Exception as exc:
+        app.logger.exception("Unexpected trendline analysis error")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "UNKNOWN_ERROR",
+                        "message": "系统识别趋势线时发生未知错误。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            500,
+        )
 
 
 def market_data_response(symbol: str):

@@ -40,3 +40,6 @@ backtest_outputs/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Reference files
+algorithm/

@@ -514,6 +514,28 @@ button:disabled {
   gap: 8px;
 }
 
+.analysis-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 4px;
+}
+
+.analysis-controls[hidden] {
+  display: none;
+}
+
+.analysis-controls select {
+  width: 132px;
+  height: 32px;
+  border-radius: 8px;
+}
+
+.analysis-controls button {
+  height: 32px;
+  white-space: nowrap;
+}
+
 .period-switch {
   display: flex;
   align-items: center;
@@ -562,6 +584,112 @@ button:disabled {
   gap: 5px;
   max-width: min(430px, calc(100% - 95px));
   pointer-events: auto;
+}
+
+.trendline-legend {
+  position: absolute;
+  z-index: 2;
+  display: grid;
+  gap: 4px;
+  max-width: min(280px, calc(100% - 100px));
+  pointer-events: none;
+}
+
+.trendline-legend[hidden] {
+  display: none;
+}
+
+.trendline-legend-top-left {
+  top: 10px;
+  left: 10px;
+}
+
+.trendline-legend-top-right {
+  top: 10px;
+  right: 78px;
+}
+
+.trendline-legend-bottom-left {
+  bottom: 40px;
+  left: 10px;
+}
+
+.trendline-legend-bottom-right {
+  right: 78px;
+  bottom: 40px;
+}
+
+.trendline-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: fit-content;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--floating-bg);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1;
+  padding: 5px 7px;
+}
+
+.trendline-swatch {
+  width: 26px;
+  height: 0;
+  border-top: 3px solid #2563eb;
+}
+
+.trendline-long {
+  border-top-style: dotted;
+  border-top-width: 3px;
+}
+
+.trendline-medium {
+  border-top-style: dashed;
+  border-top-width: 2px;
+}
+
+.trendline-short {
+  border-top-style: solid;
+  border-top-width: 3px;
+}
+
+.trendline-up.trendline-long {
+  border-top-color: #2563eb;
+}
+
+.trendline-down.trendline-long {
+  border-top-color: var(--danger);
+}
+
+.trendline-up.trendline-medium {
+  border-top-color: #06b6d4;
+}
+
+.trendline-down.trendline-medium {
+  border-top-color: #f97316;
+}
+
+.trendline-up.trendline-short {
+  border-top-color: #8b5cf6;
+}
+
+.trendline-down.trendline-short {
+  border-top-color: #d946ef;
+}
+
+.trendline-name {
+  overflow: hidden;
+  max-width: 158px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trendline-value {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
 
 .legend-row {
