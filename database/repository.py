@@ -199,8 +199,8 @@ def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
         conn.execute(
             """
             INSERT INTO symbols
-                (symbol, name, exchange_name, currency, show_weekend_data, display_order, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                (symbol, name, exchange_name, currency, show_weekend_data, show_in_overview, display_order, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 name = COALESCE(excluded.name, symbols.name),
                 exchange_name = COALESCE(excluded.exchange_name, symbols.exchange_name),
@@ -257,7 +257,7 @@ def get_symbol(symbol: str) -> dict:
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT id, symbol, name, exchange_name, currency, show_weekend_data, created_at, updated_at
+            SELECT id, symbol, name, exchange_name, currency, show_weekend_data, show_in_overview, created_at, updated_at
             FROM symbols
             WHERE id = ?
             """,
@@ -265,6 +265,7 @@ def get_symbol(symbol: str) -> dict:
         ).fetchone()
     data = dict(row)
     data["show_weekend_data"] = bool(data["show_weekend_data"])
+    data["show_in_overview"] = bool(data["show_in_overview"])
     data["display_symbol"] = get_symbol_display_name(data["symbol"])
     return data
 
@@ -274,7 +275,7 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
     with get_connection() as conn:
         latest_rows = conn.execute(
             """
-            SELECT date, open, high, low, close, volume
+            SELECT date, open, high, low, close, volume, COALESCE(updated_at, created_at) AS price_updated_at
             FROM daily_prices
             WHERE symbol = ?
             ORDER BY date DESC
@@ -340,6 +341,7 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
 
     return {
         "latest_date": latest["date"] if latest else None,
+        "latest_price_updated_at": latest["price_updated_at"] if latest else None,
         "latest_price": latest_price,
         "previous_close": previous_close,
         "daily_change": daily_change,
@@ -358,11 +360,14 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
 
 def list_market_overview(page: int = 1, page_size: int = 100) -> dict:
     with get_connection() as conn:
-        total_rows = conn.execute("SELECT COUNT(*) AS count FROM symbols").fetchone()["count"]
+        total_rows = conn.execute(
+            "SELECT COUNT(*) AS count FROM symbols WHERE show_in_overview = 1"
+        ).fetchone()["count"]
         rows = conn.execute(
             """
             SELECT id, symbol, name, display_order, updated_at
             FROM symbols
+            WHERE show_in_overview = 1
             ORDER BY display_order ASC, id ASC
             """
         ).fetchall()
@@ -394,6 +399,7 @@ def update_symbol_display_order(symbols: list[str]) -> dict:
             """
             SELECT symbol
             FROM symbols
+            WHERE show_in_overview = 1
             ORDER BY display_order ASC, id ASC
             """
         ).fetchall()
@@ -424,11 +430,66 @@ def update_symbol_display_order(symbols: list[str]) -> dict:
     return list_market_overview()
 
 
+def list_overview_symbols() -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.symbol, a.id AS alias_id, a.display_name, a.yahoo_symbol, a.twelvedata_symbol
+            FROM symbols s
+            LEFT JOIN symbol_aliases a ON UPPER(a.common_symbol) = UPPER(s.symbol)
+            WHERE s.show_in_overview = 1
+            ORDER BY s.display_order ASC, s.id ASC
+            """
+        ).fetchall()
+
+    result = []
+    for row in rows:
+        data = dict(row)
+        data["common_symbol"] = data.pop("symbol")
+        data["display_name"] = data["display_name"] or data["common_symbol"]
+        if data.pop("alias_id") is None:
+            data["yahoo_symbol"] = data["common_symbol"]
+            data["twelvedata_symbol"] = data["common_symbol"]
+        result.append(data)
+    return result
+
+
+def set_symbol_overview_visibility(symbol: str, show_in_overview: bool) -> dict:
+    normalized = normalize_symbol_key(symbol)
+    if not normalized:
+        raise ValueError("Symbol is required")
+
+    now = utc_now_iso()
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT symbol
+            FROM symbols
+            WHERE UPPER(symbol) = ?
+            LIMIT 1
+            """,
+            (normalized,),
+        ).fetchone()
+        if not row:
+            raise ValueError("Unknown symbol")
+        conn.execute(
+            """
+            UPDATE symbols
+            SET show_in_overview = ?, updated_at = ?
+            WHERE symbol = ?
+            """,
+            (1 if show_in_overview else 0, now, row["symbol"]),
+        )
+    return get_symbol(row["symbol"])
+
+
 def update_symbol_settings(symbol: str, payload: dict) -> dict:
     symbol_id = upsert_symbol(symbol)
     allowed: dict[str, object] = {}
     if "show_weekend_data" in payload:
         allowed["show_weekend_data"] = 1 if bool(payload["show_weekend_data"]) else 0
+    if "show_in_overview" in payload:
+        allowed["show_in_overview"] = 1 if bool(payload["show_in_overview"]) else 0
 
     if allowed:
         allowed["updated_at"] = utc_now_iso()

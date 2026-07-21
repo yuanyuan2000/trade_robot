@@ -61,6 +61,12 @@ def migrate_database(conn: sqlite3.Connection) -> None:
     ensure_column(
         conn,
         table_name="symbols",
+        column_name="show_in_overview",
+        definition="INTEGER NOT NULL DEFAULT 1",
+    )
+    ensure_column(
+        conn,
+        table_name="symbols",
         column_name="display_order",
         definition="INTEGER NOT NULL DEFAULT 0",
     )

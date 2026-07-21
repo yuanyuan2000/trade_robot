@@ -24,7 +24,11 @@ from config import (
 from database.db import backup_database, init_database
 from database import repository
 from services.api_errors import MarketDataError
-from services.market_data_service import get_market_data, update_full_market_data
+from services.market_data_service import (
+    get_market_data,
+    sync_market_overview_daily_prices,
+    update_full_market_data,
+)
 
 
 app = Flask(__name__)
@@ -32,6 +36,13 @@ app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 session_lock = threading.Lock()
 last_heartbeat_at: datetime | None = None
 shutdown_pending = False
+overview_sync_lock = threading.Lock()
+overview_sync_state = {
+    "running": False,
+    "last_result": None,
+    "last_error": None,
+    "updated_at": None,
+}
 
 
 def now_utc() -> datetime:
@@ -196,6 +207,157 @@ def market_overview_order():
                     "error": {
                         "code": "UNKNOWN_ERROR",
                         "message": "系统保存行情总览排序时发生未知错误。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            500,
+        )
+
+
+@app.route("/api/market-overview/sync-daily", methods=["POST"])
+def market_overview_sync_daily():
+    try:
+        started = start_overview_sync()
+        return jsonify({"ok": True, "running": True, "started": started, **overview_sync_snapshot()})
+    except Exception as exc:
+        app.logger.exception("Unexpected market overview daily sync error")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "UNKNOWN_ERROR",
+                        "message": "系统自动补齐行情总览日 K 时发生未知错误。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            500,
+        )
+
+
+@app.route("/api/market-overview/sync-status")
+def market_overview_sync_status():
+    return jsonify({"ok": True, **overview_sync_snapshot()})
+
+
+@app.route("/api/market-overview/refresh-prices", methods=["POST"])
+def market_overview_refresh_prices():
+    try:
+        started = start_overview_sync()
+        overview = repository.list_market_overview()
+        items = [
+            {
+                "symbol": item["symbol"],
+                "display_symbol": item["display_symbol"],
+                "source": "database",
+                "status": "success",
+                "latest_price": item["latest_price"],
+                "daily_change": item["daily_change"],
+                "daily_change_percent": item["daily_change_percent"],
+                "error": None,
+            }
+            for item in overview["items"]
+        ]
+        return jsonify(
+            {
+                "ok": True,
+                "source": "database",
+                "running": True,
+                "started": started,
+                "items": items,
+                "updated_rows": 0,
+            }
+        )
+    except Exception as exc:
+        app.logger.exception("Unexpected market overview price refresh error")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "UNKNOWN_ERROR",
+                        "message": "系统刷新行情总览实时价格时发生未知错误。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            500,
+        )
+
+
+def start_overview_sync() -> bool:
+    with overview_sync_lock:
+        if overview_sync_state["running"]:
+            return False
+        overview_sync_state["running"] = True
+        overview_sync_state["last_error"] = None
+        overview_sync_state["updated_at"] = now_utc().isoformat()
+
+    threading.Thread(target=run_overview_sync, daemon=True).start()
+    return True
+
+
+def run_overview_sync() -> None:
+    try:
+        result = sync_market_overview_daily_prices()
+        with overview_sync_lock:
+            overview_sync_state["last_result"] = result
+            overview_sync_state["last_error"] = None
+            overview_sync_state["updated_at"] = now_utc().isoformat()
+    except Exception as exc:
+        app.logger.exception("Background market overview sync failed")
+        with overview_sync_lock:
+            overview_sync_state["last_error"] = str(exc)
+            overview_sync_state["updated_at"] = now_utc().isoformat()
+    finally:
+        with overview_sync_lock:
+            overview_sync_state["running"] = False
+
+
+def overview_sync_snapshot() -> dict:
+    with overview_sync_lock:
+        return {
+            "running": bool(overview_sync_state["running"]),
+            "last_result": overview_sync_state["last_result"],
+            "last_error": overview_sync_state["last_error"],
+            "updated_at": overview_sync_state["updated_at"],
+        }
+
+
+@app.route("/api/market-overview/<path:symbol>", methods=["PATCH"])
+def patch_market_overview_symbol(symbol: str):
+    payload = request.get_json(silent=True) or {}
+    try:
+        show_in_overview = payload.get("show_in_overview")
+        if show_in_overview is None:
+            raise ValueError("show_in_overview is required")
+        settings = repository.set_symbol_overview_visibility(symbol, bool(show_in_overview))
+        return jsonify({"ok": True, "symbol_settings": settings, **repository.list_market_overview()})
+    except ValueError as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "INVALID_SYMBOL",
+                        "message": "行情总览标的请求无效。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            400,
+        )
+    except Exception as exc:
+        app.logger.exception("Unexpected market overview symbol patch error")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "UNKNOWN_ERROR",
+                        "message": "系统更新行情总览标的时发生未知错误。",
                         "detail": str(exc),
                     },
                 }
