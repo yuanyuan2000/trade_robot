@@ -778,8 +778,12 @@ function trendlineName(line) {
     historical: "历史",
     valid: "有效",
     challenging: "挑战中",
+    broken: "已结束",
   };
-  return `${tierLabels[line.tier] || line.tier} ${directionLabels[line.direction] || line.direction} ${statusLabels[line.status] || line.status}`;
+  const tierLabel = line.tier === "short" && !line.active
+    ? "S"
+    : (tierLabels[line.tier] || line.tier);
+  return `${tierLabel} ${directionLabels[line.direction] || line.direction} ${statusLabels[line.status] || line.status}`;
 }
 
 function isWeekendDate(dateText) {

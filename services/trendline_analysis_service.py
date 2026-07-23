@@ -7,8 +7,12 @@ market data rather than treated as immutable constants.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
+import json
+import threading
 from typing import Literal
 
 import numpy as np
@@ -21,6 +25,10 @@ from services.market_data_service import get_market_data
 Direction = Literal["up", "down"]
 Tier = Literal["long", "medium", "short"]
 SUPPORTED_PERIODS = {"1D", "3D", "1W", "1M"}
+ANALYSIS_CACHE_VERSION = "trendline-v7-performance-1"
+ANALYSIS_CACHE_MAX_SIZE = 64
+_analysis_result_cache: OrderedDict[tuple, tuple[dict, ...]] = OrderedDict()
+_analysis_result_cache_lock = threading.Lock()
 
 
 @dataclass
@@ -37,6 +45,15 @@ class TrendResult:
     touch_score: float
     rejection: float
     event_span: float
+    touch_distribution: float
+    max_touch_gap: float
+    interior_touches: int
+    first_touch: int
+    last_touch: int
+    body_integrity: float
+    body_breach_ratio: float
+    severe_body_breach_ratio: float
+    max_body_breach_run: int
     efficiency: float
     slope_strength: float
     drift_t: float
@@ -44,6 +61,10 @@ class TrendResult:
     @property
     def length(self) -> int:
         return self.end - self.start + 1
+
+    @property
+    def structure_length(self) -> int:
+        return self.last_touch - self.first_touch + 1
 
     def y(self, absolute_index: np.ndarray | float) -> np.ndarray:
         return self.intercept + self.slope * (np.asarray(absolute_index) - self.start)
@@ -63,7 +84,48 @@ class TieredTrend:
     @property
     def id(self) -> str:
         r = self.trend
-        return f"{self.tier[0].upper()}-{r.direction}-{r.start + 1}-{r.end + 1}"
+        return (
+            f"{self.tier[0].upper()}-{r.direction}-"
+            f"{r.first_touch + 1}-{r.last_touch + 1}"
+        )
+
+
+@dataclass(frozen=True)
+class ContactMetrics:
+    touches: int
+    touch_score: float
+    rejection: float
+    proximity: float
+    event_span: float
+    touch_distribution: float
+    max_touch_gap: float
+    interior_touches: int
+    first_touch: int
+    last_touch: int
+
+
+@dataclass(frozen=True)
+class BodyMetrics:
+    integrity: float
+    breach_ratio: float
+    severe_breach_ratio: float
+    max_breach_run: int
+
+
+@dataclass(frozen=True)
+class AnalysisArrays:
+    close: np.ndarray
+    atr: np.ndarray
+    anchor_up: np.ndarray
+    anchor_down: np.ndarray
+    body_edge_up: np.ndarray
+    body_edge_down: np.ndarray
+
+    def anchor(self, direction: Direction) -> np.ndarray:
+        return self.anchor_up if direction == "up" else self.anchor_down
+
+    def body_edge(self, direction: Direction) -> np.ndarray:
+        return self.body_edge_up if direction == "up" else self.body_edge_down
 
 
 def true_range(df: pd.DataFrame) -> np.ndarray:
@@ -80,6 +142,33 @@ def true_range(df: pd.DataFrame) -> np.ndarray:
     return value
 
 
+def _analysis_arrays(df: pd.DataFrame) -> AnalysisArrays:
+    cached = df.attrs.get("_trendline_analysis_arrays")
+    if cached is not None and len(cached.close) == len(df):
+        return cached
+
+    open_values = df["Open"].to_numpy()
+    close_values = df["Close"].to_numpy()
+    low_values = df["Low"].to_numpy()
+    high_values = df["High"].to_numpy()
+    body_edge_up = np.minimum(open_values, close_values)
+    body_edge_down = np.maximum(open_values, close_values)
+    arrays = AnalysisArrays(
+        close=close_values,
+        atr=true_range(df),
+        anchor_up=0.75 * body_edge_up + 0.25 * (
+            (low_values + body_edge_up) / 2
+        ),
+        anchor_down=0.75 * body_edge_down + 0.25 * (
+            (high_values + body_edge_down) / 2
+        ),
+        body_edge_up=body_edge_up,
+        body_edge_down=body_edge_down,
+    )
+    df.attrs["_trendline_analysis_arrays"] = arrays
+    return arrays
+
+
 def anchor_points(df: pd.DataFrame, direction: Direction,
                   body_weight: float = 0.75) -> np.ndarray:
     """Entity edge dominates; half-wick midpoint contributes the remainder."""
@@ -93,7 +182,56 @@ def anchor_points(df: pd.DataFrame, direction: Direction,
     return body_weight * edge + (1 - body_weight) * wick_mid
 
 
-def _event_metrics(gap: np.ndarray) -> tuple[int, float, float, float, float]:
+def body_edges(df: pd.DataFrame, direction: Direction) -> np.ndarray:
+    open_values = df["Open"].to_numpy()
+    close_values = df["Close"].to_numpy()
+    if direction == "up":
+        return np.minimum(open_values, close_values)
+    return np.maximum(open_values, close_values)
+
+
+def _longest_true_run(mask: np.ndarray) -> int:
+    best = current = 0
+    for value in mask:
+        current = current + 1 if value else 0
+        best = max(best, current)
+    return best
+
+
+def _body_metrics(body_gap: np.ndarray) -> BodyMetrics:
+    """Measure line penetration into candle bodies in ATR units."""
+    breached = body_gap < -0.10
+    severe = body_gap < -0.35
+    max_run = _longest_true_run(breached)
+    penetration = float(np.mean(np.clip(-body_gap - 0.06, 0, None)))
+    breach_ratio = float(np.mean(breached))
+    severe_ratio = float(np.mean(severe))
+    integrity = float(np.exp(
+        -4.0 * penetration -
+        4.0 * severe_ratio -
+        0.75 * max(0, max_run - 1)
+    ))
+    return BodyMetrics(integrity, breach_ratio, severe_ratio, max_run)
+
+
+def _body_integrity_batch(body_gap: np.ndarray) -> np.ndarray:
+    """Vectorized entity integrity for a candidate-by-candle matrix."""
+    breached = body_gap < -0.10
+    severe_ratio = np.mean(body_gap < -0.35, axis=1)
+    penetration = np.mean(np.clip(-body_gap - 0.06, 0, None), axis=1)
+    current_run = np.zeros(len(body_gap), dtype=np.int32)
+    max_run = np.zeros(len(body_gap), dtype=np.int32)
+    for column in breached.T:
+        current_run = np.where(column, current_run + 1, 0)
+        max_run = np.maximum(max_run, current_run)
+    return np.exp(
+        -4.0 * penetration
+        -4.0 * severe_ratio
+        -0.75 * np.maximum(0, max_run - 1)
+    )
+
+
+def _event_metrics(gap: np.ndarray) -> ContactMetrics:
     """Find scale-aware support/resistance tests and subsequent rejections.
 
     gap is positive on the valid side of either support or resistance, in ATR.
@@ -104,11 +242,12 @@ def _event_metrics(gap: np.ndarray) -> tuple[int, float, float, float, float]:
     are allowed to be far from a resistance line.
     """
     n = len(gap)
-    smooth = (pd.Series(gap).rolling(5, center=True, min_periods=1)
+    smooth_window = 3 if n < 36 else 5
+    smooth = (pd.Series(gap).rolling(smooth_window, center=True, min_periods=1)
               .mean().to_numpy())
-    min_distance = max(3, n // 15)
+    min_distance = max(2, n // 18)
     pivots, properties = find_peaks(-smooth, distance=min_distance,
-                                    prominence=0.15)
+                                    prominence=0.12)
     prominences = properties.get("prominences", np.zeros(len(pivots)))
 
     # A valid structural test is within 0.75 ATR of the envelope. This is wider
@@ -118,17 +257,29 @@ def _event_metrics(gap: np.ndarray) -> tuple[int, float, float, float, float]:
     kept_prominence = prominences[keep].tolist()
     horizon = min(24, max(7, n // 6))
 
-    # scipy's peak finder intentionally excludes endpoints. For live trend
-    # detection, however, the newest pullback approaching the line is valuable
-    # evidence even before its rejection is fully confirmed.
+    # scipy's peak finder intentionally excludes endpoints. Both edges matter:
+    # an older trend often begins at its first rejection, while a live trend may
+    # end with an unconfirmed challenge near today's candle.
     edge_width = max(4, n // 15)
-    edge_start = max(0, n - edge_width)
-    edge_i = edge_start + int(np.argmin(smooth[edge_start:]))
-    if smooth[edge_i] <= 0.75 and all(abs(edge_i - j) >= min_distance
-                                      for j in candidates):
-        left_high = np.max(smooth[max(0, edge_i - horizon):edge_i + 1])
+    edge_ranges = (
+        range(0, min(n, edge_width)),
+        range(max(0, n - edge_width), n),
+    )
+    for edge_range in edge_ranges:
+        edge_values = list(edge_range)
+        if not edge_values:
+            continue
+        edge_i = edge_values[int(np.argmin(smooth[edge_values]))]
+        if smooth[edge_i] > 0.75 or any(
+                abs(edge_i - j) < min_distance for j in candidates):
+            continue
+        local_start = max(0, edge_i - horizon)
+        local_end = min(n, edge_i + horizon + 1)
+        local_high = np.max(smooth[local_start:local_end])
         candidates.append(edge_i)
-        kept_prominence.append(max(0.0, float(left_high - smooth[edge_i])))
+        kept_prominence.append(
+            max(0.0, float(local_high - smooth[edge_i]))
+        )
 
     if candidates:
         ordered = sorted(zip(candidates, kept_prominence))
@@ -152,12 +303,30 @@ def _event_metrics(gap: np.ndarray) -> tuple[int, float, float, float, float]:
             q = min(1.0, q + 0.12)
         qualities.append(q)
 
-    required = 2 if n < 20 else 3
-    touch_score = min(1.0, len(candidates) / required)
+    touch_count = len(candidates)
+    count_scores = (0.0, 0.12, 0.43, 0.73, 0.88, 1.0)
+    count_score = count_scores[min(touch_count, len(count_scores) - 1)]
     event_span = 0.0
-    if len(candidates) >= 2:
+    touch_distribution = 0.0
+    max_touch_gap = 1.0
+    interior_touches = 0
+    if touch_count >= 2:
         event_span = (candidates[-1] - candidates[0]) / max(1, n - 1)
-        touch_score *= 0.60 + 0.40 * min(1.0, event_span / 0.60)
+        relative = (
+            (np.asarray(candidates, dtype=float) - candidates[0]) /
+            max(1, candidates[-1] - candidates[0])
+        )
+        max_touch_gap = float(np.max(np.diff(relative)))
+        occupied_bins = len(set(np.minimum(3, (relative * 4).astype(int))))
+        gap_score = float(np.clip((0.78 - max_touch_gap) / 0.38, 0, 1))
+        bin_score = float(np.clip((occupied_bins - 1) / 3, 0, 1))
+        touch_distribution = 0.65 * gap_score + 0.35 * bin_score
+        interior_touches = sum(
+            0.20 <= i / max(1, n - 1) <= 0.80 for i in candidates
+        )
+    span_factor = 0.62 + 0.38 * min(1.0, event_span / 0.60)
+    distribution_factor = 0.72 + 0.28 * touch_distribution
+    touch_score = count_score * span_factor * distribution_factor
     rejection = float(np.mean(qualities)) if evaluated else 0.0
 
     if candidates:
@@ -168,20 +337,33 @@ def _event_metrics(gap: np.ndarray) -> tuple[int, float, float, float, float]:
         # No challenges means weak evidence even if the line is geometrically
         # below/above all candles.
         envelope_proximity = 0.0
-    return (len(candidates), touch_score, rejection,
-            envelope_proximity, event_span)
+    return ContactMetrics(
+        touches=touch_count,
+        touch_score=float(touch_score),
+        rejection=rejection,
+        proximity=envelope_proximity,
+        event_span=float(event_span),
+        touch_distribution=float(touch_distribution),
+        max_touch_gap=max_touch_gap,
+        interior_touches=interior_touches,
+        first_touch=candidates[0] if candidates else 0,
+        last_touch=candidates[-1] if candidates else n - 1,
+    )
 
 
 def _score_line(df: pd.DataFrame, start: int, end: int, direction: Direction,
                 slope: float, intercept_local: float) -> TrendResult:
-    seg = df.iloc[start:end + 1]
-    n = len(seg)
+    arrays = _analysis_arrays(df)
+    n = end - start + 1
     x = np.arange(n)
     d = 1 if direction == "up" else -1
-    atr = np.maximum(true_range(df)[start:end + 1], 1e-9)
-    ref = anchor_points(seg, direction)
+    atr = np.maximum(arrays.atr[start:end + 1], 1e-9)
+    ref = arrays.anchor(direction)[start:end + 1]
     line = intercept_local + slope * x
     gap = d * (ref - line) / atr
+    body_gap = d * (
+        arrays.body_edge(direction)[start:end + 1] - line
+    ) / atr
 
     tolerated = 0.22
     coverage = np.mean(gap >= -tolerated)
@@ -190,9 +372,10 @@ def _score_line(df: pd.DataFrame, start: int, end: int, direction: Direction,
     integrity = np.clip((coverage - 0.72) / 0.27, 0, 1)
     integrity *= np.exp(-2.5 * soft_breach - 3.0 * hard_breach)
 
-    touches, touch_score, rejection, proximity, event_span = _event_metrics(gap)
+    contacts = _event_metrics(gap)
+    body = _body_metrics(body_gap)
 
-    close = seg["Close"].to_numpy()
+    close = arrays.close[start:end + 1]
     signed_net = d * (close[-1] - close[0])
     path = np.sum(np.abs(np.diff(close))) + 1e-9
     efficiency = float(np.clip(signed_net / path, 0, 1))
@@ -208,16 +391,30 @@ def _score_line(df: pd.DataFrame, start: int, end: int, direction: Direction,
 
     # Structural trend: repeated tests and rejection matter more than the
     # distance of impulse-wave candles from the support/resistance envelope.
-    raw = (0.26 * integrity + 0.12 * proximity + 0.22 * touch_score +
-           0.22 * rejection + 0.08 * event_span +
-           0.05 * efficiency + 0.05 * slope_strength)
+    raw = (
+        0.17 * integrity +
+        0.18 * body.integrity +
+        0.11 * contacts.proximity +
+        0.22 * contacts.touch_score +
+        0.14 * contacts.rejection +
+        0.10 * contacts.touch_distribution +
+        0.03 * efficiency +
+        0.05 * slope_strength
+    )
     # Very short segments are easy to overfit; discount them smoothly.
-    length_confidence = 0.78 + 0.22 * (1 - np.exp(-(n - 7) / 24))
-    score = 100 * raw * length_confidence * (0.52 + 0.48 * direction_gate)
+    length_confidence = 0.86 + 0.14 * (1 - np.exp(-(n - 7) / 20))
+    score = 100 * raw * length_confidence * (0.68 + 0.32 * direction_gate)
 
     return TrendResult(start, end, direction, slope,
                        intercept_local - slope * 0, score, integrity,
-                       proximity, touches, touch_score, rejection, event_span,
+                       contacts.proximity, contacts.touches,
+                       contacts.touch_score, contacts.rejection,
+                       contacts.event_span, contacts.touch_distribution,
+                       contacts.max_touch_gap, contacts.interior_touches,
+                       start + contacts.first_touch,
+                       start + contacts.last_touch,
+                       body.integrity, body.breach_ratio,
+                       body.severe_breach_ratio, body.max_breach_run,
                        efficiency, slope_strength, drift_t)
 
 
@@ -226,8 +423,8 @@ def fit_interval(df: pd.DataFrame, start: int, end: int,
     """Fit a lower/upper envelope by slope search plus asymmetric quantiles."""
     if end - start + 1 < 7:
         return None
-    seg = df.iloc[start:end + 1]
-    ref = anchor_points(seg, direction)
+    arrays = _analysis_arrays(df)
+    ref = arrays.anchor(direction)[start:end + 1]
     n = len(ref)
     x = np.arange(n)
     d = 1 if direction == "up" else -1
@@ -244,68 +441,169 @@ def fit_interval(df: pd.DataFrame, start: int, end: int,
         return None
     qgrid = np.linspace(0.08, 0.92, 15)
     slope_grid = np.unique(np.quantile(directional, qgrid))
-    intercept_quantiles = (0.07, 0.13, 0.20)
+    intercept_quantiles = (0.03, 0.07, 0.13, 0.20)
 
     # Cheap first pass: retain only a few envelope candidates. Full event
     # detection (local challenges and rebounds) is then run on those finalists.
-    atr = np.maximum(true_range(df)[start:end + 1], 1e-9)
-    shortlist = []
-    for slope in slope_grid:
-        residual = ref - slope * x
-        for q in intercept_quantiles:
-            iq = q if direction == "up" else 1 - q
-            intercept = float(np.quantile(residual, iq))
-            gap = d * (ref - (intercept + slope * x)) / atr
-            coverage = np.mean(gap >= -0.22)
-            # Cheap lower-envelope proxy for shortlisting. Using the all-candle
-            # median here would again favor impulse legs over structural lines.
-            proximity = np.exp(-np.quantile(np.abs(gap), 0.20) / 0.65)
-            severe = np.mean(gap < -0.80)
-            surrogate = 0.58 * coverage + 0.42 * proximity - 0.50 * severe
-            shortlist.append((surrogate, float(slope), intercept))
+    atr = np.maximum(arrays.atr[start:end + 1], 1e-9)
+    bodies = arrays.body_edge(direction)[start:end + 1]
+    residuals = ref[None, :] - slope_grid[:, None] * x
+    intercept_levels = (
+        np.asarray(intercept_quantiles)
+        if direction == "up"
+        else 1 - np.asarray(intercept_quantiles)
+    )
+    intercept_grid = np.quantile(
+        residuals,
+        intercept_levels,
+        axis=1,
+    ).T.reshape(-1)
+    candidate_slopes = np.repeat(slope_grid, len(intercept_quantiles))
+    lines = (
+        intercept_grid[:, None]
+        + candidate_slopes[:, None] * x[None, :]
+    )
+    gap = d * (ref[None, :] - lines) / atr[None, :]
+    coverage = np.mean(gap >= -0.22, axis=1)
+    # Cheap lower-envelope proxy for shortlisting. Using the all-candle
+    # median here would again favor impulse legs over structural lines.
+    proximity = np.exp(np.quantile(np.abs(gap), 0.20, axis=1) / -0.65)
+    severe = np.mean(gap < -0.80, axis=1)
+    body_gap = d * (bodies[None, :] - lines) / atr[None, :]
+    body_integrity = _body_integrity_batch(body_gap)
+    surrogate = (
+        0.45 * coverage
+        + 0.30 * proximity
+        + 0.25 * body_integrity
+        - 0.50 * severe
+    )
+    shortlist = list(zip(
+        surrogate.tolist(),
+        candidate_slopes.tolist(),
+        intercept_grid.tolist(),
+    ))
     shortlist.sort(reverse=True)
     finalists = [_score_line(df, start, end, direction, slope, intercept)
                  for _, slope, intercept in shortlist[:5]]
-    return max(finalists, key=lambda r: r.score)
+    short_max, long_min = _tier_boundaries(len(df))
+    if n <= short_max:
+        score_fn = short_progress_score
+    elif n < long_min:
+        score_fn = medium_trend_score
+    else:
+        score_fn = lambda result: result.score
+    return max(finalists, key=score_fn)
+
+
+def _tier_boundaries(n: int) -> tuple[int, int]:
+    """Return inclusive short maximum and long minimum for the analysis size."""
+    short_max = max(10, int(round(0.10 * n)))
+    long_min = max(short_max + 1, int(round(n / 3)))
+    return short_max, long_min
+
+
+def _tier_for_length(length: int, n: int) -> Tier:
+    short_max, long_min = _tier_boundaries(n)
+    if length <= short_max:
+        return "short"
+    if length < long_min:
+        return "medium"
+    return "long"
+
+
+def medium_trend_score(r: TrendResult) -> float:
+    """Balance directional progress with repeated envelope confirmation."""
+    significance = 1.0 / (1.0 + np.exp(-1.35 * (r.drift_t - 0.65)))
+    length_confidence = 0.90 + 0.10 * (
+        1 - np.exp(-(max(0, r.length - 12)) / 18)
+    )
+    raw = (
+        0.17 * r.integrity +
+        0.18 * r.body_integrity +
+        0.12 * r.proximity +
+        0.20 * r.touch_score +
+        0.12 * r.rejection +
+        0.09 * r.touch_distribution +
+        0.06 * r.efficiency +
+        0.04 * r.slope_strength +
+        0.02 * significance
+    )
+    return 100 * raw * length_confidence
+
+
+def _candidate_rank(r: TrendResult, n: int) -> float:
+    tier = _tier_for_length(r.structure_length, n)
+    if tier == "short":
+        return short_progress_score(r)
+    if tier == "medium":
+        return _medium_selection_score(r, n)
+    return r.score
+
+
+def _coarse_lengths(n: int) -> list[int]:
+    short_max, long_min = _tier_boundaries(n)
+    values = {
+        7,
+        10,
+        short_max,
+        int(round(0.15 * n)),
+        int(round(0.21 * n)),
+        int(round(0.30 * n)),
+        int(round(0.42 * n)),
+        long_min + 9,
+        int(round(0.57 * n)),
+        int(round(0.77 * n)),
+        n,
+    }
+    return sorted(length for length in values if 7 <= length <= n)
 
 
 def _candidate_pool(df: pd.DataFrame) -> list[TrendResult]:
-    """Return a shared pool so nested tiers do not suppress one another."""
+    """Return a time-balanced shared candidate pool for every duration tier."""
     n = len(df)
-    base_lengths = [x for x in (7, 14, 30, 60, 90, 120, 150) if x <= n]
+    short_max, long_min = _tier_boundaries(n)
+    base_lengths = _coarse_lengths(n)
     seeds: list[TrendResult] = []
     for direction in ("up", "down"):
         for length in base_lengths:
-            stride = 1 if length <= 14 else 3
+            stride = 1 if length <= 10 else (2 if length < long_min else 3)
             for end in range(length - 1, n, stride):
                 r = fit_interval(df, end - length + 1, end, direction)
                 if r:
                     seeds.append(r)
 
-    # Refine both the global leaders and leaders in each direction/size bucket.
-    # This prevents a strong long trend from starving medium candidates.
-    seeds.sort(key=lambda z: z.score, reverse=True)
-    refined = seeds[:40]
-    seen = {(r.start, r.end, r.direction) for r in refined}
-    short_max = max(14, int(round(0.30 * n)))
-    long_min = max(short_max + 1, int(np.ceil(0.55 * n)))
-    refinement_seeds = list(seeds[:10])
-    for direction in ("up", "down"):
-        buckets = (
-            lambda r: r.length <= short_max,
-            lambda r: short_max < r.length < long_min,
-            lambda r: r.length >= long_min,
+    # Keep global leaders plus local leaders in each direction, duration and
+    # chart region. Time balancing prevents a strong recent regime from
+    # starving a visually clear historical segment.
+    seeds.sort(key=lambda z: _candidate_rank(z, n), reverse=True)
+    retained = list(seeds[:36])
+    region_size = max(1, int(np.ceil(n / 5)))
+    grouped: dict[tuple, list[TrendResult]] = {}
+    for r in seeds:
+        key = (
+            r.direction,
+            _tier_for_length(r.structure_length, n),
+            min(4, r.start // region_size),
+            min(4, r.end // region_size),
         )
-        directional = [r for r in seeds if r.direction == direction]
-        for predicate in buckets:
-            refinement_seeds.extend([r for r in directional if predicate(r)][:3])
+        grouped.setdefault(key, []).append(r)
+    for values in grouped.values():
+        retained.extend(values[:2])
 
-    unique_refinement = {}
-    for r in refinement_seeds:
-        unique_refinement[(r.start, r.end, r.direction)] = r
-    for seed in unique_refinement.values():
-        for ds in range(-7, 8, 3):
-            for de in range(-7, 8, 3):
+    unique_retained = {
+        (r.start, r.end, r.direction): r
+        for r in retained
+    }
+    refined = list(unique_retained.values())
+    seen = {(r.start, r.end, r.direction) for r in refined}
+    refinement_seeds = sorted(
+        unique_retained.values(),
+        key=lambda z: _candidate_rank(z, n),
+        reverse=True,
+    )[:42]
+    for seed in refinement_seeds:
+        for ds in range(-6, 7, 3):
+            for de in range(-6, 7, 3):
                 s, e = max(0, seed.start + ds), min(n - 1, seed.end + de)
                 key = (s, e, seed.direction)
                 if e - s + 1 >= 7 and key not in seen:
@@ -318,7 +616,8 @@ def _candidate_pool(df: pd.DataFrame) -> list[TrendResult]:
     # line may fit better before the newest pullback/bounce; it is projected to
     # today later and retained only if the post-fit bars did not break it.
     recent_ends = range(max(6, n - 10), n)
-    recent_lengths = sorted(set([7, 10, 14, 20, 30, short_max]))
+    recent_max = max(short_max, min(30, n))
+    recent_lengths = sorted(set([7, 10, short_max, 20, 24, recent_max]))
     recent_seeds = []
     for direction in ("up", "down"):
         for end in recent_ends:
@@ -341,30 +640,84 @@ def _candidate_pool(df: pd.DataFrame) -> list[TrendResult]:
                 s = max(0, seed.start + ds)
                 e = min(n - 1, max(n - 10, seed.end + de))
                 key = (s, e, seed.direction)
-                if 7 <= e - s + 1 <= short_max and key not in seen:
+                if 7 <= e - s + 1 <= recent_max and key not in seen:
                     seen.add(key)
                     r = fit_interval(df, s, e, seed.direction)
                     if r:
                         refined.append(r)
 
-    refined.sort(key=lambda z: z.score, reverse=True)
+    refined.sort(key=lambda z: _candidate_rank(z, n), reverse=True)
     return refined
 
 
-def _nms(candidates: list[TrendResult], max_results: int,
-         overlap_limit: float = 0.60, score_fn=None) -> list[TrendResult]:
-    """Suppress duplicates only inside one tier; cross-tier nesting is allowed."""
+def _lines_are_duplicates(
+        df: pd.DataFrame,
+        first: TrendResult,
+        second: TrendResult,
+) -> bool:
+    """Identify only genuinely coincident lines, independent of duration tier."""
+    if first.direction != second.direction:
+        return False
+    overlap_start = max(first.first_touch, second.first_touch)
+    overlap_end = min(first.last_touch, second.last_touch)
+    overlap = overlap_end - overlap_start + 1
+    if overlap <= 1:
+        return False
+    overlap_ratio = overlap / min(
+        first.structure_length,
+        second.structure_length,
+    )
+    dates_close = (
+        abs(first.first_touch - second.first_touch) <= 15 and
+        abs(first.last_touch - second.last_touch) <= 15
+    )
+    if overlap_ratio < 0.40 and not dates_close:
+        return False
+
+    indices = np.linspace(
+        overlap_start,
+        overlap_end,
+        min(7, overlap),
+    )
+    positions = np.clip(np.rint(indices).astype(int), 0, len(df) - 1)
+    atr = np.maximum(true_range(df)[positions], 1e-9)
+    distances = np.abs(first.y(positions) - second.y(positions)) / atr
+    median_distance = float(np.median(distances))
+    distance_80 = float(np.quantile(distances, 0.80))
+    distance_70 = float(np.quantile(distances, 0.70))
+    median_atr = float(np.median(atr))
+    slope_divergence = (
+        abs(first.slope - second.slope) * max(1, overlap - 1) /
+        max(median_atr, 1e-9)
+    )
+    collinear = (
+        overlap_ratio >= 0.40 and
+        median_distance <= 0.55 and
+        distance_80 <= 0.90 and
+        slope_divergence <= 1.25
+    )
+    nested_visual = (
+        overlap_ratio >= 0.85 and
+        median_distance <= 1.05 and
+        distance_70 <= 1.50 and
+        slope_divergence <= 2.00
+    )
+    close_boundaries = (
+        dates_close and
+        median_distance <= 0.90 and
+        distance_80 <= 1.40 and
+        slope_divergence <= 3.00
+    )
+    return collinear or nested_visual or close_boundaries
+
+
+def _nms(df: pd.DataFrame, candidates: list[TrendResult], max_results: int,
+         score_fn=None) -> list[TrendResult]:
+    """Suppress geometrically coincident candidates while preserving fan lines."""
     selected: list[TrendResult] = []
     score_fn = score_fn or (lambda z: z.score)
     for r in sorted(candidates, key=score_fn, reverse=True):
-        redundant = False
-        for k in selected:
-            inter = max(0, min(r.end, k.end) - max(r.start, k.start) + 1)
-            union = r.length + k.length - inter
-            if r.direction == k.direction and inter / union > overlap_limit:
-                redundant = True
-                break
-        if not redundant:
+        if not any(_lines_are_duplicates(df, r, kept) for kept in selected):
             selected.append(r)
         if len(selected) >= max_results:
             break
@@ -375,91 +728,300 @@ def search_trends(df: pd.DataFrame, threshold: float = 75.0,
                   max_results: int = 8) -> list[TrendResult]:
     """Backward-compatible flat output."""
     pool = [r for r in _candidate_pool(df) if r.score >= threshold]
-    return _nms(pool, max_results=max_results)
+    return _nms(df, pool, max_results=max_results)
 
 
 def _latest_gap(df: pd.DataFrame, r: TrendResult) -> float:
     i = len(df) - 1
     d = 1 if r.direction == "up" else -1
-    ref = anchor_points(df.iloc[[i]], r.direction)[0]
-    return float(d * (ref - r.y(i)) / max(true_range(df)[i], 1e-9))
+    arrays = _analysis_arrays(df)
+    ref = arrays.anchor(r.direction)[i]
+    return float(d * (ref - r.y(i)) / max(arrays.atr[i], 1e-9))
 
 
 def _post_fit_gaps(df: pd.DataFrame, r: TrendResult) -> np.ndarray:
     """Evaluate an older short line by extrapolating it through today's bar."""
     indices = np.arange(r.end, len(df))
-    segment = df.iloc[r.end:]
     d = 1 if r.direction == "up" else -1
-    refs = anchor_points(segment, r.direction)
-    atr = np.maximum(true_range(df)[r.end:], 1e-9)
+    arrays = _analysis_arrays(df)
+    refs = arrays.anchor(r.direction)[r.end:]
+    atr = np.maximum(arrays.atr[r.end:], 1e-9)
+    return d * (refs - r.y(indices)) / atr
+
+
+def _post_touch_gaps(df: pd.DataFrame, r: TrendResult) -> np.ndarray:
+    """Evaluate whether a confirmed support/resistance structure still holds."""
+    indices = np.arange(r.last_touch, len(df))
+    d = 1 if r.direction == "up" else -1
+    arrays = _analysis_arrays(df)
+    refs = arrays.anchor(r.direction)[r.last_touch:]
+    atr = np.maximum(arrays.atr[r.last_touch:], 1e-9)
     return d * (refs - r.y(indices)) / atr
 
 
 def short_progress_score(r: TrendResult) -> float:
     """Tier-specific score: momentum/efficiency matter more than 3+ rejections."""
-    significance = 1.0 / (1.0 + np.exp(-1.4 * (r.drift_t - 0.80)))
+    significance = 1.0 / (1.0 + np.exp(-1.4 * (r.drift_t - 0.70)))
     return 100 * (
-        0.22 * r.integrity + 0.18 * r.proximity +
-        0.18 * r.efficiency + 0.15 * r.slope_strength +
-        0.12 * significance + 0.07 * r.touch_score +
-        0.04 * r.rejection + 0.04 * r.event_span
+        0.16 * r.integrity + 0.16 * r.body_integrity +
+        0.14 * r.proximity + 0.14 * r.efficiency +
+        0.12 * r.slope_strength + 0.08 * significance +
+        0.12 * r.touch_score + 0.04 * r.rejection +
+        0.02 * r.event_span + 0.02 * r.touch_distribution
     )
+
+
+def _freshness_extra(age: int) -> float:
+    if age <= 45:
+        return 0.0
+    if age <= 75:
+        return 2.0
+    if age <= 105:
+        return 6.0
+    return 8.0
+
+
+def _is_display_fresh(score: float, age: int) -> bool:
+    if age > 105:
+        return score >= 80.0
+    if age > 75:
+        return score >= 78.0
+    return True
+
+
+def _is_recent_medium_reversal(r: TrendResult, n: int) -> bool:
+    return (
+        r.structure_length <= 30 and
+        0 <= n - 1 - r.end <= 12
+    )
+
+
+def _medium_selection_score(r: TrendResult, n: int) -> float:
+    score = medium_trend_score(r)
+    if _is_recent_medium_reversal(r, n):
+        score = max(score, short_progress_score(r))
+    return score
+
+
+def _is_live_structure(df: pd.DataFrame, r: TrendResult) -> bool:
+    cached = getattr(r, "_live_structure_cache", None)
+    if cached is not None and cached[0] == len(df):
+        return cached[1]
+    value = (
+        np.min(_post_touch_gaps(df, r)) >= -0.50 and
+        _latest_gap(df, r) <= 1.25
+    )
+    r._live_structure_cache = (len(df), bool(value))
+    return bool(value)
+
+
+def _medium_output_score(
+        df: pd.DataFrame,
+        r: TrendResult,
+        n: int,
+) -> float:
+    score = _medium_selection_score(r, n)
+    if _is_live_structure(df, r):
+        score = max(score, short_progress_score(r))
+    return score
+
+
+def _tier_score(
+        tier: Tier,
+        trend: TrendResult,
+        n: int,
+        df: pd.DataFrame,
+) -> float:
+    if tier == "short":
+        return short_progress_score(trend)
+    if tier == "medium":
+        return _medium_output_score(df, trend, n)
+    return trend.score
+
+
+def _deduplicate_across_tiers(
+        df: pd.DataFrame,
+        items: dict[Tier, list[TieredTrend]],
+) -> dict[Tier, list[TieredTrend]]:
+    """Cluster coincident lines and retain one strong, broad representative."""
+    flat = [
+        item
+        for tier in ("long", "medium", "short")
+        for item in items[tier]
+    ]
+    if len(flat) < 2:
+        return items
+
+    parents = list(range(len(flat)))
+
+    def root(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(first: int, second: int) -> None:
+        first_root, second_root = root(first), root(second)
+        if first_root != second_root:
+            parents[second_root] = first_root
+
+    for first in range(len(flat) - 1):
+        for second in range(first + 1, len(flat)):
+            if _lines_are_duplicates(
+                    df, flat[first].trend, flat[second].trend):
+                union(first, second)
+
+    clusters: dict[int, list[TieredTrend]] = {}
+    for index, item in enumerate(flat):
+        clusters.setdefault(root(index), []).append(item)
+
+    representatives = []
+    for cluster in clusters.values():
+        best_score = max(item.tier_score for item in cluster)
+        near_best = [
+            item for item in cluster
+            if item.tier_score >= best_score - 10.0
+        ]
+        representative = max(
+            near_best,
+            key=lambda item: (
+                item.trend.structure_length,
+                item.trend.last_touch,
+                item.tier_score,
+            ),
+        )
+        representatives.append(representative)
+
+    limits = {"long": 3, "medium": 4, "short": 2}
+    result: dict[Tier, list[TieredTrend]] = {
+        "long": [],
+        "medium": [],
+        "short": [],
+    }
+    representatives.sort(
+        key=lambda item: (
+            item.tier_score - _freshness_extra(item.age),
+            item.trend.structure_length,
+        ),
+        reverse=True,
+    )
+    for item in representatives:
+        if sum(len(values) for values in result.values()) >= 6:
+            break
+        if len(result[item.tier]) < limits[item.tier]:
+            result[item.tier].append(item)
+    return result
 
 
 def search_trend_hierarchy(
         df: pd.DataFrame,
-        long_threshold: float = 75.0,
+        long_threshold: float = 55.0,
         medium_threshold: float = 70.0,
-        short_threshold: float = 65.0,
+        short_threshold: float = 64.0,
 ) -> dict[Tier, list[TieredTrend]]:
     """Build nested long/medium/short output for a 150-candle decision chart.
 
-    Long and medium tiers may include completed historical structures. A short
-    fit may end within the latest 10 candles; it is extrapolated to today and
-    returned only when no post-fit candle materially breaks it.
+    Long and medium tiers may include completed historical structures. Recent
+    short structures remain visible up to their last confirmed contact even
+    when a later candle has already broken the line.
     """
     n = len(df)
-    short_max = max(14, int(round(0.30 * n)))
-    long_min = max(short_max + 1, int(np.ceil(0.55 * n)))
+    short_max, long_min = _tier_boundaries(n)
     pool = _candidate_pool(df)
 
     long_candidates = [
-        r for r in pool if r.length >= long_min and r.score >= long_threshold
-        and r.touches >= 3 and r.event_span >= 0.45
+        r for r in pool
+        if r.structure_length >= long_min
+        and r.score >= long_threshold + _freshness_extra(n - 1 - r.last_touch)
+        and _is_display_fresh(r.score, n - 1 - r.last_touch)
+        and r.touches >= 3 and r.event_span >= 0.38
+        and r.max_touch_gap <= 0.80 and r.drift_t >= 0.55
+        and r.max_body_breach_run <= 2
     ]
     medium_candidates = [
-        r for r in pool if short_max < r.length < long_min
-        and r.score >= medium_threshold and r.touches >= 2
-        and r.event_span >= 0.35
+        r for r in pool
+        if short_max < r.structure_length < long_min
+        and _medium_output_score(df, r, n) >= (
+            (66.0 if (
+                _is_recent_medium_reversal(r, n) or
+                _is_live_structure(df, r)
+            ) else medium_threshold) +
+            _freshness_extra(n - 1 - r.last_touch)
+        )
+        and _is_display_fresh(
+            _medium_output_score(df, r, n),
+            n - 1 - r.last_touch,
+        )
+        and r.touches >= 2
+        and r.event_span >= 0.28 and r.drift_t >= 0.65
+        and (
+            r.touches == 2 or
+            (
+                r.max_touch_gap <= 0.80 and
+                r.touch_distribution >= 0.15
+            )
+        )
+        and (
+            r.touches >= 3 or
+            _medium_output_score(df, r, n) >= (
+                (66.0 if (
+                    _is_recent_medium_reversal(r, n) or
+                    _is_live_structure(df, r)
+                ) else medium_threshold) +
+                _freshness_extra(n - 1 - r.last_touch) + 4
+            )
+        )
+        and r.max_body_breach_run <= 2
     ]
     short_candidates = [
-        r for r in pool if r.length <= short_max and 0 <= n - 1 - r.end <= 9
+        r for r in pool
+        if 7 <= r.structure_length <= short_max
+        and 0 <= n - 1 - r.end <= 9
         and short_progress_score(r) >= short_threshold and r.touches >= 2
-        and r.event_span >= 0.35 and r.drift_t >= 1.10
-        and np.min(_post_fit_gaps(df, r)) >= -0.50
+        and r.event_span >= 0.28 and r.drift_t >= 0.85
+        and (
+            r.structure_length >= 10 or
+            short_progress_score(r) >= short_threshold + 7
+        )
+        and (r.touches >= 3 or short_progress_score(r) >= short_threshold + 3)
+        and r.max_body_breach_run <= 2
     ]
 
     chosen = {
-        "long": _nms(long_candidates, max_results=3, overlap_limit=0.68),
-        "medium": _nms(medium_candidates, max_results=4, overlap_limit=0.68),
-        "short": _nms(short_candidates, max_results=2, overlap_limit=0.72,
-                      score_fn=short_progress_score),
+        "long": _nms(df, long_candidates, max_results=6),
+        "medium": _nms(
+            df,
+            medium_candidates,
+            max_results=8,
+            score_fn=lambda trend: _medium_output_score(df, trend, n),
+        ),
+        "short": _nms(
+            df,
+            short_candidates,
+            max_results=4,
+            score_fn=short_progress_score,
+        ),
     }
     items: dict[Tier, list[TieredTrend]] = {"long": [], "medium": [], "short": []}
     for tier, values in chosen.items():
         for r in values:
-            age = n - 1 - r.end
+            age = n - 1 - r.last_touch
             current_gap = _latest_gap(df, r)
-            if tier == "short":
-                status = "challenging" if current_gap <= 0.50 else "valid"
-                active = True  # broken/stale candidates were filtered out
-                tier_score = short_progress_score(r)
+            broken = bool(np.min(_post_touch_gaps(df, r)) < -0.50)
+            active = not broken and current_gap <= 1.25
+            if broken:
+                status = "broken"
+            elif active and current_gap <= 0.50:
+                status = "challenging"
+            elif active:
+                status = "valid"
             else:
-                active = r.end == n - 1
-                status = "current" if active else "historical"
-                tier_score = r.score
+                status = "historical"
+            tier_score = _tier_score(tier, r, n, df)
             items[tier].append(TieredTrend(tier, r, active, None, status,
                                            age, current_gap, tier_score))
+
+    items = _deduplicate_across_tiers(df, items)
 
     # Attach each child to the smallest same-direction parent containing at
     # least 80% of the child. Orphans remain valid standalone trends.
@@ -470,13 +1032,56 @@ def search_trend_hierarchy(
             for parent in parents:
                 if parent.tier == child.tier or parent.trend.direction != child.trend.direction:
                     continue
-                inter = max(0, min(child.trend.end, parent.trend.end) -
-                            max(child.trend.start, parent.trend.start) + 1)
-                if inter / child.trend.length >= 0.80 and parent.trend.length > child.trend.length:
+                inter = max(
+                    0,
+                    min(child.trend.last_touch, parent.trend.last_touch) -
+                    max(child.trend.first_touch, parent.trend.first_touch) + 1,
+                )
+                if (
+                    inter / child.trend.structure_length >= 0.80 and
+                    parent.trend.structure_length > child.trend.structure_length
+                ):
                     eligible.append(parent)
             if eligible:
-                child.parent_id = min(eligible, key=lambda x: x.trend.length).id
+                child.parent_id = min(
+                    eligible,
+                    key=lambda x: x.trend.structure_length,
+                ).id
     return items
+
+
+def _window_fingerprint(candles: list[dict]) -> str:
+    serialized = json.dumps(
+        candles,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.blake2b(serialized, digest_size=16).hexdigest()
+
+
+def _cached_analysis_result(key: tuple) -> list[dict] | None:
+    with _analysis_result_cache_lock:
+        cached = _analysis_result_cache.get(key)
+        if cached is None:
+            return None
+        _analysis_result_cache.move_to_end(key)
+        return [dict(item) for item in cached]
+
+
+def _store_analysis_result(key: tuple, trends: list[dict]) -> None:
+    immutable_copy = tuple(dict(item) for item in trends)
+    with _analysis_result_cache_lock:
+        _analysis_result_cache[key] = immutable_copy
+        _analysis_result_cache.move_to_end(key)
+        while len(_analysis_result_cache) > ANALYSIS_CACHE_MAX_SIZE:
+            _analysis_result_cache.popitem(last=False)
+
+
+def clear_trendline_analysis_cache() -> None:
+    """Clear memoized API results, primarily for tests and maintenance."""
+    with _analysis_result_cache_lock:
+        _analysis_result_cache.clear()
 
 
 def analyze_symbol_trendlines(symbol: str, period: str = "1D",
@@ -515,9 +1120,26 @@ def analyze_symbol_trendlines(symbol: str, period: str = "1D",
 
     window_start = max(0, len(candles) - window_size)
     window = candles[window_start:]
-    df = candles_to_dataframe(window)
-    hierarchy = search_trend_hierarchy(df)
-    trends = serialize_hierarchy(hierarchy, window_start, len(candles) - 1)
+    cache_key = (
+        ANALYSIS_CACHE_VERSION,
+        payload.get("canonical_symbol") or payload.get("symbol") or symbol,
+        clean_period,
+        window_size,
+        include_weekends,
+        window_start,
+        len(candles),
+        _window_fingerprint(window),
+    )
+    trends = _cached_analysis_result(cache_key)
+    if trends is None:
+        df = candles_to_dataframe(window)
+        hierarchy = search_trend_hierarchy(df)
+        trends = serialize_hierarchy(
+            hierarchy,
+            window_start,
+            len(candles) - 1,
+        )
+        _store_analysis_result(cache_key, trends)
 
     return {
         "ok": True,
@@ -624,12 +1246,12 @@ def serialize_hierarchy(hierarchy: dict[Tier, list[TieredTrend]],
 def serialize_trend(item: TieredTrend, window_start: int,
                     latest_index: int) -> dict:
     trend = item.trend
-    start_index = window_start + trend.start
-    end_index = window_start + trend.end
-    projection_end_index = latest_index if item.tier == "short" else end_index
+    start_index = window_start + trend.first_touch
+    end_index = window_start + trend.last_touch
+    projection_end_index = latest_index if item.active else end_index
     local_projection_end = projection_end_index - window_start
-    start_price = float(trend.y(trend.start))
-    end_price = float(trend.y(trend.end))
+    start_price = float(trend.y(trend.first_touch))
+    end_price = float(trend.y(trend.last_touch))
     projection_end_price = float(trend.y(local_projection_end))
     return {
         "id": item.id,
@@ -651,6 +1273,17 @@ def serialize_trend(item: TieredTrend, window_start: int,
         "touch_score": round(float(trend.touch_score), 4),
         "rejection": round(float(trend.rejection), 4),
         "event_span": round(float(trend.event_span), 4),
+        "touch_distribution": round(float(trend.touch_distribution), 4),
+        "max_touch_gap": round(float(trend.max_touch_gap), 4),
+        "interior_touches": int(trend.interior_touches),
+        "fit_start_index": window_start + trend.start,
+        "fit_end_index": window_start + trend.end,
+        "body_integrity": round(float(trend.body_integrity), 4),
+        "body_breach_ratio": round(float(trend.body_breach_ratio), 4),
+        "severe_body_breach_ratio": round(
+            float(trend.severe_body_breach_ratio), 4
+        ),
+        "max_body_breach_run": int(trend.max_body_breach_run),
         "efficiency": round(float(trend.efficiency), 4),
         "slope_strength": round(float(trend.slope_strength), 4),
         "drift_t": round(float(trend.drift_t), 4),
