@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260726-01') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260726-06') }}">
   </head>
   <body class="theme-dark">
     <aside class="sidebar">
@@ -67,16 +67,17 @@
         <div id="market-status" class="status neutral">准备就绪</div>
         <section id="market-overview-panel" class="panel overview-panel">
           <div class="panel-title">
-            <h3>行情总览</h3>
+            <h3 id="overview-title">行情总览</h3>
             <div class="overview-title-actions">
               <label class="switch-control" title="每5分钟刷新总览最新价格">
                 <input id="overview-live-toggle" type="checkbox">
                 <span class="switch-track" aria-hidden="true"></span>
-                <span class="switch-label">自动更新</span>
+                <span id="overview-live-label" class="switch-label">自动更新</span>
               </label>
               <span id="overview-summary">加载中</span>
             </div>
           </div>
+          <div id="analysis-overview-progress" class="analysis-overview-progress" hidden></div>
           <div class="overview-table-wrap">
             <table id="overview-table" class="overview-table"></table>
           </div>
@@ -86,6 +87,7 @@
             <button id="overview-next" type="button">下一页</button>
           </div>
         </section>
+        <div id="analysis-trend-tooltip" class="analysis-trend-tooltip" hidden></div>
 
         <section id="market-detail-panel" class="panel chart-panel" hidden>
           <div class="panel-title">
@@ -225,6 +227,6 @@
 
     <script src="{{ url_for('static', filename='js/chart.js', v='20260726-01') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260719-01') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260726-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260726-06') }}"></script>
   </body>
 </html>

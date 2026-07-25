@@ -2,7 +2,7 @@
 
 本文保留公式、搜索空间和实现细节。更容易阅读、严格按实际运行顺序组织的主说明见
 `docs/trendline_algorithm.md`；实现仍以 `services/trendline_analysis_service.py`
-为准。当前算法版本为 `trendline-v11-trend-families-1`。
+为准。当前算法版本为 `trendline-v11-trend-families-2`。
 
 本文描述的是项目内独立实现，不依赖 `algorithm/` 目录。外部导入的
 `algorithm/trendline_algorithm_v4_bundle/直线趋势线算法完整说明.md`
@@ -1026,6 +1026,8 @@ close_gap >= 4.00
 
 未发生反向突破或持续加速结束时 `active = true`。反向突破保存 `break_index`，
 顺向持续加速保存 `acceleration_index`，两者中较早者为 `termination_index`。
+`acceleration_index` 表示最初达到 4 ATR 的绘图停止位置；总览事件另用
+`termination_confirmed_index` 表示后续至少 3 根 K 线完成确认的日期。
 
 绘图字段：
 
@@ -1054,11 +1056,11 @@ projection_end_index = 最新 K 线或 termination_index
 - `touches`、`touch_score`、`rejection`、`proximity`；
 - `event_span`、`touch_distribution`、`max_touch_gap`、`interior_touches`；
 - `touch_indices`、`formation_end_index`、`break_index`、`acceleration_index`；
-- `termination_index`、`end_reason`；
+- `termination_index`、`termination_confirmed_index`、`end_reason`；
 - `efficiency`、`slope_strength`、`drift_t`；
 - `fit_start_index`、`fit_end_index`；
 - `distribution_penalty_factor`；
-- `active`、`status`、`age`、`current_close_gap`、`parent_id`；
+- `active`、`status`、`age`、`previous_close_gap`、`current_close_gap`、`parent_id`；
 - `family_id`：趋势族主线 ID；
 - `family_role`：`primary`、`stage` 或 `standalone`。
 
@@ -1202,7 +1204,7 @@ body_edge_up、body_edge_down
 当前没有实现区间级增量缓存。它会增加失效管理和内存占用，而冷计算已经降至约 4.5 秒，
 现阶段收益不足。
 
-### 20.4 暂缓：多核并行
+### 20.4 已实现：多标的有界多进程
 
 以下任务天然独立：
 
@@ -1211,14 +1213,19 @@ body_edge_up、body_edge_down
 - 不同 `(start, end, direction)` 区间；
 - 最终完整评分中的少量候选。
 
-候选搜索由粗搜、依赖粗搜排名的局部精搜和依赖近期种子的二次精搜组成，多阶段之间存在
-顺序依赖。为大量仅含 7～150 根的小任务增加进程通信、数组共享和稳定排序，预期收益
-有限。
+单个标的内部仍按原有顺序执行，因为粗搜、局部精搜和近期二次精搜之间存在依赖。智能
+分析总览批量刷新则在标的层并行：主进程先逐个计算数据指纹并检查持久化快照，缓存命中
+时不进入进程池；只有确实需要冷计算的标的才作为独立任务提交。
 
-项目主要运行在 Windows Python/Flask 环境中，进程池还要承担 `spawn` 启动成本和服务
-生命周期管理。当前单标的冷计算约 4.5 秒、缓存命中约 0.019 秒，暂不值得引入这些复杂
-性。未来批量分析多个标的需要加速时，应优先在标的之间并行；这种任务粒度更大，也更
-容易保持算法内部顺序。
+进程池采用 `spawn` 上下文，避免 Flask 已有后台线程时直接 `fork` 继承锁和连接状态。
+并发上限默认为 4，同时至少保留 1 个逻辑 CPU 给 Flask 请求、行情更新和界面交互；实际
+进程数取“待计算任务数、配置上限、CPU 预算”三者最小值。环境变量
+`ANALYSIS_MAX_WORKERS` 可在 `1`～`4` 之间调整。
+
+子进程只读取 SQLite 行情并执行趋势线搜索，不写快照。每个结果返回主进程后，由主进程
+串行生成总览摘要并写入 SQLite，因此不同进程不会争抢写锁。任务完成顺序不影响最终
+顺序：结果始终按行情总览的标的顺序汇总。单任务异常也只标记该标的，不会取消同批其他
+任务。
 
 ### 20.5 暂缓：JIT 或编译热点
 
@@ -1236,7 +1243,7 @@ NumPy 分位数和 SciPy 局部峰值检测中；为这些小任务增加 JIT �
 
 1. 保留已实现的 NumPy 预计算、批量粗筛和数据快照缓存；
 2. 用真实运行数据继续观察冷计算是否影响主要工作流；
-3. 批量分析多标的需要加速时，在标的层使用进程池；
+3. 批量分析多标的时复用现有标的级有界进程池；
 4. 只有单标的冷计算仍构成明确瓶颈时，再独立验证等价的触点检测实现。
 
 进一步减少完整评分候选可能漏掉独立结构。减少窗口数量或降低局部精搜密度会改变候选

@@ -21,6 +21,10 @@ AUTO_SHUTDOWN_ON_BROWSER_CLOSE = (
     os.getenv("AUTO_SHUTDOWN_ON_BROWSER_CLOSE", "true").lower() == "true"
 )
 BROWSER_OPEN_COMMAND = os.getenv("BROWSER_OPEN_COMMAND", "")
+ANALYSIS_MAX_WORKERS = max(
+    1,
+    min(4, int(os.getenv("ANALYSIS_MAX_WORKERS", "4"))),
+)
 
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com/time_series"

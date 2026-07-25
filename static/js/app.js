@@ -14,6 +14,10 @@ const overviewPrev = document.getElementById("overview-prev");
 const overviewNext = document.getElementById("overview-next");
 const overviewPageText = document.getElementById("overview-page-text");
 const overviewLiveToggle = document.getElementById("overview-live-toggle");
+const overviewLiveLabel = document.getElementById("overview-live-label");
+const overviewTitle = document.getElementById("overview-title");
+const analysisOverviewProgress = document.getElementById("analysis-overview-progress");
+const analysisTrendTooltip = document.getElementById("analysis-trend-tooltip");
 const backToOverview = document.getElementById("back-to-overview");
 const themeToggle = document.getElementById("theme-toggle");
 const shutdownButton = document.getElementById("shutdown-button");
@@ -46,12 +50,20 @@ let currentSymbolSettings = { show_weekend_data: true };
 let overviewPage = 1;
 let overviewTotalPages = 1;
 let overviewItems = [];
+let marketOverviewItems = [];
+let analysisOverviewItems = [];
 const defaultOverviewSort = { key: "display_order", direction: "asc" };
 let overviewSort = { ...defaultOverviewSort };
 let draggedOverviewSymbol = "";
 let overviewDailySyncDone = false;
 let overviewLiveTimer;
 let overviewLiveRefreshInFlight = false;
+let marketOverviewAutoUpdate = false;
+let analysisOverviewAutoUpdate = false;
+let analysisOverviewTimer;
+let analysisOverviewStatusTimer;
+let analysisOverviewLoadInFlight;
+let lastAnalysisRefreshState = {};
 let analysisIndicatorLegendVisible = false;
 let overviewLoadInFlight;
 const overviewLiveRefreshMs = 5 * 60 * 1000;
@@ -89,6 +101,41 @@ function applyWorkspaceMode(mode) {
   const isAnalysis = currentWorkspaceMode === "analysis";
   marketPageTitle.textContent = isAnalysis ? "智能分析" : "查看行情";
   marketSubtitle.textContent = isAnalysis ? "K线智能识别与算法分析" : "2020年以来行情数据";
+  overviewTitle.textContent = isAnalysis ? "K线分析总览" : "行情总览";
+  overviewLiveLabel.textContent = "自动更新";
+  overviewLiveToggle.checked = isAnalysis
+    ? analysisOverviewAutoUpdate
+    : marketOverviewAutoUpdate;
+  overviewLiveToggle.parentElement.title = isAnalysis
+    ? "定期检查并更新直线趋势线分析"
+    : "每5分钟刷新总览最新价格";
+  analysisOverviewProgress.hidden = !isAnalysis;
+  if (isAnalysis) {
+    if (overviewLiveTimer) {
+      window.clearInterval(overviewLiveTimer);
+      overviewLiveTimer = null;
+    }
+    if (analysisOverviewAutoUpdate && !analysisOverviewTimer) {
+      analysisOverviewTimer = window.setInterval(
+        () => startAnalysisOverviewRefresh({ silent: true }),
+        overviewLiveRefreshMs,
+      );
+    }
+    if (!marketOverviewPanel.hidden) {
+      renderAnalysisProgress(lastAnalysisRefreshState);
+    }
+  } else {
+    if (analysisOverviewTimer) {
+      window.clearInterval(analysisOverviewTimer);
+      analysisOverviewTimer = null;
+    }
+    if (marketOverviewAutoUpdate && !overviewLiveTimer) {
+      overviewLiveTimer = window.setInterval(
+        refreshOverviewLivePrices,
+        overviewLiveRefreshMs,
+      );
+    }
+  }
   analysisControls.hidden = !isAnalysis;
   trendlineLegend.hidden = !isAnalysis || !trendlineLegend.innerHTML;
   analysisIndicatorLegendVisible = false;
@@ -176,6 +223,9 @@ async function loadMarketData(symbol) {
         "success",
       );
     }
+    if (currentWorkspaceMode === "analysis") {
+      await loadStoredTrendlineAnalysis(currentSymbol);
+    }
   } catch (error) {
     setStatus(error.message || "前端无法连接本地服务，请确认后端仍在运行。", "error");
     chartSource.textContent = "连接失败";
@@ -194,9 +244,11 @@ async function loadMarketOverview(page = overviewPage) {
 
 async function loadMarketOverviewInner(page = overviewPage) {
   overviewPage = page;
-  showMarketOverview();
-  overviewSummary.textContent = "加载中";
-  setStatus("正在加载行情总览...", "neutral");
+  if (currentWorkspaceMode === "market") {
+    showMarketOverview();
+    overviewSummary.textContent = "加载中";
+    setStatus("正在加载行情总览...", "neutral");
+  }
 
   try {
     await fetchAndRenderMarketOverview();
@@ -207,17 +259,22 @@ async function loadMarketOverviewInner(page = overviewPage) {
         await fetchAndRenderMarketOverview({ silent: true });
       } catch (error) {
         syncFailed = true;
-        setStatus(error.message || "行情总览日K补齐失败，已保留本地数据。", "warning");
+        if (currentWorkspaceMode === "market") {
+          setStatus(error.message || "行情总览日K补齐失败，已保留本地数据。", "warning");
+        }
       }
     }
-    if (!syncFailed) {
+    if (!syncFailed && currentWorkspaceMode === "market") {
       setStatus("行情总览已加载。", "success");
     }
   } catch (error) {
-    setStatus(error.message || "行情总览加载失败。", "error");
-    overviewSummary.textContent = "加载失败";
-    overviewItems = [];
-    renderOverviewTable([]);
+    if (currentWorkspaceMode === "market") {
+      setStatus(error.message || "行情总览加载失败。", "error");
+      overviewSummary.textContent = "加载失败";
+      marketOverviewItems = [];
+      overviewItems = [];
+      renderOverviewTable([]);
+    }
   }
 }
 
@@ -230,24 +287,176 @@ async function fetchAndRenderMarketOverview(options = {}) {
 
   overviewPage = payload.page;
   overviewTotalPages = payload.total_pages;
-  overviewItems = payload.items || [];
-  renderOverviewTable(getSortedOverviewItems());
-  overviewSummary.textContent = `共 ${payload.total_rows} 个标的`;
-  overviewPageText.textContent = "";
-  overviewPagination.hidden = true;
-  overviewPrev.disabled = true;
-  overviewNext.disabled = true;
+  marketOverviewItems = payload.items || [];
+  if (currentWorkspaceMode === "market") {
+    overviewItems = marketOverviewItems;
+    renderOverviewTable(getSortedOverviewItems());
+    overviewSummary.textContent = `共 ${payload.total_rows} 个标的`;
+    overviewPageText.textContent = "";
+    overviewPagination.hidden = true;
+    overviewPrev.disabled = true;
+    overviewNext.disabled = true;
 
-  if (!options.silent) {
-    setStatus("已显示本地行情总览。", "success");
+    if (!options.silent) {
+      setStatus("已显示本地行情总览。", "success");
+    }
   }
   return payload;
 }
 
+async function loadAnalysisOverview() {
+  if (analysisOverviewLoadInFlight) {
+    return analysisOverviewLoadInFlight;
+  }
+  analysisOverviewLoadInFlight = loadAnalysisOverviewInner().finally(() => {
+    analysisOverviewLoadInFlight = null;
+  });
+  return analysisOverviewLoadInFlight;
+}
+
+async function loadAnalysisOverviewInner() {
+  if (currentWorkspaceMode === "analysis") {
+    showMarketOverview();
+    overviewSummary.textContent = "加载中";
+    setStatus("正在读取 K 线分析总览...", "neutral");
+  }
+  try {
+    const payload = await fetchAndRenderAnalysisOverview();
+    if (currentWorkspaceMode !== "analysis") {
+      return;
+    }
+    renderAnalysisProgress(payload.refresh || {});
+    if (payload.refresh?.running) {
+      setStatus(analysisProgressText(payload.refresh), "neutral");
+      monitorAnalysisOverviewRefresh();
+    } else if (payload.refresh?.last_error) {
+      setStatus(payload.refresh.last_error, "warning");
+    } else {
+      setStatus("K 线分析总览已加载。", "success");
+    }
+  } catch (error) {
+    if (currentWorkspaceMode === "analysis") {
+      setStatus(error.message || "K 线分析总览加载失败。", "error");
+      overviewSummary.textContent = "加载失败";
+      analysisOverviewItems = [];
+      overviewItems = [];
+      renderOverviewTable([]);
+    }
+  }
+}
+
+async function fetchAndRenderAnalysisOverview() {
+  const response = await fetch("/api/analysis-overview");
+  const payload = await parseJsonResponse(response);
+  if (!payload.ok) {
+    throw new Error(payload.error?.message || "K 线分析总览加载失败。");
+  }
+  analysisOverviewItems = payload.items || [];
+  if (currentWorkspaceMode === "analysis") {
+    overviewItems = analysisOverviewItems;
+    overviewSummary.textContent = `共 ${payload.total_rows} 个标的`;
+    overviewPagination.hidden = true;
+    renderOverviewTable(getSortedOverviewItems());
+  }
+  return payload;
+}
+
+async function startAnalysisOverviewRefresh(options = {}) {
+  try {
+    const response = await fetch("/api/analysis-overview/refresh", {
+      method: "POST",
+    });
+    const payload = await parseJsonResponse(response);
+    if (!payload.ok) {
+      throw new Error(payload.error?.message || "无法启动 K 线分析更新。");
+    }
+    renderAnalysisProgress(payload);
+    monitorAnalysisOverviewRefresh();
+    if (!options.silent && currentWorkspaceMode === "analysis") {
+      setStatus(analysisProgressText(payload), "neutral");
+    }
+  } catch (error) {
+    if (!options.silent && currentWorkspaceMode === "analysis") {
+      setStatus(error.message || "K 线分析更新启动失败。", "error");
+    }
+  }
+}
+
+function monitorAnalysisOverviewRefresh() {
+  if (analysisOverviewStatusTimer) {
+    return;
+  }
+  const poll = async () => {
+    try {
+      const response = await fetch("/api/analysis-overview/refresh-status");
+      const payload = await parseJsonResponse(response);
+      if (!payload.ok) {
+        throw new Error(payload.error?.message || "分析进度读取失败。");
+      }
+      renderAnalysisProgress(payload);
+      if (currentWorkspaceMode === "analysis" && !marketOverviewPanel.hidden) {
+        await fetchAndRenderAnalysisOverview();
+        setStatus(
+          payload.running
+            ? analysisProgressText(payload)
+            : analysisCompletionText(payload),
+          payload.last_error || payload.last_result?.failed ? "warning" : (payload.running ? "neutral" : "success"),
+        );
+      }
+      if (!payload.running) {
+        window.clearInterval(analysisOverviewStatusTimer);
+        analysisOverviewStatusTimer = null;
+      }
+    } catch (error) {
+      if (currentWorkspaceMode === "analysis") {
+        setStatus(error.message || "分析进度读取失败。", "warning");
+      }
+    }
+  };
+  poll();
+  analysisOverviewStatusTimer = window.setInterval(poll, 2500);
+}
+
+function analysisProgressText(state) {
+  const total = Number(state.total || 0);
+  const completed = Number(state.completed || 0);
+  const workers = Number(state.parallel_workers || 0);
+  const remaining = Number(state.remaining || 0);
+  const parallel = workers > 1
+    ? `，${workers} 个进程并行计算，剩余 ${remaining} 个`
+    : "";
+  const current = state.current_symbol ? `，正在分析 ${state.current_symbol}` : "";
+  return `直线趋势线分析需要一些时间：已完成 ${completed}/${total}${parallel}${current}`;
+}
+
+function analysisCompletionText(state) {
+  const failed = Number(state.last_result?.failed || 0);
+  return failed
+    ? `趋势线总览更新完成，${failed} 个标的分析失败。`
+    : "趋势线总览更新完成。";
+}
+
+function renderAnalysisProgress(state) {
+  lastAnalysisRefreshState = state || {};
+  if (currentWorkspaceMode !== "analysis") {
+    analysisOverviewProgress.hidden = true;
+    return;
+  }
+  const running = Boolean(state.running);
+  const hasError = Boolean(state.last_error);
+  analysisOverviewProgress.hidden = false;
+  analysisOverviewProgress.className = `analysis-overview-progress${running ? " is-running" : ""}${hasError ? " is-error" : ""}`;
+  analysisOverviewProgress.innerHTML = running
+    ? `<span class="analysis-progress-spinner" aria-hidden="true"></span><span>${escapeHtml(analysisProgressText(state))}</span>`
+    : `<span>${escapeHtml(hasError ? state.last_error : analysisCompletionText(state))}</span>`;
+}
+
 async function syncMarketOverviewDaily() {
   overviewDailySyncDone = true;
-  overviewSummary.textContent = "补齐日K中";
-  setStatus("正在自动补齐行情总览日K...", "neutral");
+  if (currentWorkspaceMode === "market") {
+    overviewSummary.textContent = "补齐日K中";
+    setStatus("正在自动补齐行情总览日K...", "neutral");
+  }
   const response = await fetch("/api/market-overview/sync-daily", { method: "POST" });
   const payload = await parseJsonResponse(response);
   if (!payload.ok) {
@@ -258,7 +467,9 @@ async function syncMarketOverviewDaily() {
   const result = await waitForOverviewSync();
   const failed = (result.items || []).filter((item) => item.status !== "success").length;
   const suffix = failed ? `，${failed} 个标的需要稍后重试` : "";
-  setStatus(`已自动补齐总览日K，更新 ${result.updated_rows || 0} 条${suffix}。`, failed ? "warning" : "success");
+  if (currentWorkspaceMode === "market") {
+    setStatus(`已自动补齐总览日K，更新 ${result.updated_rows || 0} 条${suffix}。`, failed ? "warning" : "success");
+  }
 }
 
 async function waitForOverviewSync() {
@@ -292,6 +503,7 @@ function showMarketOverview() {
   symbolSettingsPanel.hidden = true;
   clearTrendlineAnalysis();
   chartSource.textContent = "等待查询";
+  analysisOverviewProgress.hidden = currentWorkspaceMode !== "analysis";
 }
 
 function showMarketDetail() {
@@ -300,6 +512,16 @@ function showMarketDetail() {
 }
 
 function renderOverviewTable(items) {
+  hideAnalysisTrendTooltip();
+  if (currentWorkspaceMode === "analysis") {
+    renderAnalysisOverviewTable(items);
+    return;
+  }
+  renderMarketOverviewTable(items);
+}
+
+function renderMarketOverviewTable(items) {
+  overviewTable.classList.remove("analysis-overview-table");
   const headers = [
     { label: "标的代码", key: "display_order" },
     { label: "最新价格", key: "latest_price" },
@@ -353,6 +575,178 @@ function renderOverviewTable(items) {
   overviewTable.innerHTML = `${thead}<tbody>${rows.join("")}</tbody>`;
 }
 
+function renderAnalysisOverviewTable(items) {
+  overviewTable.classList.add("analysis-overview-table");
+  const headers = [
+    { label: "标的代码", key: "symbol" },
+    { label: "最新价格", key: "latest_price" },
+    { label: "更新时间", key: "latest_price_updated_at" },
+    { label: "直线趋势线", key: "analysis_score" },
+  ];
+  const thead = `<thead><tr>${headers.map(renderOverviewHeader).join("")}</tr></thead>`;
+  if (!items.length) {
+    overviewTable.innerHTML = `${thead}<tbody><tr><td class="empty-cell" colspan="4">暂无分析标的。</td></tr></tbody>`;
+    return;
+  }
+  const rows = items.map((item) => {
+    const priceClass = numberTone(item.daily_change);
+    const analysis = item.analysis;
+    const trendContent = analysis
+      ? renderAnalysisTrendSummary(analysis)
+      : '<span class="analysis-empty">等待后台分析</span>';
+    return `
+      <tr class="overview-row analysis-overview-row" data-symbol="${escapeHtml(item.symbol)}" tabindex="0" role="button" aria-label="打开 ${escapeHtml(item.symbol)} K线分析">
+        <td class="analysis-symbol">${escapeHtml(item.symbol)}</td>
+        <td class="${priceClass}">
+          <span class="analysis-price">${formatOverviewPrice(item.latest_price)}</span>
+          <span class="analysis-price-change">${formatOverviewPercent(item.daily_change_percent)}</span>
+        </td>
+        <td class="number-neutral">${formatOverviewUpdatedAt(item.latest_price_updated_at)}</td>
+        <td class="analysis-trend-cell">${trendContent}</td>
+      </tr>
+    `;
+  });
+  overviewTable.innerHTML = `${thead}<tbody>${rows.join("")}</tbody>`;
+}
+
+function renderAnalysisTrendSummary(analysis) {
+  const trends = addOverviewTierLabels(analysis.headline_trends || []);
+  const events = analysis.events || [];
+  const visibleTrends = trends.slice(0, 2);
+  const visibleEvents = events.slice(0, 2);
+  const trendRows = visibleTrends.length
+    ? visibleTrends.map(renderAnalysisTrend).join("")
+    : '<span class="analysis-empty">暂无有效趋势</span>';
+  const extraTrends = trends.length > 2
+    ? `<span class="analysis-more" title="${escapeHtml(trends.slice(2).map(analysisTrendPlainText).join("\n"))}">+${trends.length - 2}</span>`
+    : "";
+  const eventRows = visibleEvents.map((event) => `
+    <span class="analysis-event analysis-event-${escapeHtml(event.type)}" title="${escapeHtml(event.detail || "")}">
+      ${analysisEventIcon(event.type)}
+      <span>${escapeHtml(event.text)}</span>
+    </span>
+  `).join("");
+  const extraEvents = events.length > 2
+    ? `<span class="analysis-more" title="${escapeHtml(events.slice(2).map((event) => `${event.text}：${event.detail || ""}`).join("\n"))}">+${events.length - 2}</span>`
+    : "";
+  const stale = analysis.stale
+    ? '<span class="analysis-stale" title="行情数据已更新，趋势线正在等待重新计算">待更新</span>'
+    : "";
+  return `
+    <div class="analysis-trend-summary">
+      <div class="analysis-current-trends">${trendRows}${extraTrends}${stale}</div>
+      ${eventRows ? `<div class="analysis-events">${eventRows}${extraEvents}</div>` : ""}
+    </div>
+  `;
+}
+
+function addOverviewTierLabels(trends) {
+  const medium = trends
+    .slice(0, 2)
+    .filter((trend) => trend.tier === "medium")
+    .sort(
+      (left, right) => Number(right.display_length || 0) - Number(left.display_length || 0),
+    );
+  const labels = new Map();
+  if (medium.length === 2) {
+    labels.set(medium[0].id, "中长期");
+    labels.set(medium[1].id, "中短期");
+  }
+  return trends.map((trend) => ({
+    ...trend,
+    overview_tier_label: trend.overview_tier_label || labels.get(trend.id) || {
+      long: "长期",
+      medium: "中期",
+      short: "短期",
+    }[trend.tier] || trend.tier,
+  }));
+}
+
+function renderAnalysisTrend(trend) {
+  const direction = trend.direction === "up" ? "↑" : "↓";
+  const tier = trend.overview_tier_label;
+  const status = trend.status === "challenging" ? "挑战中" : "趋势中";
+  const role = trend.family_role === "stage" ? '<span class="analysis-stage">阶段</span>' : "";
+  return `
+    <span
+      class="analysis-trend analysis-trend-${escapeHtml(trend.status)}"
+      tabindex="0"
+      data-analysis-trend-tooltip="1"
+      data-score="${escapeHtml(Number(trend.score || 0).toFixed(1))}"
+      data-touches="${escapeHtml(trend.touches || 0)}"
+      data-formation-date="${escapeHtml(formatOverviewDate(trend.formation_date))}"
+      data-last-touch-date="${escapeHtml(formatOverviewDate(trend.last_touch_date))}"
+      data-current-gap="${escapeHtml(formatAtrGap(trend.current_close_gap))}"
+    >
+      <span class="analysis-direction analysis-direction-${escapeHtml(trend.direction)}">${direction}</span>
+      <span>${escapeHtml(tier)}</span>
+      <span>${escapeHtml(status)}</span>
+      <strong class="analysis-line-price">${formatOverviewPrice(trend.latest_line_price)}</strong>
+      ${role}
+    </span>
+  `;
+}
+
+function analysisTrendPlainText(trend) {
+  const direction = trend.direction === "up" ? "上涨" : "下跌";
+  const tier = trend.overview_tier_label;
+  const status = trend.status === "challenging" ? "挑战中" : "趋势中";
+  return `${direction}${tier} ${status} 点位 ${formatOverviewPrice(trend.latest_line_price)}`;
+}
+
+function showAnalysisTrendTooltip(target, clientX, clientY) {
+  analysisTrendTooltip.innerHTML = `
+    <strong>趋势结构</strong>
+    <div class="analysis-tooltip-grid">
+      <span>评分</span><b>${escapeHtml(target.dataset.score)}</b>
+      <span>有效触点</span><b>${escapeHtml(target.dataset.touches)}</b>
+      <span>形成日期</span><b>${escapeHtml(target.dataset.formationDate)}</b>
+      <span>最近触点</span><b>${escapeHtml(target.dataset.lastTouchDate)}</b>
+      <span>距趋势线</span><b>${escapeHtml(target.dataset.currentGap)}</b>
+    </div>
+  `;
+  analysisTrendTooltip.hidden = false;
+  positionAnalysisTrendTooltip(target, clientX, clientY);
+}
+
+function positionAnalysisTrendTooltip(target, clientX, clientY) {
+  const targetRect = target.getBoundingClientRect();
+  const x = Number.isFinite(clientX) ? clientX : targetRect.right;
+  const y = Number.isFinite(clientY) ? clientY : targetRect.bottom;
+  const tooltipRect = analysisTrendTooltip.getBoundingClientRect();
+  const left = Math.min(
+    x + 14,
+    window.innerWidth - tooltipRect.width - 10,
+  );
+  const top = Math.min(
+    y + 14,
+    window.innerHeight - tooltipRect.height - 10,
+  );
+  analysisTrendTooltip.style.left = `${Math.max(10, left)}px`;
+  analysisTrendTooltip.style.top = `${Math.max(10, top)}px`;
+}
+
+function hideAnalysisTrendTooltip() {
+  analysisTrendTooltip.hidden = true;
+}
+
+function analysisEventIcon(type) {
+  if (type === "ended") return '<span aria-hidden="true">■</span>';
+  if (type === "formed" || type === "stage_formed") return '<span aria-hidden="true">◆</span>';
+  if (type === "challenge_started") return '<span aria-hidden="true">▲</span>';
+  if (type === "challenge_resolved") return '<span aria-hidden="true">↺</span>';
+  return '<span aria-hidden="true">●</span>';
+}
+
+function formatOverviewDate(value) {
+  return value ? String(value).slice(5) : "-";
+}
+
+function formatAtrGap(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(2)} ATR` : "-";
+}
+
 async function hideOverviewSymbol(symbol) {
   try {
     const response = await fetch(`/api/market-overview/${encodeURIComponent(symbol)}`, {
@@ -365,7 +759,8 @@ async function hideOverviewSymbol(symbol) {
       setStatus(payload.error?.message || "隐藏标的失败。", "error");
       return;
     }
-    overviewItems = payload.items || overviewItems.filter((item) => item.symbol !== symbol);
+    marketOverviewItems = payload.items || marketOverviewItems.filter((item) => item.symbol !== symbol);
+    overviewItems = marketOverviewItems;
     renderOverviewTable(getSortedOverviewItems());
     overviewSummary.textContent = `共 ${payload.total_rows ?? overviewItems.length} 个标的`;
     setStatus(`已从行情总览隐藏 ${symbol}，历史数据仍保留。`, "success");
@@ -375,7 +770,11 @@ async function hideOverviewSymbol(symbol) {
 }
 
 async function refreshOverviewLivePrices() {
-  if (overviewLiveRefreshInFlight || marketOverviewPanel.hidden) {
+  if (
+    overviewLiveRefreshInFlight
+    || marketOverviewPanel.hidden
+    || currentWorkspaceMode !== "market"
+  ) {
     return;
   }
   overviewLiveRefreshInFlight = true;
@@ -405,7 +804,7 @@ async function refreshOverviewLivePrices() {
 
 function mergeOverviewLivePrices(items) {
   const bySymbol = new Map(items.map((item) => [item.symbol, item]));
-  overviewItems = overviewItems.map((item) => {
+  marketOverviewItems = marketOverviewItems.map((item) => {
     const live = bySymbol.get(item.symbol);
     if (!live || live.status !== "success" || live.latest_price === null || live.latest_price === undefined) {
       return item;
@@ -422,10 +821,12 @@ function mergeOverviewLivePrices(items) {
     }
     return next;
   });
+  overviewItems = marketOverviewItems;
   renderOverviewTable(getSortedOverviewItems());
 }
 
 function setOverviewLiveRefresh(enabled) {
+  marketOverviewAutoUpdate = enabled;
   if (overviewLiveTimer) {
     window.clearInterval(overviewLiveTimer);
     overviewLiveTimer = null;
@@ -437,6 +838,24 @@ function setOverviewLiveRefresh(enabled) {
   refreshOverviewLivePrices();
   overviewLiveTimer = window.setInterval(refreshOverviewLivePrices, overviewLiveRefreshMs);
   setStatus("总览自动更新已开启，每5分钟刷新一次最新价格。", "success");
+}
+
+function setAnalysisOverviewAutoUpdate(enabled) {
+  analysisOverviewAutoUpdate = enabled;
+  if (analysisOverviewTimer) {
+    window.clearInterval(analysisOverviewTimer);
+    analysisOverviewTimer = null;
+  }
+  if (!enabled) {
+    setStatus("K 线分析自动更新已关闭。", "neutral");
+    return;
+  }
+  startAnalysisOverviewRefresh();
+  analysisOverviewTimer = window.setInterval(
+    () => startAnalysisOverviewRefresh({ silent: true }),
+    overviewLiveRefreshMs,
+  );
+  setStatus("K 线分析自动更新已开启，每 5 分钟检查一次数据变化。", "success");
 }
 
 function renderOverviewHeader(header) {
@@ -482,6 +901,12 @@ function compareOverviewValues(left, right, key) {
   }
   if (key === "symbol") {
     return compareStrings(left.symbol, right.symbol);
+  }
+  if (key === "analysis_score") {
+    return compareNullableNumbers(
+      left.analysis?.highest_score,
+      right.analysis?.highest_score,
+    );
   }
   const numericResult = compareNullableNumbers(left[key], right[key]);
   if (numericResult !== 0) {
@@ -738,6 +1163,41 @@ async function runTrendlineAnalysis() {
   }
 }
 
+async function loadStoredTrendlineAnalysis(symbol) {
+  try {
+    const params = new URLSearchParams({ symbol });
+    const response = await fetch(`/api/analysis-overview/snapshot?${params}`);
+    const result = await parseJsonResponse(response);
+    const snapshot = result.ok ? result.snapshot : null;
+    if (!snapshot?.payload) {
+      clearTrendlineAnalysis();
+      setStatus(`${symbol} 尚无分析快照，可点击智能识别立即计算。`, "neutral");
+      return;
+    }
+    if (
+      Boolean(snapshot.show_weekend_data)
+      !== Boolean(currentSymbolSettings.show_weekend_data)
+    ) {
+      clearTrendlineAnalysis();
+      setStatus(`${symbol} 的图表设置已变化，请重新点击智能识别。`, "neutral");
+      return;
+    }
+    const trendlines = decorateTrendlines(snapshot.payload.trends || []);
+    setChartTrendlines(trendlines);
+    renderTrendlineLegend(trendlines);
+    const stale = snapshot.latest_data_date !== currentRawMarketData.at(-1)?.date;
+    setStatus(
+      stale
+        ? `已显示 ${symbol} 的上次趋势线结果，后台正在更新。`
+        : `已加载 ${symbol} 的趋势线分析，共 ${trendlines.length} 条。`,
+      stale ? "warning" : "success",
+    );
+  } catch (error) {
+    clearTrendlineAnalysis();
+    setStatus(error.message || "趋势线快照加载失败。", "warning");
+  }
+}
+
 function clearTrendlineAnalysis() {
   if (typeof clearChartTrendlines === "function") {
     clearChartTrendlines();
@@ -760,6 +1220,9 @@ function renderTrendlineLegend(trendlines) {
     const visible = line.visible !== false;
     const visibilityClass = visible ? "" : " is-hidden";
     const lineStyleClass = Number(line.tier_score || 0) >= 75 ? "" : " is-dashed";
+    const latestPoint = line.active
+      ? `<span class="trendline-point">@${formatOverviewPrice(line.projection_end_price)}</span>`
+      : "";
     return `
     <div class="trendline-row${visibilityClass}" data-trendline-id="${escapeHtml(line.id)}">
       <button class="legend-button${visibilityClass}" type="button" data-action="toggle-trendline" title="${visible ? "隐藏" : "显示"}">
@@ -767,7 +1230,7 @@ function renderTrendlineLegend(trendlines) {
       </button>
       <span class="trendline-swatch${lineStyleClass}" style="border-top-color:${escapeHtml(line.color)}"></span>
       <span class="trendline-name">${escapeHtml(trendlineName(line))}</span>
-      <span class="trendline-value">${Number(line.tier_score).toFixed(1)}</span>
+      <span class="trendline-value">${Number(line.tier_score).toFixed(1)}${latestPoint}</span>
     </div>
   `;
   }).join("");
@@ -1060,15 +1523,13 @@ function bindNavigation() {
       if (button.dataset.view === "database-view") {
         loadTables();
       } else if (button.dataset.view === "market-view" && currentWorkspaceMode === "analysis") {
-        marketOverviewPanel.hidden = true;
         if (!currentSymbol) {
-          marketDetailPanel.hidden = true;
-          setStatus("请输入标的代码，加载K线后可执行智能识别。", "neutral");
+          loadAnalysisOverview();
         } else {
           showMarketDetail();
-          setStatus(`当前为智能分析模式，可对 ${currentSymbol} 执行趋势线识别。`, "neutral");
+          loadStoredTrendlineAnalysis(currentSymbol);
         }
-      } else if (button.dataset.view === "market-view" && marketOverviewPanel.hidden) {
+      } else if (button.dataset.view === "market-view") {
         loadMarketOverview(overviewPage);
       }
     });
@@ -1118,7 +1579,11 @@ backToOverview.addEventListener("click", () => {
   renderCandles([]);
   setChartIndicators([]);
   clearTrendlineAnalysis();
-  loadMarketOverview(overviewPage);
+  if (currentWorkspaceMode === "analysis") {
+    loadAnalysisOverview();
+  } else {
+    loadMarketOverview(overviewPage);
+  }
 });
 overviewPrev.addEventListener("click", () => {
   loadMarketOverview(Math.max(1, overviewPage - 1));
@@ -1146,6 +1611,46 @@ overviewTable.addEventListener("click", (event) => {
   if (!row) {
     return;
   }
+  loadMarketData(row.dataset.symbol);
+});
+overviewTable.addEventListener("mouseover", (event) => {
+  const target = event.target.closest("[data-analysis-trend-tooltip]");
+  if (target) {
+    showAnalysisTrendTooltip(target, event.clientX, event.clientY);
+  }
+});
+overviewTable.addEventListener("mousemove", (event) => {
+  const target = event.target.closest("[data-analysis-trend-tooltip]");
+  if (target && !analysisTrendTooltip.hidden) {
+    positionAnalysisTrendTooltip(target, event.clientX, event.clientY);
+  }
+});
+overviewTable.addEventListener("mouseout", (event) => {
+  const target = event.target.closest("[data-analysis-trend-tooltip]");
+  if (target && !target.contains(event.relatedTarget)) {
+    hideAnalysisTrendTooltip();
+  }
+});
+overviewTable.addEventListener("focusin", (event) => {
+  const target = event.target.closest("[data-analysis-trend-tooltip]");
+  if (target) {
+    showAnalysisTrendTooltip(target);
+  }
+});
+overviewTable.addEventListener("focusout", (event) => {
+  if (event.target.closest("[data-analysis-trend-tooltip]")) {
+    hideAnalysisTrendTooltip();
+  }
+});
+overviewTable.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") {
+    return;
+  }
+  const row = event.target.closest("tr[data-symbol]");
+  if (!row || currentWorkspaceMode !== "analysis") {
+    return;
+  }
+  event.preventDefault();
   loadMarketData(row.dataset.symbol);
 });
 overviewTable.addEventListener("dragstart", (event) => {
@@ -1185,7 +1690,11 @@ overviewTable.addEventListener("dragend", async () => {
 });
 shutdownButton.addEventListener("click", shutdownSystem);
 overviewLiveToggle.addEventListener("change", () => {
-  setOverviewLiveRefresh(overviewLiveToggle.checked);
+  if (currentWorkspaceMode === "analysis") {
+    setAnalysisOverviewAutoUpdate(overviewLiveToggle.checked);
+  } else {
+    setOverviewLiveRefresh(overviewLiveToggle.checked);
+  }
 });
 themeToggle.addEventListener("click", () => {
   const nextTheme = document.body.classList.contains("theme-dark") ? "light" : "dark";
@@ -1257,6 +1766,7 @@ initTheme();
 startHeartbeat();
 loadIndicatorCatalog();
 loadMarketOverview();
+startAnalysisOverviewRefresh({ silent: true });
 
 function escapeHtml(value) {
   return String(value)

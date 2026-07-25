@@ -107,3 +107,34 @@ CREATE TABLE IF NOT EXISTS symbol_indicators (
 
 CREATE INDEX IF NOT EXISTS idx_symbol_indicators_view
 ON symbol_indicators(symbol_id, view_code, sort_order);
+
+CREATE TABLE IF NOT EXISTS trendline_analysis_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    period TEXT NOT NULL,
+    window_size INTEGER NOT NULL,
+    show_weekend_data INTEGER NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    latest_data_date TEXT,
+    data_fingerprint TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    UNIQUE(
+        symbol,
+        period,
+        window_size,
+        show_weekend_data,
+        algorithm_version,
+        data_fingerprint
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_trendline_snapshots_lookup
+ON trendline_analysis_snapshots(
+    symbol,
+    period,
+    window_size,
+    algorithm_version,
+    computed_at DESC
+);

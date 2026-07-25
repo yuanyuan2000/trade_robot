@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+import multiprocessing
 import os
 import platform
 import shlex
@@ -13,6 +15,7 @@ import webbrowser
 from flask import Flask, jsonify, render_template, request
 
 from config import (
+    ANALYSIS_MAX_WORKERS,
     APP_NAME,
     AUTO_OPEN_BROWSER,
     AUTO_SHUTDOWN_ON_BROWSER_CLOSE,
@@ -29,7 +32,16 @@ from services.market_data_service import (
     sync_market_overview_daily_prices,
     update_full_market_data,
 )
-from services.trendline_analysis_service import analyze_symbol_trendlines
+from services.analysis_overview_service import (
+    build_trendline_overview_summary,
+    merge_analysis_overview,
+    snapshot_matches_signature,
+)
+from services.trendline_analysis_service import (
+    ANALYSIS_CACHE_VERSION,
+    analyze_symbol_trendlines,
+    get_trendline_analysis_signature,
+)
 
 
 app = Flask(__name__)
@@ -43,6 +55,19 @@ overview_sync_state = {
     "last_result": None,
     "last_error": None,
     "updated_at": None,
+}
+analysis_overview_lock = threading.Lock()
+analysis_overview_state = {
+    "running": False,
+    "total": 0,
+    "completed": 0,
+    "current_symbol": None,
+    "parallel_workers": 0,
+    "remaining": 0,
+    "last_result": None,
+    "last_error": None,
+    "updated_at": None,
+    "rerun_requested": False,
 }
 
 
@@ -84,14 +109,17 @@ def trendline_analysis(symbol: str):
 
 def trendline_analysis_response(symbol: str):
     try:
-        return jsonify(
-            analyze_symbol_trendlines(
-                symbol,
-                period=request.args.get("period", "1D"),
-                limit=int(request.args.get("limit", "150")),
-                show_weekend_data=request.args.get("show_weekend_data"),
-            )
+        period = request.args.get("period", "1D")
+        limit = int(request.args.get("limit", "150"))
+        payload = analyze_symbol_trendlines(
+            symbol,
+            period=period,
+            limit=limit,
+            show_weekend_data=request.args.get("show_weekend_data"),
         )
+        if period.upper() == "1D" and limit == 150:
+            save_analysis_overview_snapshot(symbol, payload)
+        return jsonify(payload)
     except ValueError as exc:
         return (
             jsonify(
@@ -230,6 +258,81 @@ def market_overview():
         )
 
 
+@app.route("/api/analysis-overview")
+def analysis_overview():
+    try:
+        market = repository.list_market_overview()
+        snapshots = repository.list_latest_trendline_analysis_snapshots(
+            ANALYSIS_CACHE_VERSION,
+        )
+        return jsonify({
+            "ok": True,
+            **merge_analysis_overview(market, snapshots),
+            "refresh": analysis_overview_snapshot(),
+        })
+    except Exception as exc:
+        app.logger.exception("Unexpected analysis overview error")
+        return (
+            jsonify({
+                "ok": False,
+                "error": {
+                    "code": "UNKNOWN_ERROR",
+                    "message": "系统读取 K 线分析总览时发生未知错误。",
+                    "detail": str(exc),
+                },
+            }),
+            500,
+        )
+
+
+@app.route("/api/analysis-overview/refresh", methods=["POST"])
+def refresh_analysis_overview():
+    try:
+        started = start_analysis_overview_refresh()
+        return jsonify({
+            "ok": True,
+            "started": started,
+            **analysis_overview_snapshot(),
+        })
+    except Exception as exc:
+        app.logger.exception("Unable to start analysis overview refresh")
+        return jsonify({
+            "ok": False,
+            "error": {
+                "code": "ANALYSIS_REFRESH_FAILED",
+                "message": "无法启动 K 线分析总览更新。",
+                "detail": str(exc),
+            },
+        }), 500
+
+
+@app.route("/api/analysis-overview/refresh-status")
+def analysis_overview_refresh_status():
+    return jsonify({"ok": True, **analysis_overview_snapshot()})
+
+
+@app.route("/api/analysis-overview/snapshot")
+def analysis_overview_symbol_snapshot():
+    symbol = request.args.get("symbol", "")
+    try:
+        snapshot = repository.get_latest_trendline_analysis_snapshot(
+            symbol,
+            ANALYSIS_CACHE_VERSION,
+        )
+        return jsonify({
+            "ok": True,
+            "snapshot": snapshot,
+        })
+    except ValueError as exc:
+        return jsonify({
+            "ok": False,
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": str(exc),
+            },
+        }), 400
+
+
 @app.route("/api/market-overview/order", methods=["PATCH"])
 def market_overview_order():
     payload = request.get_json(silent=True) or {}
@@ -354,8 +457,10 @@ def start_overview_sync() -> bool:
 
 
 def run_overview_sync() -> None:
+    analysis_refresh_needed = False
     try:
         result = sync_market_overview_daily_prices()
+        analysis_refresh_needed = True
         with overview_sync_lock:
             overview_sync_state["last_result"] = result
             overview_sync_state["last_error"] = None
@@ -368,6 +473,8 @@ def run_overview_sync() -> None:
     finally:
         with overview_sync_lock:
             overview_sync_state["running"] = False
+        if analysis_refresh_needed:
+            start_analysis_overview_refresh(queue_if_running=True)
 
 
 def overview_sync_snapshot() -> dict:
@@ -377,6 +484,275 @@ def overview_sync_snapshot() -> dict:
             "last_result": overview_sync_state["last_result"],
             "last_error": overview_sync_state["last_error"],
             "updated_at": overview_sync_state["updated_at"],
+        }
+
+
+def save_analysis_overview_snapshot(symbol: str, payload: dict) -> dict:
+    summary = build_trendline_overview_summary(payload)
+    canonical_symbol = (
+        payload.get("canonical_symbol")
+        or payload.get("symbol")
+        or symbol
+    )
+    return repository.save_trendline_analysis_snapshot(
+        canonical_symbol,
+        payload,
+        summary,
+        ANALYSIS_CACHE_VERSION,
+    )
+
+
+def start_analysis_overview_refresh(queue_if_running: bool = False) -> bool:
+    total = len(repository.list_overview_symbols())
+    with analysis_overview_lock:
+        if analysis_overview_state["running"]:
+            if queue_if_running:
+                analysis_overview_state["rerun_requested"] = True
+            return False
+        analysis_overview_state.update({
+            "running": True,
+            "total": total,
+            "completed": 0,
+            "current_symbol": None,
+            "parallel_workers": 0,
+            "remaining": total,
+            "last_error": None,
+            "updated_at": now_utc().isoformat(),
+            "rerun_requested": False,
+        })
+    threading.Thread(
+        target=run_analysis_overview_refresh,
+        daemon=True,
+    ).start()
+    return True
+
+
+def analysis_worker_count(
+        task_count: int,
+        available_cpus: int | None = None,
+) -> int:
+    """Keep one logical CPU available while bounding analysis concurrency."""
+    if task_count <= 0:
+        return 0
+    if available_cpus is None:
+        try:
+            available_cpus = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            available_cpus = os.cpu_count() or 1
+    cpu_budget = max(1, int(available_cpus) - 1)
+    return min(task_count, ANALYSIS_MAX_WORKERS, cpu_budget)
+
+
+def _analysis_result(
+        symbol: str,
+        status: str,
+        active_count: int | None = None,
+        error: str | None = None,
+) -> dict:
+    return {
+        "symbol": symbol,
+        "status": status,
+        "active_count": active_count,
+        "error": error,
+    }
+
+
+def _mark_analysis_item_completed(remaining: int) -> None:
+    with analysis_overview_lock:
+        analysis_overview_state["completed"] += 1
+        analysis_overview_state["remaining"] = max(0, remaining)
+        analysis_overview_state["updated_at"] = now_utc().isoformat()
+
+
+def run_analysis_overview_refresh() -> None:
+    ordered_symbols: list[str] = []
+    results_by_symbol: dict[str, dict] = {}
+    pending_symbols: list[str] = []
+    try:
+        symbols = repository.list_overview_symbols()
+        ordered_symbols = [item["common_symbol"] for item in symbols]
+        with analysis_overview_lock:
+            analysis_overview_state["total"] = len(symbols)
+            analysis_overview_state["remaining"] = len(symbols)
+
+        for item in symbols:
+            symbol = item["common_symbol"]
+            with analysis_overview_lock:
+                analysis_overview_state["current_symbol"] = symbol
+                analysis_overview_state["updated_at"] = now_utc().isoformat()
+            try:
+                signature = get_trendline_analysis_signature(
+                    symbol,
+                    period="1D",
+                    limit=150,
+                )
+                snapshot = repository.get_latest_trendline_analysis_snapshot(
+                    signature["canonical_symbol"],
+                    ANALYSIS_CACHE_VERSION,
+                )
+                cache_hit = snapshot_matches_signature(
+                    snapshot,
+                    signature,
+                )
+                if cache_hit:
+                    saved = save_analysis_overview_snapshot(
+                        symbol,
+                        snapshot["payload"],
+                    )
+                    results_by_symbol[symbol] = _analysis_result(
+                        symbol,
+                        "cached",
+                        saved["active_count"],
+                    )
+                    _mark_analysis_item_completed(
+                        len(symbols) - len(results_by_symbol)
+                    )
+                else:
+                    pending_symbols.append(symbol)
+            except Exception as exc:
+                app.logger.exception(
+                    "Analysis overview failed for %s",
+                    symbol,
+                )
+                results_by_symbol[symbol] = _analysis_result(
+                    symbol,
+                    "error",
+                    error=str(exc),
+                )
+                _mark_analysis_item_completed(
+                    len(symbols) - len(results_by_symbol)
+                )
+
+        worker_count = analysis_worker_count(len(pending_symbols))
+        with analysis_overview_lock:
+            analysis_overview_state["current_symbol"] = None
+            analysis_overview_state["parallel_workers"] = worker_count
+            analysis_overview_state["remaining"] = len(pending_symbols)
+            analysis_overview_state["updated_at"] = now_utc().isoformat()
+
+        if worker_count == 1:
+            for symbol in pending_symbols:
+                try:
+                    payload = analyze_symbol_trendlines(
+                        symbol,
+                        period="1D",
+                        limit=150,
+                    )
+                    saved = save_analysis_overview_snapshot(symbol, payload)
+                    results_by_symbol[symbol] = _analysis_result(
+                        symbol,
+                        "success",
+                        saved["active_count"],
+                    )
+                except Exception as exc:
+                    app.logger.exception(
+                        "Analysis overview failed for %s",
+                        symbol,
+                    )
+                    results_by_symbol[symbol] = _analysis_result(
+                        symbol,
+                        "error",
+                        error=str(exc),
+                    )
+                finally:
+                    remaining = sum(
+                        item not in results_by_symbol
+                        for item in pending_symbols
+                    )
+                    _mark_analysis_item_completed(remaining)
+        elif worker_count > 1:
+            # Spawn avoids inheriting Flask thread locks or SQLite connections.
+            # Workers only calculate; the parent serializes snapshot writes.
+            spawn_context = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(
+                    max_workers=worker_count,
+                    mp_context=spawn_context,
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        analyze_symbol_trendlines,
+                        symbol,
+                        "1D",
+                        150,
+                    ): symbol
+                    for symbol in pending_symbols
+                }
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        payload = future.result()
+                        saved = save_analysis_overview_snapshot(
+                            symbol,
+                            payload,
+                        )
+                        results_by_symbol[symbol] = _analysis_result(
+                            symbol,
+                            "success",
+                            saved["active_count"],
+                        )
+                    except Exception as exc:
+                        app.logger.exception(
+                            "Analysis overview failed for %s",
+                            symbol,
+                        )
+                        results_by_symbol[symbol] = _analysis_result(
+                            symbol,
+                            "error",
+                            error=str(exc),
+                        )
+                    finally:
+                        remaining = sum(
+                            item not in results_by_symbol
+                            for item in pending_symbols
+                        )
+                        _mark_analysis_item_completed(remaining)
+
+        results = [
+            results_by_symbol[symbol]
+            for symbol in ordered_symbols
+            if symbol in results_by_symbol
+        ]
+        failed = sum(1 for item in results if item["status"] == "error")
+        with analysis_overview_lock:
+            analysis_overview_state["last_result"] = {
+                "items": results,
+                "total": len(results),
+                "failed": failed,
+            }
+            analysis_overview_state["last_error"] = None
+    except Exception as exc:
+        app.logger.exception("Background analysis overview refresh failed")
+        with analysis_overview_lock:
+            analysis_overview_state["last_error"] = str(exc)
+    finally:
+        rerun_requested = False
+        with analysis_overview_lock:
+            rerun_requested = bool(
+                analysis_overview_state["rerun_requested"]
+            )
+            analysis_overview_state["running"] = False
+            analysis_overview_state["current_symbol"] = None
+            analysis_overview_state["parallel_workers"] = 0
+            analysis_overview_state["remaining"] = 0
+            analysis_overview_state["updated_at"] = now_utc().isoformat()
+        if rerun_requested:
+            start_analysis_overview_refresh()
+
+
+def analysis_overview_snapshot() -> dict:
+    with analysis_overview_lock:
+        return {
+            "running": bool(analysis_overview_state["running"]),
+            "total": int(analysis_overview_state["total"]),
+            "completed": int(analysis_overview_state["completed"]),
+            "current_symbol": analysis_overview_state["current_symbol"],
+            "parallel_workers": int(
+                analysis_overview_state["parallel_workers"]
+            ),
+            "remaining": int(analysis_overview_state["remaining"]),
+            "last_result": analysis_overview_state["last_result"],
+            "last_error": analysis_overview_state["last_error"],
+            "updated_at": analysis_overview_state["updated_at"],
         }
 
 
@@ -674,6 +1050,7 @@ def is_wsl() -> bool:
 
 def main() -> None:
     init_database()
+    start_analysis_overview_refresh()
     if AUTO_OPEN_BROWSER:
         threading.Thread(target=open_browser, daemon=True).start()
     app.run(host=FLASK_HOST, port=FLASK_PORT, debug=True, use_reloader=False)

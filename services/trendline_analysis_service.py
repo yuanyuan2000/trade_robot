@@ -25,7 +25,7 @@ from services.market_data_service import get_market_data
 Direction = Literal["up", "down"]
 Tier = Literal["long", "medium", "short"]
 SUPPORTED_PERIODS = {"1D", "3D", "1W", "1M"}
-ANALYSIS_CACHE_VERSION = "trendline-v11-trend-families-1"
+ANALYSIS_CACHE_VERSION = "trendline-v11-trend-families-2"
 ANALYSIS_CACHE_MAX_SIZE = 64
 TOUCH_DISTRIBUTION_FULL_QUALITY = 0.55
 TOUCH_DISTRIBUTION_PENALTY = {
@@ -100,6 +100,7 @@ class TieredTrend:
     status: str = "trending"
     age: int = 0
     current_gap: float = 0.0
+    previous_gap: float = 0.0
     tier_score: float = 0.0
     break_index: int | None = None
     acceleration_index: int | None = None
@@ -833,6 +834,17 @@ def _latest_close_gap(df: pd.DataFrame, r: TrendResult) -> float:
     return float(_post_touch_close_gaps(df, r)[-1])
 
 
+def _previous_close_gap(df: pd.DataFrame, r: TrendResult) -> float:
+    index = max(0, len(df) - 2)
+    direction = 1 if r.direction == "up" else -1
+    arrays = _analysis_arrays(df)
+    return float(
+        direction
+        * (arrays.close[index] - r.y(index))
+        / max(arrays.atr[index], 1e-9)
+    )
+
+
 def _post_fit_gaps(df: pd.DataFrame, r: TrendResult) -> np.ndarray:
     """Evaluate an older short line by extrapolating it through today's bar."""
     indices = np.arange(r.end, len(df))
@@ -1389,6 +1401,7 @@ def search_trend_hierarchy(
         for r in values:
             age = n - 1 - r.last_touch
             current_gap = _latest_close_gap(df, r)
+            previous_gap = _previous_close_gap(df, r)
             break_index = _confirmed_break_index(df, r)
             acceleration_index = _confirmed_acceleration_index(df, r)
             termination_indices = [
@@ -1411,6 +1424,7 @@ def search_trend_hierarchy(
                 status=status,
                 age=age,
                 current_gap=current_gap,
+                previous_gap=previous_gap,
                 tier_score=tier_score,
                 break_index=break_index,
                 acceleration_index=acceleration_index,
@@ -1482,10 +1496,12 @@ def clear_trendline_analysis_cache() -> None:
         _analysis_result_cache.clear()
 
 
-def analyze_symbol_trendlines(symbol: str, period: str = "1D",
-                              limit: int = 150,
-                              show_weekend_data: str | bool | None = None) -> dict:
-    """Analyze the latest candles for one symbol and return drawable lines."""
+def _prepare_trendline_analysis(
+        symbol: str,
+        period: str,
+        limit: int,
+        show_weekend_data: str | bool | None,
+) -> dict:
     clean_period = (period or "1D").upper()
     if clean_period not in SUPPORTED_PERIODS:
         raise ValueError("Unsupported analysis period")
@@ -1503,21 +1519,85 @@ def analyze_symbol_trendlines(symbol: str, period: str = "1D",
     if not include_weekends:
         raw_rows = [row for row in raw_rows if not is_weekend_date(row["date"])]
     candles = aggregate_rows(raw_rows, clean_period)
+    window_start = max(0, len(candles) - window_size)
+    window = candles[window_start:]
+    return {
+        "market_payload": payload,
+        "period": clean_period,
+        "requested_window_size": window_size,
+        "show_weekend_data": include_weekends,
+        "candles": candles,
+        "window_start": window_start,
+        "window": window,
+        "data_fingerprint": _window_fingerprint(window),
+    }
+
+
+def get_trendline_analysis_signature(
+        symbol: str,
+        period: str = "1D",
+        limit: int = 150,
+        show_weekend_data: str | bool | None = None,
+) -> dict:
+    prepared = _prepare_trendline_analysis(
+        symbol,
+        period,
+        limit,
+        show_weekend_data,
+    )
+    payload = prepared["market_payload"]
+    candles = prepared["candles"]
+    return {
+        "symbol": payload.get("symbol") or symbol,
+        "canonical_symbol": (
+            payload.get("canonical_symbol")
+            or payload.get("symbol")
+            or symbol
+        ),
+        "period": prepared["period"],
+        "requested_window_size": prepared["requested_window_size"],
+        "show_weekend_data": prepared["show_weekend_data"],
+        "data_count": len(candles),
+        "latest_data_date": candles[-1]["date"] if candles else None,
+        "data_fingerprint": prepared["data_fingerprint"],
+    }
+
+
+def analyze_symbol_trendlines(symbol: str, period: str = "1D",
+                              limit: int = 150,
+                              show_weekend_data: str | bool | None = None) -> dict:
+    """Analyze the latest candles for one symbol and return drawable lines."""
+    prepared = _prepare_trendline_analysis(
+        symbol,
+        period,
+        limit,
+        show_weekend_data,
+    )
+    payload = prepared["market_payload"]
+    clean_period = prepared["period"]
+    window_size = prepared["requested_window_size"]
+    include_weekends = prepared["show_weekend_data"]
+    candles = prepared["candles"]
+    window_start = prepared["window_start"]
+    window = prepared["window"]
+    data_fingerprint = prepared["data_fingerprint"]
     if len(candles) < 7:
         return {
             "ok": True,
             "symbol": payload.get("symbol") or symbol,
             "canonical_symbol": payload.get("canonical_symbol") or symbol,
             "period": clean_period,
+            "requested_window_size": window_size,
+            "show_weekend_data": include_weekends,
             "window_start_index": 0,
             "window_size": len(candles),
             "data_count": len(candles),
+            "latest_data_date": candles[-1]["date"] if candles else None,
+            "data_fingerprint": data_fingerprint,
             "trends": [],
             "message": "K线数量不足，无法识别趋势线。",
         }
 
-    window_start = max(0, len(candles) - window_size)
-    window = candles[window_start:]
     cache_key = (
         ANALYSIS_CACHE_VERSION,
         payload.get("canonical_symbol") or payload.get("symbol") or symbol,
@@ -1526,7 +1606,7 @@ def analyze_symbol_trendlines(symbol: str, period: str = "1D",
         include_weekends,
         window_start,
         len(candles),
-        _window_fingerprint(window),
+        data_fingerprint,
     )
     trends = _cached_analysis_result(cache_key)
     if trends is None:
@@ -1537,6 +1617,7 @@ def analyze_symbol_trendlines(symbol: str, period: str = "1D",
             window_start,
             len(candles) - 1,
         )
+        _attach_trend_dates(trends, candles)
         _store_analysis_result(cache_key, trends)
 
     return {
@@ -1546,9 +1627,12 @@ def analyze_symbol_trendlines(symbol: str, period: str = "1D",
         "source": payload.get("source"),
         "show_weekend_data": include_weekends,
         "period": clean_period,
+        "requested_window_size": window_size,
         "window_start_index": window_start,
         "window_size": len(window),
         "data_count": len(candles),
+        "latest_data_date": candles[-1]["date"],
+        "data_fingerprint": data_fingerprint,
         "trends": trends,
         "message": None if trends else "未识别出满足阈值的直线趋势线。",
     }
@@ -1670,11 +1754,20 @@ def serialize_trend(item: TieredTrend, window_start: int,
     ]
     termination_index = min(termination_indices, default=None)
     end_reason = None
+    termination_confirmed_index = None
     if termination_index is not None:
         end_reason = (
             "break"
             if termination_index == break_index
             else "acceleration"
+        )
+        termination_confirmed_index = (
+            break_index
+            if end_reason == "break"
+            else min(
+                latest_index,
+                acceleration_index + ACCELERATION_CONFIRM_BARS,
+            )
         )
     projection_end_index = (
         latest_index
@@ -1696,6 +1789,7 @@ def serialize_trend(item: TieredTrend, window_start: int,
         "break_index": break_index,
         "acceleration_index": acceleration_index,
         "termination_index": termination_index,
+        "termination_confirmed_index": termination_confirmed_index,
         "end_reason": end_reason,
         "start_price": start_price,
         "end_price": end_price,
@@ -1736,11 +1830,31 @@ def serialize_trend(item: TieredTrend, window_start: int,
         "age": int(item.age),
         "current_gap": round(float(item.current_gap), 4),
         "current_close_gap": round(float(item.current_gap), 4),
+        "previous_close_gap": round(float(item.previous_gap), 4),
         "distribution_penalty_factor": round(
             float(_distribution_penalty_factor(item.tier, trend)),
             4,
         ),
     }
+
+
+def _attach_trend_dates(trends: list[dict], candles: list[dict]) -> None:
+    date_fields = {
+        "start_index": "start_date",
+        "formation_end_index": "formation_date",
+        "end_index": "last_touch_date",
+        "projection_end_index": "projection_end_date",
+        "termination_index": "termination_date",
+        "termination_confirmed_index": "termination_confirmed_date",
+    }
+    for trend in trends:
+        for index_field, date_field in date_fields.items():
+            index = trend.get(index_field)
+            trend[date_field] = (
+                candles[index]["date"]
+                if isinstance(index, int) and 0 <= index < len(candles)
+                else None
+            )
 
 
 def _candles(ax, df: pd.DataFrame) -> None:

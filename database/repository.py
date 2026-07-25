@@ -293,6 +293,16 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
             """,
             (symbol, year_start),
         ).fetchone()
+        latest_weekday_row = conn.execute(
+            """
+            SELECT date
+            FROM daily_prices
+            WHERE symbol = ? AND strftime('%w', date) NOT IN ('0', '6')
+            ORDER BY date DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
 
     latest = dict(latest_rows[0]) if latest_rows else None
     previous = dict(latest_rows[1]) if len(latest_rows) > 1 else None
@@ -341,6 +351,11 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
 
     return {
         "latest_date": latest["date"] if latest else None,
+        "latest_weekday_date": (
+            latest_weekday_row["date"]
+            if latest_weekday_row
+            else None
+        ),
         "latest_price_updated_at": latest["price_updated_at"] if latest else None,
         "latest_price": latest_price,
         "previous_close": previous_close,
@@ -365,7 +380,8 @@ def list_market_overview(page: int = 1, page_size: int = 100) -> dict:
         ).fetchone()["count"]
         rows = conn.execute(
             """
-            SELECT id, symbol, name, display_order, updated_at
+            SELECT id, symbol, name, show_weekend_data,
+                   display_order, updated_at
             FROM symbols
             WHERE show_in_overview = 1
             ORDER BY display_order ASC, id ASC
@@ -375,8 +391,14 @@ def list_market_overview(page: int = 1, page_size: int = 100) -> dict:
     items = []
     for row in rows:
         item = dict(row)
+        item["show_weekend_data"] = bool(item["show_weekend_data"])
         item["display_symbol"] = get_symbol_display_name(item["symbol"])
         item.update(get_symbol_price_snapshot(item["symbol"]))
+        item["analysis_latest_date"] = (
+            item["latest_date"]
+            if item["show_weekend_data"]
+            else item["latest_weekday_date"]
+        )
         items.append(item)
 
     return {
@@ -385,6 +407,125 @@ def list_market_overview(page: int = 1, page_size: int = 100) -> dict:
         "page_size": total_rows,
         "total_rows": total_rows,
         "total_pages": 1,
+    }
+
+
+def save_trendline_analysis_snapshot(
+        symbol: str,
+        payload: dict,
+        summary: dict,
+        algorithm_version: str,
+) -> dict:
+    normalized = normalize_symbol_key(symbol)
+    computed_at = utc_now_iso()
+    period = str(payload.get("period") or "1D")
+    window_size = int(payload.get("requested_window_size") or 150)
+    show_weekend_data = 1 if payload.get("show_weekend_data") else 0
+    fingerprint = str(payload.get("data_fingerprint") or "")
+    latest_data_date = payload.get("latest_data_date")
+    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    summary_json = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO trendline_analysis_snapshots (
+                symbol, period, window_size, show_weekend_data,
+                algorithm_version, latest_data_date, data_fingerprint,
+                payload_json, summary_json, computed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(
+                symbol, period, window_size, show_weekend_data,
+                algorithm_version, data_fingerprint
+            ) DO UPDATE SET
+                latest_data_date = excluded.latest_data_date,
+                payload_json = excluded.payload_json,
+                summary_json = excluded.summary_json,
+                computed_at = excluded.computed_at
+            """,
+            (
+                normalized,
+                period,
+                window_size,
+                show_weekend_data,
+                algorithm_version,
+                latest_data_date,
+                fingerprint,
+                payload_json,
+                summary_json,
+                computed_at,
+            ),
+        )
+    return {
+        **summary,
+        "computed_at": computed_at,
+        "algorithm_version": algorithm_version,
+    }
+
+
+def list_latest_trendline_analysis_snapshots(
+        algorithm_version: str,
+        period: str = "1D",
+        window_size: int = 150,
+) -> dict[str, dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT symbol, show_weekend_data, latest_data_date,
+                   payload_json, summary_json, computed_at
+            FROM trendline_analysis_snapshots
+            WHERE algorithm_version = ? AND period = ? AND window_size = ?
+            ORDER BY computed_at DESC, id DESC
+            """,
+            (algorithm_version, period, window_size),
+        ).fetchall()
+
+    latest: dict[str, dict] = {}
+    for row in rows:
+        symbol = row["symbol"]
+        if symbol in latest:
+            continue
+        latest[symbol] = {
+            "symbol": symbol,
+            "show_weekend_data": bool(row["show_weekend_data"]),
+            "latest_data_date": row["latest_data_date"],
+            "payload": json.loads(row["payload_json"]),
+            "summary": json.loads(row["summary_json"]),
+            "computed_at": row["computed_at"],
+        }
+    return latest
+
+
+def get_latest_trendline_analysis_snapshot(
+        symbol: str,
+        algorithm_version: str,
+        period: str = "1D",
+        window_size: int = 150,
+) -> dict | None:
+    normalized = normalize_symbol_key(symbol)
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT symbol, show_weekend_data, latest_data_date,
+                   payload_json, summary_json, computed_at
+            FROM trendline_analysis_snapshots
+            WHERE symbol = ? AND algorithm_version = ?
+              AND period = ? AND window_size = ?
+            ORDER BY computed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (normalized, algorithm_version, period, window_size),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "symbol": row["symbol"],
+        "show_weekend_data": bool(row["show_weekend_data"]),
+        "latest_data_date": row["latest_data_date"],
+        "payload": json.loads(row["payload_json"]),
+        "summary": json.loads(row["summary_json"]),
+        "computed_at": row["computed_at"],
     }
 
 

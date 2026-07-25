@@ -2,7 +2,7 @@
 
 本文按程序实际执行顺序说明当前趋势线算法。生产实现位于
 `services/trendline_analysis_service.py`，算法版本为
-`trendline-v11-trend-families-1`。
+`trendline-v11-trend-families-2`。
 
 ## 1. 算法要解决什么问题
 
@@ -414,8 +414,9 @@ close_gap = d * (Close - line) / ATR
 | `end_index` | 最后一个有效触点 |
 | `projection_end_index` | 最新 K 线或趋势结束位置 |
 | `break_index` | 确认突破位置，未突破时为 `null` |
-| `acceleration_index` | 持续加速开始并被确认的位置 |
+| `acceleration_index` | 持续加速最初达到 4 ATR 的位置 |
 | `termination_index` | 实际绘图结束位置 |
+| `termination_confirmed_index` | 突破或持续加速完成确认的位置 |
 | `end_reason` | `break`、`acceleration` 或 `null` |
 | `fit_start_index`, `fit_end_index` | 搜索拟合时使用的原始窗口 |
 | `touch_indices` | 全部有效触点位置 |
@@ -423,6 +424,7 @@ close_gap = d * (Close - line) / ATR
 | `tier_score` | 加入所属层级规则和分布减分后的最终分 |
 | `distribution_penalty_factor` | 分布减分乘数，1 表示没有额外减分 |
 | `current_close_gap` | 最新收盘到趋势线的 ATR 方向距离 |
+| `previous_close_gap` | 前一根收盘到同一条当前趋势线的 ATR 方向距离 |
 | `age` | 最后触点距最新 K 线的根数 |
 | `active` | 尚未确认突破时为 true |
 | `parent_id` | 包含该线的最近同方向上级结构 |
