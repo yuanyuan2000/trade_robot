@@ -84,6 +84,15 @@ function applyWorkspaceMode(mode) {
   trendlineLegend.hidden = !isAnalysis || !trendlineLegend.innerHTML;
   if (!isAnalysis) {
     clearTrendlineAnalysis();
+    if (currentSymbol) {
+      loadSymbolIndicators();
+    }
+  } else if (currentSymbolIndicators.length) {
+    currentSymbolIndicators = currentSymbolIndicators.map((indicator) => ({
+      ...indicator,
+      visible: false,
+    }));
+    setChartIndicators(currentSymbolIndicators);
   }
 }
 
@@ -724,19 +733,29 @@ function clearTrendlineAnalysis() {
 }
 
 function renderTrendlineLegend(trendlines) {
-  if (!trendlines.length || currentWorkspaceMode !== "analysis") {
+  const sortedTrendlines = [...trendlines].sort(
+    (left, right) => Number(right.tier_score || 0) - Number(left.tier_score || 0),
+  );
+  if (!sortedTrendlines.length || currentWorkspaceMode !== "analysis") {
     trendlineLegend.innerHTML = "";
     trendlineLegend.hidden = true;
     return;
   }
 
-  trendlineLegend.innerHTML = trendlines.map((line) => `
-    <div class="trendline-row">
+  trendlineLegend.innerHTML = sortedTrendlines.map((line) => {
+    const visible = line.visible !== false;
+    const visibilityClass = visible ? "" : " is-hidden";
+    return `
+    <div class="trendline-row${visibilityClass}" data-trendline-id="${escapeHtml(line.id)}">
+      <button class="legend-button${visibilityClass}" type="button" data-action="toggle-trendline" title="${visible ? "隐藏" : "显示"}">
+        ${eyeIcon(visible)}
+      </button>
       <span class="trendline-swatch trendline-${escapeHtml(line.tier)}" style="border-top-color:${escapeHtml(line.color)}"></span>
       <span class="trendline-name">${escapeHtml(trendlineName(line))}</span>
       <span class="trendline-value">${Number(line.tier_score).toFixed(1)}</span>
     </div>
-  `).join("");
+  `;
+  }).join("");
   trendlineLegend.hidden = false;
   if (typeof updateTrendlineLegendPlacement === "function") {
     updateTrendlineLegendPlacement();
@@ -859,7 +878,9 @@ async function loadSymbolIndicators() {
     return;
   }
 
-  currentSymbolIndicators = payload.indicators;
+  currentSymbolIndicators = currentWorkspaceMode === "analysis"
+    ? payload.indicators.map((indicator) => ({ ...indicator, visible: false }))
+    : payload.indicators;
   setChartIndicators(currentSymbolIndicators);
 }
 
@@ -942,6 +963,15 @@ async function handleIndicatorAction(event) {
   }
 
   if (action === "toggle-visible") {
+    if (currentWorkspaceMode === "analysis") {
+      currentSymbolIndicators = currentSymbolIndicators.map((indicator) => (
+        indicator.id === symbolIndicatorId
+          ? { ...indicator, visible: !indicator.visible }
+          : indicator
+      ));
+      setChartIndicators(currentSymbolIndicators);
+      return;
+    }
     await patchSymbolIndicator(symbolIndicatorId, { visible: !symbolIndicator.visible });
     return;
   }
@@ -1164,6 +1194,23 @@ favoriteIndicators.addEventListener("click", (event) => {
 customIndicatorForm.addEventListener("submit", createAndAddIndicator);
 updateDataButton.addEventListener("click", updateCurrentMarketData);
 runAnalysisButton.addEventListener("click", runTrendlineAnalysis);
+trendlineLegend.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-action='toggle-trendline']");
+  if (!button) {
+    return;
+  }
+  const row = button.closest(".trendline-row");
+  const lineId = row?.dataset.trendlineId;
+  if (!lineId || typeof setChartTrendlineVisible !== "function") {
+    return;
+  }
+  const line = getChartTrendlines().find((item) => item.id === lineId);
+  if (!line) {
+    return;
+  }
+  setChartTrendlineVisible(lineId, line.visible === false);
+  renderTrendlineLegend(getChartTrendlines());
+});
 symbolSettingsToggle.addEventListener("click", () => {
   symbolSettingsPanel.hidden = !symbolSettingsPanel.hidden;
   indicatorPanel.hidden = true;

@@ -17,6 +17,8 @@ const chartState = {
   dragStartFirstVisible: 0,
   isDragging: false,
   hoverIndex: null,
+  hoverX: null,
+  hoverY: null,
   dpr: 1,
   defaultVisibleCount: 150,
   layout: {
@@ -82,12 +84,27 @@ function setChartIndicators(indicators) {
 }
 
 function setChartTrendlines(trendlines) {
-  chartState.trendlines = Array.isArray(trendlines) ? trendlines : [];
+  chartState.trendlines = Array.isArray(trendlines)
+    ? trendlines.map((line) => ({ visible: true, ...line, visible: line.visible !== false }))
+    : [];
   drawChart();
 }
 
 function clearChartTrendlines() {
   setChartTrendlines([]);
+}
+
+function setChartTrendlineVisible(lineId, visible) {
+  const line = chartState.trendlines.find((item) => item.id === lineId);
+  if (!line) {
+    return;
+  }
+  line.visible = Boolean(visible);
+  drawChart();
+}
+
+function getChartTrendlines() {
+  return chartState.trendlines.map((line) => ({ ...line }));
 }
 
 function bindPeriodButtons() {
@@ -183,6 +200,8 @@ function bindChartEvents() {
 
     if (!inside) {
       chartState.hoverIndex = null;
+      chartState.hoverX = null;
+      chartState.hoverY = null;
       hideTooltip();
       drawChart();
       return;
@@ -194,6 +213,8 @@ function bindChartEvents() {
   canvas.addEventListener("mouseleave", () => {
     if (!chartState.isDragging) {
       chartState.hoverIndex = null;
+      chartState.hoverX = null;
+      chartState.hoverY = null;
       hideTooltip();
       drawChart();
     }
@@ -419,25 +440,55 @@ function drawTimeAxis(ctx, plot, visible, theme) {
 }
 
 function drawCrosshair(ctx, plot, visible, priceRange, theme) {
-  if (chartState.hoverIndex === null) {
+  if (chartState.hoverX === null || chartState.hoverY === null) {
     return;
   }
 
-  const visibleIndex = chartState.hoverIndex - chartState.firstVisible;
-  if (visibleIndex < 0 || visibleIndex >= visible.length) {
+  const x = clamp(chartState.hoverX, plot.left, plot.right);
+  const y = clamp(chartState.hoverY, plot.top, plot.bottom);
+  const price = yToPrice(y, plot, priceRange);
+  if (!Number.isFinite(price)) {
     return;
   }
-
-  const slot = plot.width / chartState.visibleCount;
-  const candle = visible[visibleIndex];
-  const x = plot.left + slot * (visibleIndex + 0.5);
-  const y = priceToY(candle.close, plot, priceRange);
 
   ctx.strokeStyle = theme.crosshair;
   ctx.setLineDash([4, 4]);
   drawLine(ctx, x, plot.top, x, plot.bottom);
   drawLine(ctx, plot.left, y, plot.right, y);
   ctx.setLineDash([]);
+
+  drawCrosshairAxisLabels(ctx, plot, visible, theme, y, price);
+}
+
+function drawCrosshairAxisLabels(ctx, plot, visible, theme, y, price) {
+  const basePrice = visible[0]?.open || 0;
+  const percent = basePrice ? (price / basePrice - 1) * 100 : 0;
+  const priceText = formatPrice(price);
+  const percentText = formatPercent(percent);
+  const labelHeight = 20;
+
+  ctx.save();
+  ctx.font = "12px system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+  ctx.lineWidth = 1;
+
+  const priceWidth = ctx.measureText(priceText).width + 12;
+  const percentWidth = ctx.measureText(percentText).width + 12;
+  const labelY = clamp(y - labelHeight / 2, plot.top, plot.bottom - labelHeight);
+
+  ctx.fillStyle = theme.background;
+  ctx.strokeStyle = theme.crosshair;
+  ctx.fillRect(plot.left - priceWidth - 6, labelY, priceWidth, labelHeight);
+  ctx.strokeRect(plot.left - priceWidth - 6, labelY, priceWidth, labelHeight);
+  ctx.fillRect(plot.right + 6, labelY, percentWidth, labelHeight);
+  ctx.strokeRect(plot.right + 6, labelY, percentWidth, labelHeight);
+
+  ctx.fillStyle = theme.label;
+  ctx.textAlign = "right";
+  ctx.fillText(priceText, plot.left - 12, labelY + labelHeight / 2);
+  ctx.textAlign = "left";
+  ctx.fillText(percentText, plot.right + 12, labelY + labelHeight / 2);
+  ctx.restore();
 }
 
 function drawIndicators(ctx, plot, priceRange) {
@@ -483,6 +534,9 @@ function drawTrendlines(ctx, plot, priceRange, theme) {
   const visibleEnd = chartState.firstVisible + chartState.visibleCount - 1;
 
   for (const line of chartState.trendlines) {
+    if (line.visible === false) {
+      continue;
+    }
     const startIndex = Number(line.start_index);
     const endIndex = Number(line.end_index);
     const projectionEndIndex = Number(line.projection_end_index ?? line.end_index);
@@ -657,6 +711,8 @@ function updateHover(offsetX, offsetY) {
     || offsetY > plot.bottom
   ) {
     chartState.hoverIndex = null;
+    chartState.hoverX = null;
+    chartState.hoverY = null;
     hideTooltip();
     drawChart();
     return;
@@ -667,13 +723,23 @@ function updateHover(offsetX, offsetY) {
   const dataIndex = chartState.firstVisible + visibleIndex;
   if (dataIndex < 0 || dataIndex >= chartState.candles.length) {
     chartState.hoverIndex = null;
+    chartState.hoverX = null;
+    chartState.hoverY = null;
     hideTooltip();
     drawChart();
     return;
   }
 
   chartState.hoverIndex = dataIndex;
-  showTooltip(chartState.candles[dataIndex], offsetX, offsetY);
+  chartState.hoverX = offsetX;
+  chartState.hoverY = offsetY;
+  const candleCenterX = plot.left + slot * (visibleIndex + 0.5);
+  const candleHitRadius = Math.max(5, Math.min(14, slot * 0.48));
+  if (Math.abs(offsetX - candleCenterX) <= candleHitRadius) {
+    showTooltip(chartState.candles[dataIndex], offsetX, offsetY);
+  } else {
+    hideTooltip();
+  }
   renderIndicatorLegend();
   drawChart();
 }
@@ -829,6 +895,9 @@ function getPriceRange(candles) {
   }
   const visibleTrendlineValues = [];
   for (const line of chartState.trendlines) {
+    if (line.visible === false) {
+      continue;
+    }
     const start = Math.max(chartState.firstVisible, Number(line.start_index));
     const end = Math.min(
       chartState.firstVisible + chartState.visibleCount - 1,
@@ -898,6 +967,10 @@ function getTimeTicks(visible) {
 
 function priceToY(price, plot, range) {
   return plot.bottom - ((price - range.min) / (range.max - range.min)) * plot.height;
+}
+
+function yToPrice(y, plot, range) {
+  return range.max - ((y - plot.top) / plot.height) * (range.max - range.min);
 }
 
 function getPlotRatio(offsetX) {

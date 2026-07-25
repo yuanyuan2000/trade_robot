@@ -11,6 +11,8 @@ from services.trendline_analysis_service import (
     _body_integrity_batch,
     _body_metrics,
     _cached_analysis_result,
+    _filter_display_noise,
+    _is_flat_low_amplitude_noise,
     _is_display_fresh,
     _lines_are_duplicates,
     _store_analysis_result,
@@ -163,6 +165,51 @@ class TrendlineAnalysisTests(unittest.TestCase):
             if item.trend.length >= 72
         ]
         self.assertEqual(covering, [])
+
+    def test_flat_low_amplitude_lines_are_display_noise(self) -> None:
+        t = np.arange(70)
+        df = make_ohlc(100 + 1.8 * np.sin(t / 6), seed=31)
+        trend = fit_interval(distributed_support(70), 0, 69, "up")
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        flat = replace(
+            trend,
+            start=0,
+            end=69,
+            first_touch=0,
+            last_touch=69,
+            slope=0.01,
+            intercept=100.0,
+        )
+        self.assertTrue(_is_flat_low_amplitude_noise(df, flat))
+
+    def test_lower_scored_countertrend_between_two_lines_is_hidden(self) -> None:
+        df = make_ohlc(np.linspace(100, 125, 80), seed=37)
+        base = fit_interval(distributed_support(80), 0, 79, "up")
+        self.assertIsNotNone(base)
+        assert base is not None
+
+        counter = replace(
+            base,
+            direction="down",
+            first_touch=20,
+            last_touch=45,
+            score=60.0,
+        )
+        parent_a = replace(base, first_touch=0, last_touch=70, score=82.0)
+        parent_b = replace(base, first_touch=8, last_touch=65, score=76.0)
+        items = {
+            "long": [
+                TieredTrend("long", parent_a, False, tier_score=82.0),
+                TieredTrend("long", parent_b, False, tier_score=76.0),
+            ],
+            "medium": [TieredTrend("medium", counter, False, tier_score=60.0)],
+            "short": [],
+        }
+
+        filtered = _filter_display_noise(df, items)
+        self.assertEqual(len(filtered["long"]), 2)
+        self.assertEqual(filtered["medium"], [])
 
     def test_serialization_draws_only_between_confirmed_contacts(self) -> None:
         trend = fit_interval(distributed_support(), 0, 89, "up")

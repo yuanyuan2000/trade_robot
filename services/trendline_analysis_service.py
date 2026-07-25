@@ -25,7 +25,7 @@ from services.market_data_service import get_market_data
 Direction = Literal["up", "down"]
 Tier = Literal["long", "medium", "short"]
 SUPPORTED_PERIODS = {"1D", "3D", "1W", "1M"}
-ANALYSIS_CACHE_VERSION = "trendline-v7-performance-1"
+ANALYSIS_CACHE_VERSION = "trendline-v8-display-filters-1"
 ANALYSIS_CACHE_MAX_SIZE = 64
 _analysis_result_cache: OrderedDict[tuple, tuple[dict, ...]] = OrderedDict()
 _analysis_result_cache_lock = threading.Lock()
@@ -913,6 +913,70 @@ def _deduplicate_across_tiers(
     return result
 
 
+def _is_flat_low_amplitude_noise(df: pd.DataFrame, r: TrendResult) -> bool:
+    first = max(0, r.first_touch)
+    last = min(len(df) - 1, r.last_touch)
+    if last <= first:
+        return False
+
+    window = df.iloc[first:last + 1]
+    low = float(window["Low"].min())
+    high = float(window["High"].max())
+    if low <= 0:
+        return False
+
+    price_range = (high - low) / low
+    line_start = float(r.y(first))
+    line_end = float(r.y(last))
+    line_move = abs(line_end - line_start) / max(abs(line_start), 1e-9)
+    return price_range <= 0.10 and line_move <= 0.025
+
+
+def _is_countertrend_bridge_noise(
+        item: TieredTrend,
+        candidates: list[TieredTrend],
+) -> bool:
+    r = item.trend
+    containers = [
+        other
+        for other in candidates
+        if other is not item
+        and other.trend.direction != r.direction
+        and other.tier_score > item.tier_score
+        and other.trend.first_touch <= r.first_touch
+        and other.trend.last_touch >= r.last_touch
+    ]
+    for first in range(len(containers) - 1):
+        for second in range(first + 1, len(containers)):
+            if containers[first].trend.direction == containers[second].trend.direction:
+                return True
+    return False
+
+
+def _filter_display_noise(
+        df: pd.DataFrame,
+        items: dict[Tier, list[TieredTrend]],
+) -> dict[Tier, list[TieredTrend]]:
+    flat = [
+        item
+        for tier in ("long", "medium", "short")
+        for item in items[tier]
+    ]
+    if not flat:
+        return items
+
+    keep = {
+        item.id
+        for item in flat
+        if not _is_flat_low_amplitude_noise(df, item.trend)
+        and not _is_countertrend_bridge_noise(item, flat)
+    }
+    return {
+        tier: [item for item in values if item.id in keep]
+        for tier, values in items.items()
+    }
+
+
 def search_trend_hierarchy(
         df: pd.DataFrame,
         long_threshold: float = 55.0,
@@ -1022,6 +1086,7 @@ def search_trend_hierarchy(
                                            age, current_gap, tier_score))
 
     items = _deduplicate_across_tiers(df, items)
+    items = _filter_display_noise(df, items)
 
     # Attach each child to the smallest same-direction parent containing at
     # least 80% of the child. Orphans remain valid standalone trends.
