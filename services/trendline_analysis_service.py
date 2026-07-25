@@ -25,8 +25,28 @@ from services.market_data_service import get_market_data
 Direction = Literal["up", "down"]
 Tier = Literal["long", "medium", "short"]
 SUPPORTED_PERIODS = {"1D", "3D", "1W", "1M"}
-ANALYSIS_CACHE_VERSION = "trendline-v8-display-filters-1"
+ANALYSIS_CACHE_VERSION = "trendline-v11-trend-families-1"
 ANALYSIS_CACHE_MAX_SIZE = 64
+TOUCH_DISTRIBUTION_FULL_QUALITY = 0.55
+TOUCH_DISTRIBUTION_PENALTY = {
+    "long": 0.16,
+    "medium": 0.14,
+    "short": 0.08,
+}
+CHALLENGE_DISTANCE_ATR = 0.50
+BREAK_CLOSE_DISTANCE_ATR = 0.30
+SEVERE_BREAK_CLOSE_DISTANCE_ATR = 0.80
+ACCELERATION_END_DISTANCE_ATR = 4.00
+ACCELERATION_REENTRY_DISTANCE_ATR = 1.50
+ACCELERATION_CONFIRM_BARS = 3
+TREND_FAMILY_MIN_OVERLAP = 0.55
+TREND_FAMILY_MAX_MEDIAN_DISTANCE_ATR = 2.00
+TREND_FAMILY_MAX_DISTANCE_80_ATR = 3.00
+TREND_FAMILY_NOVEL_TOUCH_DISTANCE_ATR = 0.75
+TREND_FAMILY_SEPARATION_DISTANCE_ATR = 0.80
+TREND_FAMILY_MIN_SEPARATION_RUN = 8
+TREND_FAMILY_MIN_SLOPE_DIFFERENCE = 0.25
+TREND_FAMILY_MAX_STAGE_SCORE_GAP = 8.00
 _analysis_result_cache: OrderedDict[tuple, tuple[dict, ...]] = OrderedDict()
 _analysis_result_cache_lock = threading.Lock()
 
@@ -50,6 +70,7 @@ class TrendResult:
     interior_touches: int
     first_touch: int
     last_touch: int
+    touch_indices: tuple[int, ...]
     body_integrity: float
     body_breach_ratio: float
     severe_body_breach_ratio: float
@@ -76,10 +97,14 @@ class TieredTrend:
     trend: TrendResult
     active: bool
     parent_id: str | None = None
-    status: str = "historical"
+    status: str = "trending"
     age: int = 0
     current_gap: float = 0.0
     tier_score: float = 0.0
+    break_index: int | None = None
+    acceleration_index: int | None = None
+    family_id: str | None = None
+    family_role: str = "standalone"
 
     @property
     def id(self) -> str:
@@ -102,6 +127,7 @@ class ContactMetrics:
     interior_touches: int
     first_touch: int
     last_touch: int
+    touch_indices: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -110,6 +136,16 @@ class BodyMetrics:
     breach_ratio: float
     severe_breach_ratio: float
     max_breach_run: int
+
+
+@dataclass(frozen=True)
+class TrendFamilyMetrics:
+    overlap_ratio: float
+    median_distance: float
+    distance_80: float
+    slope_difference: float
+    novel_touches: int
+    separation_run: int
 
 
 @dataclass(frozen=True)
@@ -348,6 +384,7 @@ def _event_metrics(gap: np.ndarray) -> ContactMetrics:
         interior_touches=interior_touches,
         first_touch=candidates[0] if candidates else 0,
         last_touch=candidates[-1] if candidates else n - 1,
+        touch_indices=tuple(candidates),
     )
 
 
@@ -413,6 +450,7 @@ def _score_line(df: pd.DataFrame, start: int, end: int, direction: Direction,
                        contacts.max_touch_gap, contacts.interior_touches,
                        start + contacts.first_touch,
                        start + contacts.last_touch,
+                       tuple(start + i for i in contacts.touch_indices),
                        body.integrity, body.breach_ratio,
                        body.severe_breach_ratio, body.max_breach_run,
                        efficiency, slope_strength, drift_t)
@@ -534,10 +572,12 @@ def medium_trend_score(r: TrendResult) -> float:
 def _candidate_rank(r: TrendResult, n: int) -> float:
     tier = _tier_for_length(r.structure_length, n)
     if tier == "short":
-        return short_progress_score(r)
-    if tier == "medium":
-        return _medium_selection_score(r, n)
-    return r.score
+        score = short_progress_score(r)
+    elif tier == "medium":
+        score = _medium_selection_score(r, n)
+    else:
+        score = r.score
+    return _apply_distribution_penalty(tier, r, score)
 
 
 def _coarse_lengths(n: int) -> list[int]:
@@ -739,6 +779,60 @@ def _latest_gap(df: pd.DataFrame, r: TrendResult) -> float:
     return float(d * (ref - r.y(i)) / max(arrays.atr[i], 1e-9))
 
 
+def _post_touch_close_gaps(df: pd.DataFrame, r: TrendResult) -> np.ndarray:
+    indices = np.arange(r.last_touch, len(df))
+    d = 1 if r.direction == "up" else -1
+    arrays = _analysis_arrays(df)
+    atr = np.maximum(arrays.atr[r.last_touch:], 1e-9)
+    return d * (arrays.close[r.last_touch:] - r.y(indices)) / atr
+
+
+def _break_confirmation_offset(close_gaps: np.ndarray) -> int | None:
+    for index, gap in enumerate(close_gaps):
+        if gap < -SEVERE_BREAK_CLOSE_DISTANCE_ATR:
+            return index
+        if (
+            index > 0 and
+            close_gaps[index - 1] < -BREAK_CLOSE_DISTANCE_ATR and
+            gap < -BREAK_CLOSE_DISTANCE_ATR
+        ):
+            return index
+    return None
+
+
+def _acceleration_end_offset(close_gaps: np.ndarray) -> int | None:
+    """Find a lasting move away from the old line into a faster trend."""
+    for index, gap in enumerate(close_gaps):
+        future = close_gaps[index + 1:]
+        if (
+            gap >= ACCELERATION_END_DISTANCE_ATR and
+            len(future) >= ACCELERATION_CONFIRM_BARS and
+            np.min(future) > ACCELERATION_REENTRY_DISTANCE_ATR
+        ):
+            return index
+    return None
+
+
+def _confirmed_break_index(
+        df: pd.DataFrame,
+        r: TrendResult,
+) -> int | None:
+    offset = _break_confirmation_offset(_post_touch_close_gaps(df, r))
+    return None if offset is None else r.last_touch + offset
+
+
+def _confirmed_acceleration_index(
+        df: pd.DataFrame,
+        r: TrendResult,
+) -> int | None:
+    offset = _acceleration_end_offset(_post_touch_close_gaps(df, r))
+    return None if offset is None else r.last_touch + offset
+
+
+def _latest_close_gap(df: pd.DataFrame, r: TrendResult) -> float:
+    return float(_post_touch_close_gaps(df, r)[-1])
+
+
 def _post_fit_gaps(df: pd.DataFrame, r: TrendResult) -> np.ndarray:
     """Evaluate an older short line by extrapolating it through today's bar."""
     indices = np.arange(r.end, len(df))
@@ -769,6 +863,25 @@ def short_progress_score(r: TrendResult) -> float:
         0.12 * r.touch_score + 0.04 * r.rejection +
         0.02 * r.event_span + 0.02 * r.touch_distribution
     )
+
+
+def _distribution_penalty_factor(tier: Tier, r: TrendResult) -> float:
+    """Smoothly discount endpoint-heavy lines without a pass/fail cliff."""
+    quality = float(np.clip(
+        r.touch_distribution / TOUCH_DISTRIBUTION_FULL_QUALITY,
+        0,
+        1,
+    ))
+    weakness = (1.0 - quality) ** 1.5
+    return 1.0 - TOUCH_DISTRIBUTION_PENALTY[tier] * weakness
+
+
+def _apply_distribution_penalty(
+        tier: Tier,
+        r: TrendResult,
+        score: float,
+) -> float:
+    return score * _distribution_penalty_factor(tier, r)
 
 
 def _freshness_extra(age: int) -> float:
@@ -833,10 +946,12 @@ def _tier_score(
         df: pd.DataFrame,
 ) -> float:
     if tier == "short":
-        return short_progress_score(trend)
-    if tier == "medium":
-        return _medium_output_score(df, trend, n)
-    return trend.score
+        score = short_progress_score(trend)
+    elif tier == "medium":
+        score = _medium_output_score(df, trend, n)
+    else:
+        score = trend.score
+    return _apply_distribution_penalty(tier, trend, score)
 
 
 def _deduplicate_across_tiers(
@@ -892,12 +1007,6 @@ def _deduplicate_across_tiers(
         )
         representatives.append(representative)
 
-    limits = {"long": 3, "medium": 4, "short": 2}
-    result: dict[Tier, list[TieredTrend]] = {
-        "long": [],
-        "medium": [],
-        "short": [],
-    }
     representatives.sort(
         key=lambda item: (
             item.tier_score - _freshness_extra(item.age),
@@ -905,7 +1014,209 @@ def _deduplicate_across_tiers(
         ),
         reverse=True,
     )
-    for item in representatives:
+    return {
+        tier: [item for item in representatives if item.tier == tier]
+        for tier in ("long", "medium", "short")
+    }
+
+
+def _family_primary_rank(
+        item: TieredTrend,
+        n: int,
+) -> tuple[float, ...]:
+    trend = item.trend
+    quality = (
+        item.tier_score +
+        6.0 * trend.touch_distribution +
+        4.0 * min(1.0, trend.structure_length / max(1, n))
+    )
+    return (
+        1.0 if item.active else 0.0,
+        quality,
+        item.tier_score,
+        trend.touch_distribution,
+        trend.structure_length,
+        trend.last_touch,
+    )
+
+
+def _trend_family_metrics(
+        df: pd.DataFrame,
+        candidate: TrendResult,
+        primary: TrendResult,
+) -> TrendFamilyMetrics:
+    overlap_start = max(candidate.first_touch, primary.first_touch)
+    overlap_end = min(candidate.last_touch, primary.last_touch)
+    overlap = overlap_end - overlap_start + 1
+    if overlap <= 1:
+        return TrendFamilyMetrics(0.0, float("inf"), float("inf"),
+                                  float("inf"), 0, 0)
+
+    overlap_ratio = overlap / min(
+        candidate.structure_length,
+        primary.structure_length,
+    )
+    positions = np.arange(overlap_start, overlap_end + 1)
+    atr = np.maximum(true_range(df)[positions], 1e-9)
+    distances = np.abs(
+        candidate.y(positions) - primary.y(positions)
+    ) / atr
+    primary_slope = max(abs(primary.slope), 1e-9)
+    slope_difference = abs(
+        candidate.slope - primary.slope
+    ) / primary_slope
+
+    novel_touches = 0
+    for index in candidate.touch_indices:
+        if index < primary.first_touch or index > primary.last_touch:
+            novel_touches += 1
+            continue
+        local_atr = max(float(true_range(df)[index]), 1e-9)
+        line_distance = abs(float(
+            candidate.y(index) - primary.y(index)
+        )) / local_atr
+        if line_distance > TREND_FAMILY_NOVEL_TOUCH_DISTANCE_ATR:
+            novel_touches += 1
+
+    separation_run = _longest_true_run(
+        distances > TREND_FAMILY_SEPARATION_DISTANCE_ATR
+    )
+    return TrendFamilyMetrics(
+        overlap_ratio=float(overlap_ratio),
+        median_distance=float(np.median(distances)),
+        distance_80=float(np.quantile(distances, 0.80)),
+        slope_difference=float(slope_difference),
+        novel_touches=novel_touches,
+        separation_run=separation_run,
+    )
+
+
+def _is_same_trend_family(metrics: TrendFamilyMetrics) -> bool:
+    return (
+        metrics.overlap_ratio >= TREND_FAMILY_MIN_OVERLAP and
+        metrics.median_distance <= TREND_FAMILY_MAX_MEDIAN_DISTANCE_ATR and
+        metrics.distance_80 <= TREND_FAMILY_MAX_DISTANCE_80_ATR
+    )
+
+
+def _is_useful_stage_line(
+        candidate: TieredTrend,
+        primary: TieredTrend,
+        metrics: TrendFamilyMetrics,
+) -> bool:
+    return (
+        candidate.tier_score >= (
+            primary.tier_score - TREND_FAMILY_MAX_STAGE_SCORE_GAP
+        ) and
+        metrics.novel_touches >= 2 and
+        metrics.separation_run >= TREND_FAMILY_MIN_SEPARATION_RUN and
+        metrics.slope_difference >= TREND_FAMILY_MIN_SLOPE_DIFFERENCE
+    )
+
+
+def _consolidate_trend_families(
+        df: pd.DataFrame,
+        items: dict[Tier, list[TieredTrend]],
+) -> dict[Tier, list[TieredTrend]]:
+    flat = [
+        item
+        for tier in ("long", "medium", "short")
+        for item in items[tier]
+    ]
+    if len(flat) < 2:
+        return items
+
+    ranked = sorted(
+        flat,
+        key=lambda item: _family_primary_rank(item, len(df)),
+        reverse=True,
+    )
+    families: list[list[TieredTrend]] = []
+    for item in ranked:
+        matches = []
+        for family_index, family in enumerate(families):
+            primary = family[0]
+            if item.trend.direction != primary.trend.direction:
+                continue
+            metrics = _trend_family_metrics(
+                df,
+                item.trend,
+                primary.trend,
+            )
+            if _is_same_trend_family(metrics):
+                affinity = (
+                    metrics.overlap_ratio,
+                    -metrics.median_distance,
+                    -metrics.distance_80,
+                )
+                matches.append((affinity, family_index))
+        if matches:
+            _, family_index = max(matches)
+            families[family_index].append(item)
+        else:
+            families.append([item])
+
+    retained: list[TieredTrend] = []
+    for family in families:
+        primary = family[0]
+        primary.family_id = primary.id
+        primary.family_role = (
+            "standalone"
+            if len(family) == 1
+            else "primary"
+        )
+        retained.append(primary)
+
+        stage_candidates = []
+        for candidate in family[1:]:
+            metrics = _trend_family_metrics(
+                df,
+                candidate.trend,
+                primary.trend,
+            )
+            if _is_useful_stage_line(candidate, primary, metrics):
+                stage_rank = (
+                    metrics.novel_touches,
+                    metrics.separation_run,
+                    metrics.slope_difference,
+                    candidate.tier_score,
+                    candidate.trend.structure_length,
+                )
+                stage_candidates.append((stage_rank, candidate))
+        if stage_candidates:
+            _, stage = max(stage_candidates, key=lambda value: value[0])
+            stage.family_id = primary.id
+            stage.family_role = "stage"
+            retained.append(stage)
+
+    return {
+        tier: [item for item in retained if item.tier == tier]
+        for tier in ("long", "medium", "short")
+    }
+
+
+def _limit_display_items(
+        items: dict[Tier, list[TieredTrend]],
+) -> dict[Tier, list[TieredTrend]]:
+    limits = {"long": 3, "medium": 4, "short": 2}
+    result: dict[Tier, list[TieredTrend]] = {
+        "long": [],
+        "medium": [],
+        "short": [],
+    }
+    ranked = sorted(
+        (
+            item
+            for tier in ("long", "medium", "short")
+            for item in items[tier]
+        ),
+        key=lambda item: (
+            item.tier_score - _freshness_extra(item.age),
+            item.trend.structure_length,
+        ),
+        reverse=True,
+    )
+    for item in ranked:
         if sum(len(values) for values in result.values()) >= 6:
             break
         if len(result[item.tier]) < limits[item.tier]:
@@ -985,9 +1296,9 @@ def search_trend_hierarchy(
 ) -> dict[Tier, list[TieredTrend]]:
     """Build nested long/medium/short output for a 150-candle decision chart.
 
-    Long and medium tiers may include completed historical structures. Recent
-    short structures remain visible up to their last confirmed contact even
-    when a later candle has already broken the line.
+    Long and medium tiers may include completed historical structures. Every
+    unbroken structure projects to today; broken structures project through
+    the candle that confirms the break.
     """
     n = len(df)
     short_max, long_min = _tier_boundaries(n)
@@ -996,16 +1307,21 @@ def search_trend_hierarchy(
     long_candidates = [
         r for r in pool
         if r.structure_length >= long_min
-        and r.score >= long_threshold + _freshness_extra(n - 1 - r.last_touch)
-        and _is_display_fresh(r.score, n - 1 - r.last_touch)
+        and _tier_score("long", r, n, df) >= (
+            long_threshold + _freshness_extra(n - 1 - r.last_touch)
+        )
+        and _is_display_fresh(
+            _tier_score("long", r, n, df),
+            n - 1 - r.last_touch,
+        )
         and r.touches >= 3 and r.event_span >= 0.38
-        and r.max_touch_gap <= 0.80 and r.drift_t >= 0.55
+        and r.drift_t >= 0.55
         and r.max_body_breach_run <= 2
     ]
     medium_candidates = [
         r for r in pool
         if short_max < r.structure_length < long_min
-        and _medium_output_score(df, r, n) >= (
+        and _tier_score("medium", r, n, df) >= (
             (66.0 if (
                 _is_recent_medium_reversal(r, n) or
                 _is_live_structure(df, r)
@@ -1013,21 +1329,14 @@ def search_trend_hierarchy(
             _freshness_extra(n - 1 - r.last_touch)
         )
         and _is_display_fresh(
-            _medium_output_score(df, r, n),
+            _tier_score("medium", r, n, df),
             n - 1 - r.last_touch,
         )
         and r.touches >= 2
         and r.event_span >= 0.28 and r.drift_t >= 0.65
         and (
-            r.touches == 2 or
-            (
-                r.max_touch_gap <= 0.80 and
-                r.touch_distribution >= 0.15
-            )
-        )
-        and (
             r.touches >= 3 or
-            _medium_output_score(df, r, n) >= (
+            _tier_score("medium", r, n, df) >= (
                 (66.0 if (
                     _is_recent_medium_reversal(r, n) or
                     _is_live_structure(df, r)
@@ -1041,52 +1350,76 @@ def search_trend_hierarchy(
         r for r in pool
         if 7 <= r.structure_length <= short_max
         and 0 <= n - 1 - r.end <= 9
-        and short_progress_score(r) >= short_threshold and r.touches >= 2
+        and _tier_score("short", r, n, df) >= short_threshold
+        and r.touches >= 2
         and r.event_span >= 0.28 and r.drift_t >= 0.85
         and (
             r.structure_length >= 10 or
-            short_progress_score(r) >= short_threshold + 7
+            _tier_score("short", r, n, df) >= short_threshold + 7
         )
-        and (r.touches >= 3 or short_progress_score(r) >= short_threshold + 3)
+        and (
+            r.touches >= 3 or
+            _tier_score("short", r, n, df) >= short_threshold + 3
+        )
         and r.max_body_breach_run <= 2
     ]
 
     chosen = {
-        "long": _nms(df, long_candidates, max_results=6),
+        "long": _nms(
+            df,
+            long_candidates,
+            max_results=6,
+            score_fn=lambda trend: _tier_score("long", trend, n, df),
+        ),
         "medium": _nms(
             df,
             medium_candidates,
             max_results=8,
-            score_fn=lambda trend: _medium_output_score(df, trend, n),
+            score_fn=lambda trend: _tier_score("medium", trend, n, df),
         ),
         "short": _nms(
             df,
             short_candidates,
             max_results=4,
-            score_fn=short_progress_score,
+            score_fn=lambda trend: _tier_score("short", trend, n, df),
         ),
     }
     items: dict[Tier, list[TieredTrend]] = {"long": [], "medium": [], "short": []}
     for tier, values in chosen.items():
         for r in values:
             age = n - 1 - r.last_touch
-            current_gap = _latest_gap(df, r)
-            broken = bool(np.min(_post_touch_gaps(df, r)) < -0.50)
-            active = not broken and current_gap <= 1.25
-            if broken:
+            current_gap = _latest_close_gap(df, r)
+            break_index = _confirmed_break_index(df, r)
+            acceleration_index = _confirmed_acceleration_index(df, r)
+            termination_indices = [
+                index
+                for index in (break_index, acceleration_index)
+                if index is not None
+            ]
+            active = not termination_indices
+            if termination_indices:
                 status = "broken"
-            elif active and current_gap <= 0.50:
+            elif current_gap <= CHALLENGE_DISTANCE_ATR:
                 status = "challenging"
-            elif active:
-                status = "valid"
             else:
-                status = "historical"
+                status = "trending"
             tier_score = _tier_score(tier, r, n, df)
-            items[tier].append(TieredTrend(tier, r, active, None, status,
-                                           age, current_gap, tier_score))
+            items[tier].append(TieredTrend(
+                tier=tier,
+                trend=r,
+                active=active,
+                status=status,
+                age=age,
+                current_gap=current_gap,
+                tier_score=tier_score,
+                break_index=break_index,
+                acceleration_index=acceleration_index,
+            ))
 
     items = _deduplicate_across_tiers(df, items)
     items = _filter_display_noise(df, items)
+    items = _consolidate_trend_families(df, items)
+    items = _limit_display_items(items)
 
     # Attach each child to the smallest same-direction parent containing at
     # least 80% of the child. Orphans remain valid standalone trends.
@@ -1313,7 +1646,41 @@ def serialize_trend(item: TieredTrend, window_start: int,
     trend = item.trend
     start_index = window_start + trend.first_touch
     end_index = window_start + trend.last_touch
-    projection_end_index = latest_index if item.active else end_index
+    required_touches = 3 if item.tier == "long" else 2
+    formation_touch_offset = min(
+        required_touches - 1,
+        len(trend.touch_indices) - 1,
+    )
+    formation_end_local = trend.touch_indices[formation_touch_offset]
+    formation_end_index = window_start + formation_end_local
+    break_index = (
+        None
+        if item.break_index is None
+        else window_start + item.break_index
+    )
+    acceleration_index = (
+        None
+        if item.acceleration_index is None
+        else window_start + item.acceleration_index
+    )
+    termination_indices = [
+        index
+        for index in (break_index, acceleration_index)
+        if index is not None
+    ]
+    termination_index = min(termination_indices, default=None)
+    end_reason = None
+    if termination_index is not None:
+        end_reason = (
+            "break"
+            if termination_index == break_index
+            else "acceleration"
+        )
+    projection_end_index = (
+        latest_index
+        if item.active
+        else max(end_index, termination_index or end_index)
+    )
     local_projection_end = projection_end_index - window_start
     start_price = float(trend.y(trend.first_touch))
     end_price = float(trend.y(trend.last_touch))
@@ -1323,8 +1690,13 @@ def serialize_trend(item: TieredTrend, window_start: int,
         "tier": item.tier,
         "direction": trend.direction,
         "start_index": start_index,
+        "formation_end_index": formation_end_index,
         "end_index": end_index,
         "projection_end_index": projection_end_index,
+        "break_index": break_index,
+        "acceleration_index": acceleration_index,
+        "termination_index": termination_index,
+        "end_reason": end_reason,
         "start_price": start_price,
         "end_price": end_price,
         "projection_end_price": projection_end_price,
@@ -1341,6 +1713,10 @@ def serialize_trend(item: TieredTrend, window_start: int,
         "touch_distribution": round(float(trend.touch_distribution), 4),
         "max_touch_gap": round(float(trend.max_touch_gap), 4),
         "interior_touches": int(trend.interior_touches),
+        "touch_indices": [
+            window_start + index
+            for index in trend.touch_indices
+        ],
         "fit_start_index": window_start + trend.start,
         "fit_end_index": window_start + trend.end,
         "body_integrity": round(float(trend.body_integrity), 4),
@@ -1354,9 +1730,16 @@ def serialize_trend(item: TieredTrend, window_start: int,
         "drift_t": round(float(trend.drift_t), 4),
         "active": bool(item.active),
         "parent_id": item.parent_id,
+        "family_id": item.family_id,
+        "family_role": item.family_role,
         "status": item.status,
         "age": int(item.age),
         "current_gap": round(float(item.current_gap), 4),
+        "current_close_gap": round(float(item.current_gap), 4),
+        "distribution_penalty_factor": round(
+            float(_distribution_penalty_factor(item.tier, trend)),
+            4,
+        ),
     }
 
 

@@ -538,9 +538,15 @@ function drawTrendlines(ctx, plot, priceRange, theme) {
       continue;
     }
     const startIndex = Number(line.start_index);
+    const formationEndIndex = Number(line.formation_end_index ?? line.start_index);
     const endIndex = Number(line.end_index);
     const projectionEndIndex = Number(line.projection_end_index ?? line.end_index);
-    if (!Number.isFinite(startIndex) || !Number.isFinite(endIndex) || !Number.isFinite(projectionEndIndex)) {
+    if (
+      !Number.isFinite(startIndex)
+      || !Number.isFinite(formationEndIndex)
+      || !Number.isFinite(endIndex)
+      || !Number.isFinite(projectionEndIndex)
+    ) {
       continue;
     }
     if (projectionEndIndex < visibleStart || startIndex > visibleEnd) {
@@ -549,7 +555,7 @@ function drawTrendlines(ctx, plot, priceRange, theme) {
 
     const color = getTrendlineColor(line, theme);
     const width = getTrendlineWidth(line.tier);
-    const dash = getTrendlineDash(line.tier);
+    const dash = getTrendlineDash(line);
 
     drawTrendlineSegment(
       ctx,
@@ -558,12 +564,28 @@ function drawTrendlines(ctx, plot, priceRange, theme) {
       slot,
       line,
       startIndex,
-      Math.min(endIndex, projectionEndIndex),
+      Math.min(formationEndIndex, endIndex, projectionEndIndex),
       color,
-      width,
+      Math.max(1.2, width - 0.5),
       dash,
-      0.94,
+      0.78,
     );
+
+    if (endIndex > formationEndIndex) {
+      drawTrendlineSegment(
+        ctx,
+        plot,
+        priceRange,
+        slot,
+        line,
+        formationEndIndex,
+        Math.min(endIndex, projectionEndIndex),
+        color,
+        width,
+        dash,
+        0.96,
+      );
+    }
 
     if (projectionEndIndex > endIndex) {
       drawTrendlineSegment(
@@ -576,8 +598,8 @@ function drawTrendlines(ctx, plot, priceRange, theme) {
         projectionEndIndex,
         color,
         Math.max(1.4, width - 0.7),
-        [2, 5],
-        0.42,
+        dash,
+        0.76,
       );
     }
   }
@@ -644,14 +666,8 @@ function getTrendlineWidth(tier) {
   return 2;
 }
 
-function getTrendlineDash(tier) {
-  if (tier === "long") {
-    return [2, 6];
-  }
-  if (tier === "medium") {
-    return [8, 5];
-  }
-  return [];
+function getTrendlineDash(line) {
+  return Number(line.tier_score || 0) >= 75 ? [] : [8, 5];
 }
 
 function updateTrendlineLegendPlacement() {

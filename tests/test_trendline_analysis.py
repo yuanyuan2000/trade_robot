@@ -8,12 +8,18 @@ import pandas as pd
 
 from services.trendline_analysis_service import (
     TieredTrend,
+    TrendFamilyMetrics,
+    _acceleration_end_offset,
+    _apply_distribution_penalty,
     _body_integrity_batch,
     _body_metrics,
+    _break_confirmation_offset,
     _cached_analysis_result,
+    _consolidate_trend_families,
     _filter_display_noise,
     _is_flat_low_amplitude_noise,
     _is_display_fresh,
+    _is_useful_stage_line,
     _lines_are_duplicates,
     _store_analysis_result,
     _tier_boundaries,
@@ -75,6 +81,30 @@ class TrendlineAnalysisTests(unittest.TestCase):
         self.assertGreater(repeated.touch_distribution, bridge.touch_distribution)
         self.assertLess(repeated.max_touch_gap, 0.80)
         self.assertGreaterEqual(bridge.max_touch_gap, 0.80)
+
+    def test_distribution_penalty_is_smooth_and_tier_weighted(self) -> None:
+        trend = fit_interval(distributed_support(), 0, 89, "up")
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        sparse = replace(trend, touch_distribution=0.0)
+        distributed = replace(trend, touch_distribution=0.55)
+
+        self.assertAlmostEqual(
+            _apply_distribution_penalty("long", distributed, 80.0),
+            80.0,
+        )
+        self.assertAlmostEqual(
+            _apply_distribution_penalty("long", sparse, 80.0),
+            67.2,
+        )
+        self.assertAlmostEqual(
+            _apply_distribution_penalty("medium", sparse, 80.0),
+            68.8,
+        )
+        self.assertAlmostEqual(
+            _apply_distribution_penalty("short", sparse, 80.0),
+            73.6,
+        )
 
     def test_medium_score_rewards_three_or_more_contacts(self) -> None:
         trend = fit_interval(distributed_support(42), 0, 41, "up")
@@ -211,6 +241,65 @@ class TrendlineAnalysisTests(unittest.TestCase):
         self.assertEqual(len(filtered["long"]), 2)
         self.assertEqual(filtered["medium"], [])
 
+    def test_active_line_is_primary_over_higher_scored_ended_line(self) -> None:
+        df = distributed_support(80)
+        trend = fit_interval(df, 0, 79, "up")
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        active = TieredTrend(
+            "medium",
+            trend,
+            True,
+            tier_score=72.0,
+        )
+        ended = TieredTrend(
+            "long",
+            replace(trend),
+            False,
+            tier_score=88.0,
+        )
+        consolidated = _consolidate_trend_families(
+            df,
+            {
+                "long": [ended],
+                "medium": [active],
+                "short": [],
+            },
+        )
+        retained = consolidated["long"] + consolidated["medium"]
+        self.assertEqual(retained, [active])
+        self.assertEqual(active.family_role, "primary")
+
+    def test_stage_line_needs_two_novel_touches_and_separation(self) -> None:
+        trend = fit_interval(distributed_support(80), 0, 79, "up")
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        primary = TieredTrend("long", trend, False, tier_score=80.0)
+        candidate = TieredTrend(
+            "medium",
+            replace(trend),
+            False,
+            tier_score=74.0,
+        )
+        useful = TrendFamilyMetrics(
+            overlap_ratio=0.75,
+            median_distance=1.2,
+            distance_80=1.8,
+            slope_difference=0.40,
+            novel_touches=2,
+            separation_run=10,
+        )
+        one_touch = replace(useful, novel_touches=1)
+        brief_separation = replace(useful, separation_run=3)
+
+        self.assertTrue(_is_useful_stage_line(candidate, primary, useful))
+        self.assertFalse(
+            _is_useful_stage_line(candidate, primary, one_touch),
+        )
+        self.assertFalse(
+            _is_useful_stage_line(candidate, primary, brief_separation),
+        )
+
     def test_serialization_draws_only_between_confirmed_contacts(self) -> None:
         trend = fit_interval(distributed_support(), 0, 89, "up")
         self.assertIsNotNone(trend)
@@ -223,6 +312,10 @@ class TrendlineAnalysisTests(unittest.TestCase):
         )
         payload = serialize_trend(item, window_start=100, latest_index=249)
         self.assertEqual(payload["start_index"], 100 + trend.first_touch)
+        self.assertEqual(
+            payload["formation_end_index"],
+            100 + trend.touch_indices[2],
+        )
         self.assertEqual(payload["end_index"], 100 + trend.last_touch)
         self.assertEqual(payload["projection_end_index"], payload["end_index"])
         self.assertEqual(payload["fit_start_index"], 100 + trend.start)
@@ -236,6 +329,65 @@ class TrendlineAnalysisTests(unittest.TestCase):
         )
         self.assertEqual(active_payload["end_index"], 100 + trend.last_touch)
         self.assertEqual(active_payload["projection_end_index"], 249)
+
+    def test_close_break_needs_two_closes_or_one_severe_close(self) -> None:
+        self.assertEqual(
+            _break_confirmation_offset(np.asarray([0.4, -0.35, -0.42])),
+            2,
+        )
+        self.assertEqual(
+            _break_confirmation_offset(np.asarray([0.4, -0.81])),
+            1,
+        )
+        self.assertIsNone(
+            _break_confirmation_offset(np.asarray([0.4, -0.45, 0.7])),
+        )
+
+    def test_acceleration_end_requires_persistence_without_reentry(self) -> None:
+        gdx_like = np.asarray([
+            0.1, 2.1, 3.0, 2.6, 4.79, 4.80, 5.08, 2.38, 1.83,
+        ])
+        mu_like = np.asarray([0.1, 4.21, 6.06, 5.10, 2.30, 1.20])
+        recent_move = np.asarray([0.1, 2.0, 4.50, 5.00, 5.20])
+
+        self.assertEqual(_acceleration_end_offset(gdx_like), 4)
+        self.assertIsNone(_acceleration_end_offset(mu_like))
+        self.assertIsNone(_acceleration_end_offset(recent_move))
+
+    def test_broken_line_projects_to_confirmation_bar(self) -> None:
+        trend = fit_interval(distributed_support(), 0, 89, "up")
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        item = TieredTrend(
+            tier="long",
+            trend=trend,
+            active=False,
+            status="broken",
+            break_index=95,
+            tier_score=trend.score,
+        )
+        payload = serialize_trend(item, window_start=100, latest_index=249)
+        self.assertEqual(payload["break_index"], 195)
+        self.assertEqual(payload["projection_end_index"], 195)
+
+    def test_accelerated_line_projects_to_acceleration_bar(self) -> None:
+        trend = fit_interval(distributed_support(), 0, 89, "up")
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        item = TieredTrend(
+            tier="long",
+            trend=trend,
+            active=False,
+            status="broken",
+            acceleration_index=95,
+            tier_score=trend.score,
+        )
+        payload = serialize_trend(item, window_start=100, latest_index=249)
+        self.assertIsNone(payload["break_index"])
+        self.assertEqual(payload["acceleration_index"], 195)
+        self.assertEqual(payload["termination_index"], 195)
+        self.assertEqual(payload["end_reason"], "acceleration")
+        self.assertEqual(payload["projection_end_index"], 195)
 
     def test_old_lines_need_high_scores_to_remain_visible(self) -> None:
         self.assertTrue(_is_display_fresh(77.0, 60))

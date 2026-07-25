@@ -1,7 +1,8 @@
 # 智能直线趋势线算法完整说明
 
-本文逐项说明当前生产代码中的直线趋势线识别流程、公式、阈值、候选保留规则、
-去重规则和输出状态。实现以 `services/trendline_analysis_service.py` 为准。
+本文保留公式、搜索空间和实现细节。更容易阅读、严格按实际运行顺序组织的主说明见
+`docs/trendline_algorithm.md`；实现仍以 `services/trendline_analysis_service.py`
+为准。当前算法版本为 `trendline-v11-trend-families-1`。
 
 本文描述的是项目内独立实现，不依赖 `algorithm/` 目录。外部导入的
 `algorithm/trendline_algorithm_v4_bundle/直线趋势线算法完整说明.md`
@@ -386,6 +387,17 @@ touch_distribution =
   + 0.35 * bin_score
 ```
 
+各层基础分算完后，再统一应用连续分布减分：
+
+```text
+quality = clip(touch_distribution / 0.55, 0, 1)
+weakness = (1 - quality) ^ 1.5
+final_tier_score = base_tier_score * (1 - tier_penalty * weakness)
+```
+
+长期、中期、短期的 `tier_penalty` 分别为 0.16、0.14、0.08。分布达到 0.55
+后没有额外减分。该连续规则取代长期和部分中期的最大空档硬淘汰。
+
 `interior_touches` 统计落在整个拟合区间 20%～80% 位置内的触点数量，目前只作为解释
 指标返回，不直接作为硬门槛。
 
@@ -698,16 +710,18 @@ age > 75  时 tier_score >= 78
 age > 105 时 tier_score >= 80
 ```
 
-### 14.2 当前仍有效的结构
+### 14.2 中期评分中的近期结构辅助条件
 
-从最后有效触点到最新 K 线重新计算 `gap`。当前仍有效需同时满足：
+从最后有效触点到最新 K 线重新计算锚点 `gap`。中期候选满足以下条件时，可以额外参考
+短期推进分：
 
 ```text
 min(post_touch_gap) >= -0.50
 latest_gap <= 1.25
 ```
 
-该结果按 DataFrame 长度缓存在候选对象上。
+该结果按 DataFrame 长度缓存在候选对象上。它只影响中期候选评分，不再决定图例状态
+或趋势线是否延伸；状态统一使用第 17 节的收盘价规则。
 
 ### 14.3 长期结构
 
@@ -725,10 +739,11 @@ long_score >= 55 + freshness_extra
 通过历史显示硬门槛
 touches >= 3
 event_span >= 0.38
-max_touch_gap <= 0.80
 drift_t >= 0.55
 max_body_breach_run <= 2
 ```
+
+长期结构分在筛选和排序前应用最高 16% 的连续分布减分。
 
 ### 14.4 中期趋势
 
@@ -760,18 +775,13 @@ drift_t >= 0.65
 max_body_breach_run <= 2
 ```
 
-三个及以上触点的中期线还必须满足：
-
-```text
-max_touch_gap <= 0.80
-touch_distribution >= 0.15
-```
-
 只有 2 个触点时还需：
 
 ```text
 medium_output_score >= base_threshold + freshness_extra + 4
 ```
+
+中期结构分在筛选和排序前应用最高 14% 的连续分布减分，不再按最大空档一票否决。
 
 ### 14.5 短期推进
 
@@ -805,8 +815,8 @@ short_score >= 71
 short_score >= 67
 ```
 
-短期结构即使后来已被突破，也可作为已经完成的近期历史线保留，但绘图不会延长到突破
-后的区域。
+短期结构分在筛选和排序前应用最高 8% 的连续分布减分。短期结构即使后来已经结束，
+也可作为已经完成的近期线保留，绘图延长到趋势结束位置后停止。
 
 ## 15. 几何去重
 
@@ -910,7 +920,55 @@ tier_score >= best_score - 10
 tier_score - freshness_extra
 ```
 
-优先排序，结构跨度作为第二排序键。最终上限：
+优先排序，结构跨度作为第二排序键。
+
+### 15.5 趋势族合并
+
+几何去重只处理近似同一条直线。精确去重后，程序还会合并“线的位置和斜率有所不同，
+但主要解释同一段行情”的同方向趋势。该步骤称为趋势族合并。
+
+候选与某个族的主线同时满足以下条件时归入该族：
+
+```text
+overlap_ratio    >= 0.55
+median_distance  <= 2.00 ATR
+distance_80      <= 3.00 ATR
+```
+
+趋势族使用主线锚定，不做传递闭包。候选分别与各族主线比较，若能加入多个族，选择
+重合比例更高、距离中位数和 80% 分位数更低的一族。这样不会因为 A 接近 B、B 接近 C，
+就把本来相距很远的 A 与 C 间接合并。
+
+主线先按是否仍未结束排序。相同状态下使用：
+
+```text
+primary_quality =
+    tier_score
+  + 6 * touch_distribution
+  + 4 * min(1, structure_length / N)
+```
+
+因此当前仍有效的结构优先；之后综合最终评分、触点分布和有效结构跨度，而不是只取最高分。
+单成员趋势族的 `family_role` 为 `standalone`，多成员族的主线为 `primary`。
+
+每族最多额外保留一条 `stage` 阶段变化线，并同时要求：
+
+```text
+candidate.tier_score >= primary.tier_score - 8
+novel_touches >= 2
+separation_run >= 8
+slope_difference >= 0.25
+```
+
+`novel_touches` 是主线不能解释的候选触点数。触点位于主线有效时间范围之外，或该位置
+两条线相距超过 `0.75 ATR`，均计为独立新增触点。
+
+`separation_run` 是两条线连续相距超过 `0.80 ATR` 的最长根数。它要求阶段变化形成
+连续区间，避免只因一两个局部点保留近似平行线。`slope_difference` 为两条线斜率绝对差
+除以主线斜率绝对值，至少 25% 才表示可辨认的推进速度变化。
+
+多个阶段候选同时合格时，依次按新增触点数、连续分离长度、斜率差、最终评分和结构跨度
+选择，仅保留最强的一条。趋势族合并完成后，才应用显示数量上限：
 
 ```text
 长期最多 3
@@ -934,40 +992,56 @@ parent.structure_length > child.structure_length
 
 ## 17. 状态判定与绘图范围
 
-从最后触点到最新 K 线的最差距离小于 `-0.50 ATR` 时：
+状态使用收盘价距离，不使用包含开盘价和影线的拟合锚点：
 
 ```text
-status = broken
-active = false
+close_gap = direction * (Close - line) / ATR
 ```
 
-否则：
+确认突破满足任一条件：
 
 ```text
-latest_gap <= 0.50  -> challenging
-0.50 < latest_gap <= 1.25 -> valid
-latest_gap > 1.25 -> historical
+连续两根 close_gap < -0.30
+任意一根 close_gap < -0.80
 ```
 
-`challenging` 和 `valid` 的 `active = true`；`historical` 的 `active = false`。
-
-绘图起点永远是首个有效触点，结构段终点永远是最后有效触点：
+旧趋势也可能被顺方向更快的趋势替代。持续加速结束条件：
 
 ```text
-start_index = first_touch
-end_index   = last_touch
+close_gap >= 4.00
+该位置之后至少已有 3 根 K 线
+后续所有 close_gap > 1.50
 ```
 
-仅 `active` 结构把 `projection_end_index` 延长到最新 K 线；其他状态只画到
-`last_touch`。因此失效线不会被画到突破位置。
+若后来重新回到 `1.50 ATR` 内，则不结束旧趋势。满足时记录
+`acceleration_index`，并从首次达到 4.00 ATR 的位置停止绘图。
 
-前端样式：
+状态只保留：
 
-- 长期：点状线；
-- 中期：虚线；
-- 短期：实线；
-- 同层级多线使用不同颜色；
-- 当前有效线从最后触点到最新 K 线的投影段使用更弱的点状样式。
+```text
+已确认突破或持续加速结束             -> broken
+尚未突破且 latest_close_gap <= 0.50 -> challenging
+尚未突破且 latest_close_gap > 0.50  -> trending
+```
+
+未发生反向突破或持续加速结束时 `active = true`。反向突破保存 `break_index`，
+顺向持续加速保存 `acceleration_index`，两者中较早者为 `termination_index`。
+
+绘图字段：
+
+```text
+start_index          = first_touch
+formation_end_index  = 达到最低触点数的位置
+end_index            = last_touch
+projection_end_index = 最新 K 线或 termination_index
+```
+
+长期以第 3 个触点作为形成位置，中短期以第 2 个触点作为形成位置。首触点到形成位置
+使用稍浅样式，形成位置到最后触点使用正常深度，最后触点到最新 K 线或趋势结束日
+使用稍浅样式。三段全部来自同一次最新窗口识别。
+
+所有分段采用相同线型：`tier_score >= 75` 使用实线，否则使用虚线。不同趋势线使用
+高区分度的分类色板，颜色不再与上涨或下跌方向绑定。
 
 ## 18. 输出解释字段
 
@@ -979,9 +1053,14 @@ end_index   = last_touch
 - `body_breach_ratio`、`severe_body_breach_ratio`、`max_body_breach_run`；
 - `touches`、`touch_score`、`rejection`、`proximity`；
 - `event_span`、`touch_distribution`、`max_touch_gap`、`interior_touches`；
+- `touch_indices`、`formation_end_index`、`break_index`、`acceleration_index`；
+- `termination_index`、`end_reason`；
 - `efficiency`、`slope_strength`、`drift_t`；
 - `fit_start_index`、`fit_end_index`；
-- `active`、`status`、`age`、`current_gap`、`parent_id`。
+- `distribution_penalty_factor`；
+- `active`、`status`、`age`、`current_close_gap`、`parent_id`；
+- `family_id`：趋势族主线 ID；
+- `family_role`：`primary`、`stage` 或 `standalone`。
 
 排查图形时应优先看 `tier_score`，因为中期和短期并不以通用 `score` 作为最终排序依据。
 
@@ -1001,6 +1080,8 @@ end_index   = last_touch
 6. **实体和影线分层处理。** 这比把 High/Low 或 Close 当作唯一真值更贴近 K 线结构。
 7. **有效跨度与拟合跨度分离。** 这是避免首尾桥接和错误长期线的重要设计。
 8. **去重基于几何关系。** ATR 距离分位数、共享时间和斜率分歧比仅比较起止日期可靠。
+9. **趋势族保留结构差异。** 相似线先选主线，只有具有独立触点和连续分离区间的阶段线
+   才能额外保留，减少同一行情下无法选择的多条近似线。
 
 ### 19.2 数学上是否“足够美”
 
@@ -1183,3 +1264,12 @@ python3 scripts/validate_trendline_algorithm.py --all-symbols
 
 任何评分、搜索密度或阈值调整都应同时保存算法版本、标的数据截止日期和验证结果，避免
 只对当前肉眼案例变好、对未来样本反而退化。
+
+本次趋势族合并的修改前后快照：
+
+```text
+trendline_results/baselines/trendline-v10-after-acceleration-end.json
+trendline_results/baselines/trendline-v11-after-family-consolidation.json
+```
+
+输出总数从 58 条降为 54 条，没有新增或替换，只删除了被族内主线充分解释的 4 条冗余线。

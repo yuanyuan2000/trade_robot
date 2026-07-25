@@ -33,6 +33,7 @@ const showWeekendData = document.getElementById("show-weekend-data");
 const analysisControls = document.getElementById("analysis-controls");
 const analysisAlgorithm = document.getElementById("analysis-algorithm");
 const runAnalysisButton = document.getElementById("run-analysis-button");
+const indicatorLegend = document.getElementById("indicator-legend");
 const trendlineLegend = document.getElementById("trendline-legend");
 let heartbeatTimer;
 let currentSymbol = "";
@@ -51,6 +52,7 @@ let draggedOverviewSymbol = "";
 let overviewDailySyncDone = false;
 let overviewLiveTimer;
 let overviewLiveRefreshInFlight = false;
+let analysisIndicatorLegendVisible = false;
 let overviewLoadInFlight;
 const overviewLiveRefreshMs = 5 * 60 * 1000;
 
@@ -75,6 +77,13 @@ function updateChartTitle(symbol) {
   chartTitle.textContent = `${symbol} ${getChartPeriodLabel()}`;
 }
 
+function updateIndicatorLegendVisibility() {
+  indicatorLegend.hidden = (
+    currentWorkspaceMode === "analysis"
+    && !analysisIndicatorLegendVisible
+  );
+}
+
 function applyWorkspaceMode(mode) {
   currentWorkspaceMode = mode === "analysis" ? "analysis" : "market";
   const isAnalysis = currentWorkspaceMode === "analysis";
@@ -82,6 +91,11 @@ function applyWorkspaceMode(mode) {
   marketSubtitle.textContent = isAnalysis ? "K线智能识别与算法分析" : "2020年以来行情数据";
   analysisControls.hidden = !isAnalysis;
   trendlineLegend.hidden = !isAnalysis || !trendlineLegend.innerHTML;
+  analysisIndicatorLegendVisible = false;
+  updateIndicatorLegendVisibility();
+  if (isAnalysis) {
+    indicatorPanel.hidden = true;
+  }
   if (!isAnalysis) {
     clearTrendlineAnalysis();
     if (currentSymbol) {
@@ -745,12 +759,13 @@ function renderTrendlineLegend(trendlines) {
   trendlineLegend.innerHTML = sortedTrendlines.map((line) => {
     const visible = line.visible !== false;
     const visibilityClass = visible ? "" : " is-hidden";
+    const lineStyleClass = Number(line.tier_score || 0) >= 75 ? "" : " is-dashed";
     return `
     <div class="trendline-row${visibilityClass}" data-trendline-id="${escapeHtml(line.id)}">
       <button class="legend-button${visibilityClass}" type="button" data-action="toggle-trendline" title="${visible ? "隐藏" : "显示"}">
         ${eyeIcon(visible)}
       </button>
-      <span class="trendline-swatch trendline-${escapeHtml(line.tier)}" style="border-top-color:${escapeHtml(line.color)}"></span>
+      <span class="trendline-swatch${lineStyleClass}" style="border-top-color:${escapeHtml(line.color)}"></span>
       <span class="trendline-name">${escapeHtml(trendlineName(line))}</span>
       <span class="trendline-value">${Number(line.tier_score).toFixed(1)}</span>
     </div>
@@ -763,29 +778,32 @@ function renderTrendlineLegend(trendlines) {
 }
 
 function decorateTrendlines(trendlines) {
-  const tierCounts = {};
-  return trendlines.map((line) => {
-    const key = `${line.tier}-${line.direction}`;
-    const index = tierCounts[key] || 0;
-    tierCounts[key] = index + 1;
+  const ranked = [...trendlines].sort(
+    (left, right) => Number(right.tier_score || 0) - Number(left.tier_score || 0),
+  );
+  const colorById = new Map(
+    ranked.map((line, index) => [line.id, trendlineColor(index)]),
+  );
+  return trendlines.map((line, index) => {
     return {
       ...line,
-      color: trendlineColor(line, index),
+      color: colorById.get(line.id) || trendlineColor(index),
       color_index: index,
     };
   });
 }
 
-function trendlineColor(line, index) {
-  const palettes = {
-    "long-up": ["#2563eb", "#14b8a6", "#64748b"],
-    "long-down": ["#dc2626", "#f59e0b", "#9333ea"],
-    "medium-up": ["#06b6d4", "#22c55e", "#0ea5e9", "#84cc16"],
-    "medium-down": ["#f97316", "#ef4444", "#a855f7", "#eab308"],
-    "short-up": ["#8b5cf6", "#10b981"],
-    "short-down": ["#d946ef", "#fb7185"],
-  };
-  const colors = palettes[`${line.tier}-${line.direction}`] || ["#64748b"];
+function trendlineColor(index) {
+  const colors = [
+    "#2563eb",
+    "#dc2626",
+    "#0f9d8a",
+    "#7c3aed",
+    "#d97706",
+    "#0891b2",
+    "#be185d",
+    "#65a30d",
+  ];
   return colors[index % colors.length];
 }
 
@@ -793,9 +811,7 @@ function trendlineName(line) {
   const tierLabels = { long: "L", medium: "M", short: "S-now" };
   const directionLabels = { up: "上涨", down: "下跌" };
   const statusLabels = {
-    current: "当前",
-    historical: "历史",
-    valid: "有效",
+    trending: "趋势中",
     challenging: "挑战中",
     broken: "已结束",
   };
@@ -1179,6 +1195,10 @@ indicatorPanelToggle.addEventListener("click", () => {
   indicatorPanel.hidden = !indicatorPanel.hidden;
   symbolSettingsPanel.hidden = true;
   if (!indicatorPanel.hidden) {
+    if (currentWorkspaceMode === "analysis") {
+      analysisIndicatorLegendVisible = true;
+      updateIndicatorLegendVisibility();
+    }
     loadIndicatorCatalog();
   }
 });

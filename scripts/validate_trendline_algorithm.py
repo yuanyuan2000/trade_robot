@@ -15,6 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from database.db import get_connection  # noqa: E402
 from database.repository import get_daily_prices  # noqa: E402
 from services.trendline_analysis_service import (  # noqa: E402
+    _distribution_penalty_factor,
     _lines_are_duplicates,
     candles_to_dataframe,
     search_trend_hierarchy,
@@ -26,7 +27,8 @@ REAL_CASES = (
     ("SPX", "down", "2026-03-02", "2026-03-31"),
     ("US10Y", "up", "2026-02-27", "2026-03-31"),
     ("MU", "up", "2025-12-17", "2026-02-06"),
-    ("GDX", "down", "2026-05-11", "2026-07-13"),
+    ("GDX", "down", "2026-03-09", "2026-06-05"),
+    ("GDX", "down", "2026-06-16", "2026-07-13"),
 )
 
 
@@ -137,7 +139,19 @@ def validate_real() -> list[tuple[str, bool, str]]:
             trend = item.trend
             if trend.direction != direction:
                 continue
-            display_end = len(rows) - 1 if item.active else trend.last_touch
+            termination_indices = [
+                index
+                for index in (item.break_index, item.acceleration_index)
+                if index is not None
+            ]
+            display_end = (
+                len(rows) - 1
+                if item.active
+                else max(
+                    trend.last_touch,
+                    min(termination_indices, default=trend.last_touch),
+                )
+            )
             intersection = max(
                 0,
                 min(display_end, target_end) -
@@ -171,6 +185,26 @@ def validate_real() -> list[tuple[str, bool, str]]:
     return results
 
 
+def validate_trend_families() -> list[tuple[str, bool, str]]:
+    rows = [
+        row for row in get_daily_prices("SOXX")
+        if date.fromisoformat(row["date"]).weekday() < 5
+    ][-150:]
+    items = flatten(search_trend_hierarchy(candles_to_dataframe(rows)))
+    up_items = [item for item in items if item.trend.direction == "up"]
+    roles = sorted(item.family_role for item in up_items)
+    passed = (
+        len(up_items) == 2 and
+        roles == ["primary", "stage"]
+    )
+    detail = ", ".join(
+        f"{item.family_role}:{rows[item.trend.first_touch]['date']}.."
+        f"{rows[item.trend.last_touch]['date']}@{item.tier_score:.1f}"
+        for item in up_items
+    )
+    return [("family:SOXX", passed, detail)]
+
+
 def audit_symbol(symbol: str) -> tuple[str, bool, str]:
     rows = [
         row for row in get_daily_prices(symbol)
@@ -192,19 +226,29 @@ def audit_symbol(symbol: str) -> tuple[str, bool, str]:
         np.isfinite(item.trend.intercept)
         for item in items
     )
-    valid_long_gaps = all(
-        item.tier != "long" or item.trend.max_touch_gap <= 0.80
+    valid_distribution_penalties = all(
+        0.84 <= _distribution_penalty_factor(item.tier, item.trend) <= 1.0
         for item in items
     )
     valid_body_crossings = all(
         item.trend.max_body_breach_run <= 2
         for item in items
     )
+    family_counts: dict[str, int] = {}
+    for item in items:
+        family_counts[item.family_id or item.id] = (
+            family_counts.get(item.family_id or item.id, 0) + 1
+        )
+    valid_family_sizes = all(
+        count <= 2
+        for count in family_counts.values()
+    )
     passed = (
         duplicate_pairs == 0 and
         valid_geometry and
-        valid_long_gaps and
+        valid_distribution_penalties and
         valid_body_crossings and
+        valid_family_sizes and
         len(items) <= 6
     )
     detail = (
@@ -243,6 +287,7 @@ def main() -> int:
     results = validate_synthetic()
     if not args.synthetic_only:
         results.extend(validate_real())
+        results.extend(validate_trend_families())
     if args.all_symbols:
         results.extend(validate_all_symbols())
     for name, passed, detail in results:

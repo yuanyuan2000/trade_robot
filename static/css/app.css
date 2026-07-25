@@ -586,6 +586,10 @@ button:disabled {
   pointer-events: auto;
 }
 
+.indicator-legend[hidden] {
+  display: none;
+}
+
 .trendline-legend {
   position: absolute;
   z-index: 2;
@@ -644,43 +648,8 @@ button:disabled {
   border-top: 3px solid #2563eb;
 }
 
-.trendline-long {
-  border-top-style: dotted;
-  border-top-width: 3px;
-}
-
-.trendline-medium {
+.trendline-swatch.is-dashed {
   border-top-style: dashed;
-  border-top-width: 2px;
-}
-
-.trendline-short {
-  border-top-style: solid;
-  border-top-width: 3px;
-}
-
-.trendline-up.trendline-long {
-  border-top-color: #2563eb;
-}
-
-.trendline-down.trendline-long {
-  border-top-color: var(--danger);
-}
-
-.trendline-up.trendline-medium {
-  border-top-color: #06b6d4;
-}
-
-.trendline-down.trendline-medium {
-  border-top-color: #f97316;
-}
-
-.trendline-up.trendline-short {
-  border-top-color: #8b5cf6;
-}
-
-.trendline-down.trendline-short {
-  border-top-color: #d946ef;
 }
 
 .trendline-name {
