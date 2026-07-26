@@ -3,6 +3,7 @@ const chartState = {
   canvas: null,
   ctx: null,
   tooltip: null,
+  trendlineTooltip: null,
   legend: null,
   rawRows: [],
   candles: [],
@@ -19,6 +20,7 @@ const chartState = {
   hoverIndex: null,
   hoverX: null,
   hoverY: null,
+  hoverTrendlineId: null,
   dpr: 1,
   defaultVisibleCount: 150,
   layout: {
@@ -41,6 +43,7 @@ function initChart() {
   chartState.canvas = document.getElementById("kline-canvas");
   chartState.ctx = chartState.canvas.getContext("2d");
   chartState.tooltip = document.getElementById("ohlcv-tooltip");
+  chartState.trendlineTooltip = document.getElementById("trendline-tooltip");
   chartState.legend = document.getElementById("indicator-legend");
 
   bindChartEvents();
@@ -87,6 +90,8 @@ function setChartTrendlines(trendlines) {
   chartState.trendlines = Array.isArray(trendlines)
     ? trendlines.map((line) => ({ visible: true, ...line, visible: line.visible !== false }))
     : [];
+  chartState.hoverTrendlineId = null;
+  hideTrendlineTooltip();
   drawChart();
 }
 
@@ -202,6 +207,7 @@ function bindChartEvents() {
       chartState.hoverIndex = null;
       chartState.hoverX = null;
       chartState.hoverY = null;
+      chartState.hoverTrendlineId = null;
       hideTooltip();
       drawChart();
       return;
@@ -215,6 +221,7 @@ function bindChartEvents() {
       chartState.hoverIndex = null;
       chartState.hoverX = null;
       chartState.hoverY = null;
+      chartState.hoverTrendlineId = null;
       hideTooltip();
       drawChart();
     }
@@ -450,6 +457,13 @@ function drawCrosshair(ctx, plot, visible, priceRange, theme) {
   if (!Number.isFinite(price)) {
     return;
   }
+  const slot = plot.width / chartState.visibleCount;
+  const visibleIndex = clamp(
+    Math.floor((x - plot.left) / slot),
+    0,
+    Math.max(0, visible.length - 1),
+  );
+  const candle = visible[visibleIndex];
 
   ctx.strokeStyle = theme.crosshair;
   ctx.setLineDash([4, 4]);
@@ -457,14 +471,15 @@ function drawCrosshair(ctx, plot, visible, priceRange, theme) {
   drawLine(ctx, plot.left, y, plot.right, y);
   ctx.setLineDash([]);
 
-  drawCrosshairAxisLabels(ctx, plot, visible, theme, y, price);
+  drawCrosshairAxisLabels(ctx, plot, visible, theme, x, y, price, candle);
 }
 
-function drawCrosshairAxisLabels(ctx, plot, visible, theme, y, price) {
+function drawCrosshairAxisLabels(ctx, plot, visible, theme, x, y, price, candle) {
   const basePrice = visible[0]?.open || 0;
   const percent = basePrice ? (price / basePrice - 1) * 100 : 0;
   const priceText = formatPrice(price);
   const percentText = formatPercent(percent);
+  const dateText = crosshairDateText(candle);
   const labelHeight = 20;
 
   ctx.save();
@@ -488,7 +503,38 @@ function drawCrosshairAxisLabels(ctx, plot, visible, theme, y, price) {
   ctx.fillText(priceText, plot.left - 12, labelY + labelHeight / 2);
   ctx.textAlign = "left";
   ctx.fillText(percentText, plot.right + 12, labelY + labelHeight / 2);
+
+  if (dateText) {
+    const dateWidth = ctx.measureText(dateText).width + 14;
+    const dateX = clamp(
+      x - dateWidth / 2,
+      plot.left,
+      plot.right - dateWidth,
+    );
+    const dateY = plot.bottom + 6;
+    ctx.fillStyle = theme.background;
+    ctx.strokeStyle = theme.crosshair;
+    ctx.fillRect(dateX, dateY, dateWidth, labelHeight);
+    ctx.strokeRect(dateX, dateY, dateWidth, labelHeight);
+    ctx.fillStyle = theme.label;
+    ctx.textAlign = "center";
+    ctx.fillText(
+      dateText,
+      dateX + dateWidth / 2,
+      dateY + labelHeight / 2,
+    );
+  }
   ctx.restore();
+}
+
+function crosshairDateText(candle) {
+  if (!candle?.date) {
+    return "";
+  }
+  if (candle.endDate && candle.endDate !== candle.date) {
+    return `${candle.date} 至 ${candle.endDate}`;
+  }
+  return candle.date;
 }
 
 function drawIndicators(ctx, plot, priceRange) {
@@ -554,7 +600,8 @@ function drawTrendlines(ctx, plot, priceRange, theme) {
     }
 
     const color = getTrendlineColor(line, theme);
-    const width = getTrendlineWidth(line.tier);
+    const width = getTrendlineWidth(line.tier)
+      + (line.id === chartState.hoverTrendlineId ? 1 : 0);
     const dash = getTrendlineDash(line);
 
     drawTrendlineSegment(
@@ -603,8 +650,58 @@ function drawTrendlines(ctx, plot, priceRange, theme) {
       );
     }
   }
+  for (const line of chartState.trendlines) {
+    drawTrendlineTouches(ctx, plot, priceRange, slot, line, theme);
+  }
   ctx.globalAlpha = 1;
   ctx.setLineDash([]);
+}
+
+function drawTrendlineTouches(ctx, plot, priceRange, slot, line, theme) {
+  if (line.visible === false || !Array.isArray(line.touch_indices)) {
+    return;
+  }
+  const projectionEnd = Number(
+    line.projection_end_index ?? line.end_index,
+  );
+  const expectedCount = Math.max(0, Number(line.touches) || 0);
+  const touchIndices = [...new Set(
+    line.touch_indices
+      .map(Number)
+      .filter(Number.isFinite),
+  )].slice(0, expectedCount);
+  const color = getTrendlineColor(line, theme);
+  const radius = line.id === chartState.hoverTrendlineId ? 4 : 3.2;
+
+  ctx.save();
+  ctx.fillStyle = theme.background;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.6;
+  ctx.setLineDash([]);
+  for (const index of touchIndices) {
+    if (
+      index < chartState.firstVisible
+      || index >= chartState.firstVisible + chartState.visibleCount
+      || index > projectionEnd
+    ) {
+      continue;
+    }
+    const price = trendlinePriceAt(line, index);
+    if (!Number.isFinite(price)) {
+      continue;
+    }
+    ctx.beginPath();
+    ctx.arc(
+      indexToX(index, plot, slot),
+      priceToY(price, plot, priceRange),
+      radius,
+      0,
+      Math.PI * 2,
+    );
+    ctx.fill();
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function drawTrendlineSegment(ctx, plot, priceRange, slot, line, fromIndex, toIndex, color, width, dash, alpha) {
@@ -729,6 +826,7 @@ function updateHover(offsetX, offsetY) {
     chartState.hoverIndex = null;
     chartState.hoverX = null;
     chartState.hoverY = null;
+    chartState.hoverTrendlineId = null;
     hideTooltip();
     drawChart();
     return;
@@ -741,6 +839,7 @@ function updateHover(offsetX, offsetY) {
     chartState.hoverIndex = null;
     chartState.hoverX = null;
     chartState.hoverY = null;
+    chartState.hoverTrendlineId = null;
     hideTooltip();
     drawChart();
     return;
@@ -749,12 +848,30 @@ function updateHover(offsetX, offsetY) {
   chartState.hoverIndex = dataIndex;
   chartState.hoverX = offsetX;
   chartState.hoverY = offsetY;
+  const visible = getVisibleCandles();
+  const priceRange = getPriceRange(visible);
+  const trendlineHit = findTrendlineHit(
+    offsetX,
+    offsetY,
+    plot,
+    priceRange,
+  );
+  chartState.hoverTrendlineId = trendlineHit?.id || null;
+  if (trendlineHit) {
+    hideOhlcvTooltip();
+    showTrendlineTooltip(trendlineHit, offsetX, offsetY);
+    renderIndicatorLegend();
+    drawChart();
+    return;
+  }
+
+  hideTrendlineTooltip();
   const candleCenterX = plot.left + slot * (visibleIndex + 0.5);
-  const candleHitRadius = Math.max(5, Math.min(14, slot * 0.48));
-  if (Math.abs(offsetX - candleCenterX) <= candleHitRadius) {
+  const candle = chartState.candles[dataIndex];
+  if (isCandleHit(candle, candleCenterX, offsetX, offsetY, slot, plot, priceRange)) {
     showTooltip(chartState.candles[dataIndex], offsetX, offsetY);
   } else {
-    hideTooltip();
+    hideOhlcvTooltip();
   }
   renderIndicatorLegend();
   drawChart();
@@ -788,7 +905,187 @@ function showTooltip(candle, offsetX, offsetY) {
 }
 
 function hideTooltip() {
+  hideOhlcvTooltip();
+  hideTrendlineTooltip();
+}
+
+function hideOhlcvTooltip() {
   chartState.tooltip.hidden = true;
+}
+
+function hideTrendlineTooltip() {
+  if (chartState.trendlineTooltip) {
+    chartState.trendlineTooltip.hidden = true;
+  }
+}
+
+function isCandleHit(candle, centerX, pointerX, pointerY, slot, plot, priceRange) {
+  const bodyWidth = Math.max(2, Math.min(12, slot * 0.62));
+  const openY = priceToY(candle.open, plot, priceRange);
+  const closeY = priceToY(candle.close, plot, priceRange);
+  const highY = priceToY(candle.high, plot, priceRange);
+  const lowY = priceToY(candle.low, plot, priceRange);
+  const bodyTop = Math.min(openY, closeY);
+  const bodyBottom = Math.max(openY, closeY, bodyTop + 1);
+  const bodyHit = (
+    Math.abs(pointerX - centerX) <= bodyWidth / 2 + 2
+    && pointerY >= bodyTop - 2
+    && pointerY <= bodyBottom + 2
+  );
+  const wickHit = (
+    Math.abs(pointerX - centerX) <= Math.max(2, Math.min(4, slot * 0.16))
+    && pointerY >= highY - 2
+    && pointerY <= lowY + 2
+  );
+  return bodyHit || wickHit;
+}
+
+function findTrendlineHit(pointerX, pointerY, plot, priceRange) {
+  const slot = plot.width / chartState.visibleCount;
+  let best = null;
+  let bestDistance = Infinity;
+  for (const line of chartState.trendlines) {
+    if (line.visible === false) {
+      continue;
+    }
+    const fromIndex = Math.max(
+      chartState.firstVisible,
+      Number(line.start_index),
+    );
+    const toIndex = Math.min(
+      chartState.firstVisible + chartState.visibleCount - 1,
+      Number(line.projection_end_index ?? line.end_index),
+    );
+    if (!Number.isFinite(fromIndex) || !Number.isFinite(toIndex) || toIndex < fromIndex) {
+      continue;
+    }
+    const x1 = indexToX(fromIndex, plot, slot);
+    const y1 = priceToY(trendlinePriceAt(line, fromIndex), plot, priceRange);
+    const x2 = indexToX(toIndex, plot, slot);
+    const y2 = priceToY(trendlinePriceAt(line, toIndex), plot, priceRange);
+    const distance = pointToSegmentDistance(
+      pointerX,
+      pointerY,
+      x1,
+      y1,
+      x2,
+      y2,
+    );
+    const tolerance = Math.max(5, getTrendlineWidth(line.tier) + 3);
+    if (distance <= tolerance && distance < bestDistance) {
+      best = line;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lengthSquared = dx * dx + dy * dy;
+  if (!lengthSquared) {
+    return Math.hypot(px - x1, py - y1);
+  }
+  const ratio = clamp(
+    ((px - x1) * dx + (py - y1) * dy) / lengthSquared,
+    0,
+    1,
+  );
+  return Math.hypot(
+    px - (x1 + ratio * dx),
+    py - (y1 + ratio * dy),
+  );
+}
+
+function showTrendlineTooltip(line, offsetX, offsetY) {
+  if (!chartState.trendlineTooltip) {
+    return;
+  }
+  const tier = { long: "长期", medium: "中期", short: "短期" }[line.tier] || line.tier;
+  const direction = line.direction === "up" ? "上涨" : "下跌";
+  const status = {
+    trending: "趋势中",
+    challenging: "挑战中",
+    broken: "已结束",
+  }[line.status] || line.status;
+  const role = line.family_role === "stage" ? "阶段变化线" : "主趋势线";
+  chartState.trendlineTooltip.innerHTML = `
+    <strong>${escapeHtml(`${tier}${direction} · ${status}`)}</strong>
+    <div class="trendline-detail-meta">
+      <span>评分 / 点位</span><b>${Number(line.tier_score || 0).toFixed(1)} / ${formatPrice(line.projection_end_price)}</b>
+      <span>结构 / 触点</span><b>${escapeHtml(role)} / ${Number(line.touches || 0)}</b>
+      <span>形成 / 最近触点</span><b>${escapeHtml(line.formation_date || "-")} / ${escapeHtml(line.last_touch_date || "-")}</b>
+      <span>距趋势线</span><b>${Number(line.current_close_gap || 0).toFixed(2)} ATR</b>
+      <span>方向显著性</span><b>${Number(line.drift_t || 0).toFixed(2)} t</b>
+    </div>
+    <div class="trendline-score-grid">
+      ${trendlineScoreRows(line)}
+    </div>
+  `;
+  positionChartTooltip(chartState.trendlineTooltip, offsetX, offsetY);
+  chartState.trendlineTooltip.hidden = false;
+}
+
+function trendlineScoreRows(line) {
+  const scoreFormula = line.score_formula || line.tier;
+  const weights = {
+    long: [17, 18, 11, 22, 14, 10, 3, 5],
+    medium: [17, 18, 12, 20, 12, 9, 6, 4],
+    short: [16, 16, 14, 12, 4, 2, 14, 12],
+  }[scoreFormula] || [17, 18, 11, 22, 14, 10, 3, 5];
+  const metrics = [
+    ["边界完整性", line.integrity],
+    ["实体完整性", line.body_integrity],
+    ["触点接近质量", line.proximity],
+    ["触点证据", line.touch_score],
+    ["拒绝质量", line.rejection],
+    ["触点分布", line.touch_distribution],
+    ["方向效率", line.efficiency],
+    ["斜率强度", line.slope_strength],
+  ];
+  const rows = metrics.map(([label, value], index) => {
+    const quality = Number(value || 0);
+    const weight = weights[index];
+    return `
+      <span>${escapeHtml(label)} · ${weight}%</span>
+      <b>${(quality * 100).toFixed(1)}% / ${(quality * weight).toFixed(1)}</b>
+    `;
+  });
+  if (scoreFormula === "medium" || scoreFormula === "short") {
+    const center = scoreFormula === "medium" ? 0.65 : 0.70;
+    const steepness = scoreFormula === "medium" ? 1.35 : 1.40;
+    const weight = scoreFormula === "medium" ? 2 : 8;
+    const significance = 1 / (
+      1 + Math.exp(-steepness * (Number(line.drift_t || 0) - center))
+    );
+    rows.push(`
+      <span>方向显著分 · ${weight}%</span>
+      <b>${(significance * 100).toFixed(1)}% / ${(significance * weight).toFixed(1)}</b>
+    `);
+  }
+  if (scoreFormula === "short") {
+    const eventSpan = Number(line.event_span || 0);
+    rows.push(`
+      <span>触点跨度 · 2%</span>
+      <b>${(eventSpan * 100).toFixed(1)}% / ${(eventSpan * 2).toFixed(1)}</b>
+    `);
+  }
+  rows.push(`
+    <span>分布修正</span>
+    <b>×${Number(line.distribution_penalty_factor || 0).toFixed(3)}</b>
+  `);
+  return rows.join("");
+}
+
+function positionChartTooltip(element, offsetX, offsetY) {
+  element.hidden = false;
+  const rect = element.getBoundingClientRect();
+  const containerRect = chartState.container.getBoundingClientRect();
+  const left = Math.min(offsetX + 16, containerRect.width - rect.width - 10);
+  const top = Math.min(offsetY + 16, containerRect.height - rect.height - 10);
+  element.style.left = `${Math.max(10, left)}px`;
+  element.style.top = `${Math.max(10, top)}px`;
 }
 
 function recalculateIndicators() {

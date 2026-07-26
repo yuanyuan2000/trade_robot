@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+import logging
 import multiprocessing
 import os
 import platform
@@ -57,6 +58,8 @@ overview_sync_state = {
     "updated_at": None,
 }
 analysis_overview_lock = threading.Lock()
+analysis_executor_lock = threading.Lock()
+analysis_process_executor: ProcessPoolExecutor | None = None
 analysis_overview_state = {
     "running": False,
     "total": 0,
@@ -69,6 +72,13 @@ analysis_overview_state = {
     "updated_at": None,
     "rerun_requested": False,
 }
+
+
+class HeartbeatAccessLogFilter(logging.Filter):
+    """Keep high-frequency session heartbeats out of the terminal."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/session/heartbeat" not in record.getMessage()
 
 
 def now_utc() -> datetime:
@@ -668,44 +678,48 @@ def run_analysis_overview_refresh() -> None:
                     max_workers=worker_count,
                     mp_context=spawn_context,
             ) as executor:
-                futures = {
-                    executor.submit(
-                        analyze_symbol_trendlines,
-                        symbol,
-                        "1D",
-                        150,
-                    ): symbol
-                    for symbol in pending_symbols
-                }
-                for future in as_completed(futures):
-                    symbol = futures[future]
-                    try:
-                        payload = future.result()
-                        saved = save_analysis_overview_snapshot(
+                set_analysis_process_executor(executor)
+                try:
+                    futures = {
+                        executor.submit(
+                            analyze_symbol_trendlines,
                             symbol,
-                            payload,
-                        )
-                        results_by_symbol[symbol] = _analysis_result(
-                            symbol,
-                            "success",
-                            saved["active_count"],
-                        )
-                    except Exception as exc:
-                        app.logger.exception(
-                            "Analysis overview failed for %s",
-                            symbol,
-                        )
-                        results_by_symbol[symbol] = _analysis_result(
-                            symbol,
-                            "error",
-                            error=str(exc),
-                        )
-                    finally:
-                        remaining = sum(
-                            item not in results_by_symbol
-                            for item in pending_symbols
-                        )
-                        _mark_analysis_item_completed(remaining)
+                            "1D",
+                            150,
+                        ): symbol
+                        for symbol in pending_symbols
+                    }
+                    for future in as_completed(futures):
+                        symbol = futures[future]
+                        try:
+                            payload = future.result()
+                            saved = save_analysis_overview_snapshot(
+                                symbol,
+                                payload,
+                            )
+                            results_by_symbol[symbol] = _analysis_result(
+                                symbol,
+                                "success",
+                                saved["active_count"],
+                            )
+                        except Exception as exc:
+                            app.logger.exception(
+                                "Analysis overview failed for %s",
+                                symbol,
+                            )
+                            results_by_symbol[symbol] = _analysis_result(
+                                symbol,
+                                "error",
+                                error=str(exc),
+                            )
+                        finally:
+                            remaining = sum(
+                                item not in results_by_symbol
+                                for item in pending_symbols
+                            )
+                            _mark_analysis_item_completed(remaining)
+                finally:
+                    clear_analysis_process_executor(executor)
 
         results = [
             results_by_symbol[symbol]
@@ -1007,8 +1021,55 @@ def shutdown_if_inactive() -> None:
 
 
 def shutdown_process() -> None:
-    time.sleep(0.4)
+    # Let Flask flush the shutdown response, then release spawned analysis
+    # workers so the parent terminal is not left waiting on child processes.
+    time.sleep(0.25)
+    terminate_child_processes()
+    time.sleep(0.05)
     os._exit(0)
+
+
+def terminate_child_processes() -> None:
+    terminate_analysis_process_executor()
+    children = multiprocessing.active_children()
+    for process in children:
+        if process.is_alive():
+            process.terminate()
+    for process in children:
+        process.join(timeout=0.5)
+
+
+def set_analysis_process_executor(executor: ProcessPoolExecutor) -> None:
+    global analysis_process_executor
+    with analysis_executor_lock:
+        analysis_process_executor = executor
+
+
+def clear_analysis_process_executor(executor: ProcessPoolExecutor) -> None:
+    global analysis_process_executor
+    with analysis_executor_lock:
+        if analysis_process_executor is executor:
+            analysis_process_executor = None
+
+
+def terminate_analysis_process_executor() -> None:
+    global analysis_process_executor
+    with analysis_executor_lock:
+        executor = analysis_process_executor
+        analysis_process_executor = None
+    if executor is None:
+        return
+    processes = list(
+        (getattr(executor, "_processes", None) or {}).values()
+    )
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
+def configure_access_logging() -> None:
+    logging.getLogger("werkzeug").addFilter(HeartbeatAccessLogFilter())
 
 
 def open_browser() -> None:
@@ -1050,6 +1111,7 @@ def is_wsl() -> bool:
 
 def main() -> None:
     init_database()
+    configure_access_logging()
     start_analysis_overview_refresh()
     if AUTO_OPEN_BROWSER:
         threading.Thread(target=open_browser, daemon=True).start()

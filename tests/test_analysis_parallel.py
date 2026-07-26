@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
+import logging
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import app as app_module
-from app import analysis_worker_count
+from app import (
+    HeartbeatAccessLogFilter,
+    analysis_worker_count,
+    terminate_analysis_process_executor,
+    terminate_child_processes,
+)
 
 
 class ImmediateExecutor:
@@ -28,6 +34,60 @@ class ImmediateExecutor:
 
 
 class AnalysisParallelTests(unittest.TestCase):
+    def test_heartbeat_access_log_is_suppressed(self) -> None:
+        log_filter = HeartbeatAccessLogFilter()
+        heartbeat = logging.LogRecord(
+            "werkzeug",
+            logging.INFO,
+            "",
+            0,
+            '"POST /api/session/heartbeat HTTP/1.1" 200 -',
+            (),
+            None,
+        )
+        market_data = logging.LogRecord(
+            "werkzeug",
+            logging.INFO,
+            "",
+            0,
+            '"GET /api/market-data HTTP/1.1" 200 -',
+            (),
+            None,
+        )
+
+        self.assertFalse(log_filter.filter(heartbeat))
+        self.assertTrue(log_filter.filter(market_data))
+
+    @patch.object(app_module.multiprocessing, "active_children")
+    def test_shutdown_terminates_active_analysis_workers(
+            self,
+            active_children,
+    ) -> None:
+        worker = Mock()
+        worker.is_alive.return_value = True
+        active_children.return_value = [worker]
+
+        terminate_child_processes()
+
+        worker.terminate.assert_called_once_with()
+        worker.join.assert_called_once_with(timeout=0.5)
+
+    def test_shutdown_terminates_registered_executor_workers(self) -> None:
+        worker = Mock()
+        worker.is_alive.return_value = True
+        executor = Mock()
+        executor._processes = {101: worker}
+        app_module.analysis_process_executor = executor
+
+        terminate_analysis_process_executor()
+
+        worker.terminate.assert_called_once_with()
+        executor.shutdown.assert_called_once_with(
+            wait=False,
+            cancel_futures=True,
+        )
+        self.assertIsNone(app_module.analysis_process_executor)
+
     def test_worker_count_is_bounded_at_four(self) -> None:
         self.assertEqual(analysis_worker_count(13, available_cpus=12), 4)
 

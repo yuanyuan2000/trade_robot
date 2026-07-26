@@ -8,7 +8,7 @@ market data rather than treated as immutable constants.
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import hashlib
 import json
@@ -25,8 +25,11 @@ from services.market_data_service import get_market_data
 Direction = Literal["up", "down"]
 Tier = Literal["long", "medium", "short"]
 SUPPORTED_PERIODS = {"1D", "3D", "1W", "1M"}
-ANALYSIS_CACHE_VERSION = "trendline-v11-trend-families-2"
+ANALYSIS_CACHE_VERSION = "trendline-v13-flat-line-veto"
 ANALYSIS_CACHE_MAX_SIZE = 64
+TOUCH_DISTANCE_ATR = 0.75
+FLAT_LINE_MAX_SLOPE_ATR_PER_20 = 0.45
+FLAT_LINE_MAX_ENDPOINT_MOVE_RATIO = 0.10
 TOUCH_DISTRIBUTION_FULL_QUALITY = 0.55
 TOUCH_DISTRIBUTION_PENALTY = {
     "long": 0.16,
@@ -106,6 +109,7 @@ class TieredTrend:
     acceleration_index: int | None = None
     family_id: str | None = None
     family_role: str = "standalone"
+    score_formula: str = ""
 
     @property
     def id(self) -> str:
@@ -268,7 +272,10 @@ def _body_integrity_batch(body_gap: np.ndarray) -> np.ndarray:
     )
 
 
-def _event_metrics(gap: np.ndarray) -> ContactMetrics:
+def _event_metrics(
+        gap: np.ndarray,
+        wick_gap: np.ndarray | None = None,
+        body_gap: np.ndarray | None = None) -> ContactMetrics:
     """Find scale-aware support/resistance tests and subsequent rejections.
 
     gap is positive on the valid side of either support or resistance, in ATR.
@@ -283,15 +290,62 @@ def _event_metrics(gap: np.ndarray) -> ContactMetrics:
     smooth = (pd.Series(gap).rolling(smooth_window, center=True, min_periods=1)
               .mean().to_numpy())
     min_distance = max(2, n // 18)
-    pivots, properties = find_peaks(-smooth, distance=min_distance,
-                                    prominence=0.12)
+    pivots, properties = find_peaks(
+        -smooth,
+        distance=min_distance,
+        prominence=0.12,
+    )
     prominences = properties.get("prominences", np.zeros(len(pivots)))
+    use_raw_contacts = wick_gap is not None and body_gap is not None
+    if use_raw_contacts:
+        wick_gap = np.asarray(wick_gap, dtype=float)
+        body_gap = np.asarray(body_gap, dtype=float)
+        # A wick can confirm the same boundary provided the candle body did not
+        # severely cross it. Keep this channel raw so a one-bar rejection is
+        # not diluted by the structural smoother.
+        valid_body = body_gap >= -0.35
+        anchor_signal = np.where(valid_body, gap, np.inf)
+        wick_signal = np.where(valid_body, wick_gap, np.inf)
+        contact_signal = np.minimum(anchor_signal, wick_signal)
+    else:
+        contact_signal = smooth
+    raw_radius = max(1, smooth_window // 2)
+    candidate_map: dict[int, float] = {}
 
-    # A valid structural test is within 0.75 ATR of the envelope. This is wider
-    # than the old 0.40 ATR band because a line may run just below several lows.
-    keep = smooth[pivots] <= 0.75
-    candidates = pivots[keep].tolist()
-    kept_prominence = prominences[keep].tolist()
+    def add_candidate(center: int, prominence: float) -> None:
+        contact = center
+        if use_raw_contacts:
+            local_start = max(0, center - raw_radius)
+            local_end = min(n, center + raw_radius + 1)
+            local = contact_signal[local_start:local_end]
+            if not len(local) or not np.any(np.isfinite(local)):
+                return
+            contact = local_start + int(np.nanargmin(local))
+        if contact_signal[contact] > TOUCH_DISTANCE_ATR:
+            return
+        nearby = [
+            index
+            for index in candidate_map
+            if abs(index - contact) < min_distance
+        ]
+        if nearby:
+            incumbent = min(
+                nearby,
+                key=lambda index: contact_signal[index],
+            )
+            if contact_signal[incumbent] <= contact_signal[contact]:
+                candidate_map[incumbent] = max(
+                    candidate_map[incumbent],
+                    float(prominence),
+                )
+                return
+            for index in nearby:
+                candidate_map.pop(index, None)
+        candidate_map[contact] = float(prominence)
+
+    for pivot, prominence in zip(pivots, prominences):
+        add_candidate(int(pivot), float(prominence))
+
     horizon = min(24, max(7, n // 6))
 
     # scipy's peak finder intentionally excludes endpoints. Both edges matter:
@@ -306,22 +360,20 @@ def _event_metrics(gap: np.ndarray) -> ContactMetrics:
         edge_values = list(edge_range)
         if not edge_values:
             continue
-        edge_i = edge_values[int(np.argmin(smooth[edge_values]))]
-        if smooth[edge_i] > 0.75 or any(
-                abs(edge_i - j) < min_distance for j in candidates):
+        edge_i = min(edge_values, key=lambda index: contact_signal[index])
+        if contact_signal[edge_i] > TOUCH_DISTANCE_ATR:
             continue
         local_start = max(0, edge_i - horizon)
         local_end = min(n, edge_i + horizon + 1)
         local_high = np.max(smooth[local_start:local_end])
-        candidates.append(edge_i)
-        kept_prominence.append(
-            max(0.0, float(local_high - smooth[edge_i]))
+        add_candidate(
+            edge_i,
+            max(0.0, float(local_high - smooth[edge_i])),
         )
 
-    if candidates:
-        ordered = sorted(zip(candidates, kept_prominence))
-        candidates = [x[0] for x in ordered]
-        kept_prominence = [x[1] for x in ordered]
+    ordered = sorted(candidate_map.items())
+    candidates = [item[0] for item in ordered]
+    kept_prominence = [item[1] for item in ordered]
 
     evaluated, qualities = 0, []
     for i, prominence in zip(candidates, kept_prominence):
@@ -329,14 +381,15 @@ def _event_metrics(gap: np.ndarray) -> ContactMetrics:
         if len(future) < 2:
             continue
         evaluated += 1
-        rebound = np.max(future) - smooth[i]
+        contact_distance = contact_signal[i]
+        rebound = np.max(future) - contact_distance
         stayed_intact = np.min(future) > -0.85
         q_forward = np.clip(rebound / 1.50, 0, 1)
         q_prominence = np.clip(prominence / 1.20, 0, 1)
         q = (0.70 * q_forward + 0.30 * q_prominence)
         q *= 1.0 if stayed_intact else 0.20
         # A shallow penetration followed by rejection is especially strong.
-        if -0.45 <= smooth[i] < 0 and stayed_intact:
+        if -0.45 <= contact_distance < 0 and stayed_intact:
             q = min(1.0, q + 0.12)
         qualities.append(q)
 
@@ -368,7 +421,7 @@ def _event_metrics(gap: np.ndarray) -> ContactMetrics:
 
     if candidates:
         # Distance only at pullback pivots defines lower/upper-envelope fit.
-        pivot_distance = np.median(np.abs(smooth[candidates]))
+        pivot_distance = np.median(np.abs(contact_signal[candidates]))
         envelope_proximity = float(np.exp(-pivot_distance / 0.65))
     else:
         # No challenges means weak evidence even if the line is geometrically
@@ -455,6 +508,28 @@ def _score_line(df: pd.DataFrame, start: int, end: int, direction: Direction,
                        body.integrity, body.breach_ratio,
                        body.severe_breach_ratio, body.max_breach_run,
                        efficiency, slope_strength, drift_t)
+
+
+def _long_score_from_metrics(r: TrendResult) -> float:
+    raw = (
+        0.17 * r.integrity +
+        0.18 * r.body_integrity +
+        0.11 * r.proximity +
+        0.22 * r.touch_score +
+        0.14 * r.rejection +
+        0.10 * r.touch_distribution +
+        0.03 * r.efficiency +
+        0.05 * r.slope_strength
+    )
+    length_confidence = 0.86 + 0.14 * (
+        1 - np.exp(-(r.length - 7) / 20)
+    )
+    direction_gate = 1.0 / (
+        1.0 + np.exp(-1.7 * (r.drift_t - 1.0))
+    )
+    return float(
+        100 * raw * length_confidence * (0.68 + 0.32 * direction_gate)
+    )
 
 
 def fit_interval(df: pd.DataFrame, start: int, end: int,
@@ -830,6 +905,64 @@ def _confirmed_acceleration_index(
     return None if offset is None else r.last_touch + offset
 
 
+def _extend_contact_evidence(
+        df: pd.DataFrame,
+        r: TrendResult) -> TrendResult:
+    """Rescan a fixed line through its valid projection for new evidence."""
+    termination_indices = [
+        index
+        for index in (
+            _confirmed_break_index(df, r),
+            _confirmed_acceleration_index(df, r),
+        )
+        if index is not None
+    ]
+    evidence_end = (
+        min(termination_indices) - 1
+        if termination_indices
+        else len(df) - 1
+    )
+    evidence_end = max(r.start, evidence_end)
+    indices = np.arange(r.start, evidence_end + 1)
+    arrays = _analysis_arrays(df)
+    d = 1 if r.direction == "up" else -1
+    atr = np.maximum(arrays.atr[r.start:evidence_end + 1], 1e-9)
+    line = r.y(indices)
+    anchor_gap = d * (
+        arrays.anchor(r.direction)[r.start:evidence_end + 1] - line
+    ) / atr
+    body_gap = d * (
+        arrays.body_edge(r.direction)[r.start:evidence_end + 1] - line
+    ) / atr
+    wick_values = (
+        df["Low"].to_numpy()[r.start:evidence_end + 1]
+        if r.direction == "up"
+        else df["High"].to_numpy()[r.start:evidence_end + 1]
+    )
+    wick_gap = d * (wick_values - line) / atr
+    contacts = _event_metrics(anchor_gap, wick_gap, body_gap)
+    if not contacts.touches:
+        return r
+    extended = replace(
+        r,
+        proximity=contacts.proximity,
+        touches=contacts.touches,
+        touch_score=contacts.touch_score,
+        rejection=contacts.rejection,
+        event_span=contacts.event_span,
+        touch_distribution=contacts.touch_distribution,
+        max_touch_gap=contacts.max_touch_gap,
+        interior_touches=contacts.interior_touches,
+        first_touch=r.start + contacts.first_touch,
+        last_touch=r.start + contacts.last_touch,
+        touch_indices=tuple(
+            r.start + index
+            for index in contacts.touch_indices
+        ),
+    )
+    return replace(extended, score=_long_score_from_metrics(extended))
+
+
 def _latest_close_gap(df: pd.DataFrame, r: TrendResult) -> float:
     return float(_post_touch_close_gaps(df, r)[-1])
 
@@ -940,30 +1073,38 @@ def _is_live_structure(df: pd.DataFrame, r: TrendResult) -> bool:
     return bool(value)
 
 
-def _medium_output_score(
-        df: pd.DataFrame,
-        r: TrendResult,
-        n: int,
-) -> float:
-    score = _medium_selection_score(r, n)
-    if _is_live_structure(df, r):
-        score = max(score, short_progress_score(r))
-    return score
-
-
 def _tier_score(
         tier: Tier,
         trend: TrendResult,
         n: int,
         df: pd.DataFrame,
 ) -> float:
+    score, _ = _tier_score_with_formula(tier, trend, n, df)
+    return score
+
+
+def _tier_score_with_formula(
+        tier: Tier,
+        trend: TrendResult,
+        n: int,
+        df: pd.DataFrame,
+) -> tuple[float, str]:
     if tier == "short":
         score = short_progress_score(trend)
+        formula = "short"
     elif tier == "medium":
-        score = _medium_output_score(df, trend, n)
+        medium_score = medium_trend_score(trend)
+        short_score = short_progress_score(trend)
+        use_short = (
+            _is_recent_medium_reversal(trend, n) or
+            _is_live_structure(df, trend)
+        ) and short_score > medium_score
+        score = short_score if use_short else medium_score
+        formula = "short" if use_short else "medium"
     else:
         score = trend.score
-    return _apply_distribution_penalty(tier, trend, score)
+        formula = "long"
+    return _apply_distribution_penalty(tier, trend, score), formula
 
 
 def _deduplicate_across_tiers(
@@ -1242,17 +1383,17 @@ def _is_flat_low_amplitude_noise(df: pd.DataFrame, r: TrendResult) -> bool:
     if last <= first:
         return False
 
-    window = df.iloc[first:last + 1]
-    low = float(window["Low"].min())
-    high = float(window["High"].max())
-    if low <= 0:
-        return False
-
-    price_range = (high - low) / low
     line_start = float(r.y(first))
     line_end = float(r.y(last))
     line_move = abs(line_end - line_start) / max(abs(line_start), 1e-9)
-    return price_range <= 0.10 and line_move <= 0.025
+    median_atr = float(np.median(true_range(df)[first:last + 1]))
+    slope_atr_per_20 = (
+        abs(r.slope) * 20 / max(median_atr, 1e-9)
+    )
+    return (
+        slope_atr_per_20 <= FLAT_LINE_MAX_SLOPE_ATR_PER_20 and
+        line_move <= FLAT_LINE_MAX_ENDPOINT_MOVE_RATIO
+    )
 
 
 def _is_countertrend_bridge_noise(
@@ -1396,6 +1537,13 @@ def search_trend_hierarchy(
             score_fn=lambda trend: _tier_score("short", trend, n, df),
         ),
     }
+    chosen = {
+        tier: [
+            _extend_contact_evidence(df, trend)
+            for trend in trends
+        ]
+        for tier, trends in chosen.items()
+    }
     items: dict[Tier, list[TieredTrend]] = {"long": [], "medium": [], "short": []}
     for tier, values in chosen.items():
         for r in values:
@@ -1416,7 +1564,12 @@ def search_trend_hierarchy(
                 status = "challenging"
             else:
                 status = "trending"
-            tier_score = _tier_score(tier, r, n, df)
+            tier_score, score_formula = _tier_score_with_formula(
+                tier,
+                r,
+                n,
+                df,
+            )
             items[tier].append(TieredTrend(
                 tier=tier,
                 trend=r,
@@ -1428,6 +1581,7 @@ def search_trend_hierarchy(
                 tier_score=tier_score,
                 break_index=break_index,
                 acceleration_index=acceleration_index,
+                score_formula=score_formula,
             ))
 
     items = _deduplicate_across_tiers(df, items)
@@ -1798,6 +1952,7 @@ def serialize_trend(item: TieredTrend, window_start: int,
         "intercept": float(trend.intercept),
         "score": round(float(trend.score), 4),
         "tier_score": round(float(item.tier_score), 4),
+        "score_formula": item.score_formula or item.tier,
         "integrity": round(float(trend.integrity), 4),
         "proximity": round(float(trend.proximity), 4),
         "touches": int(trend.touches),

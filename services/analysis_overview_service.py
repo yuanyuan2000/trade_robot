@@ -66,6 +66,7 @@ def build_trendline_overview_summary(payload: dict) -> dict:
         for trend in headline
     ]
     _assign_overview_tier_labels(headline_trends)
+    visible_headlines = headline_trends[:2]
     return {
         "period": payload.get("period") or "1D",
         "window_size": int(payload.get("requested_window_size") or 150),
@@ -75,8 +76,8 @@ def build_trendline_overview_summary(payload: dict) -> dict:
             1 for trend in active if trend.get("status") == "challenging"
         ),
         "highest_score": max(
-            (float(trend.get("tier_score") or 0) for trend in active),
-            default=None,
+            (float(trend.get("score") or 0) for trend in visible_headlines),
+            default=0.0,
         ),
         "headline_trends": headline_trends,
         "events": events,

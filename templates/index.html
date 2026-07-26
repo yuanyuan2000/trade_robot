@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260726-06') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260726-08') }}">
   </head>
   <body class="theme-dark">
     <aside class="sidebar">
@@ -47,8 +47,7 @@
     <main class="workspace">
       <div id="shutdown-notice" class="shutdown-notice" hidden>
         <div>
-          <h2>系统已退出</h2>
-          <p>后端服务已停止。你可以手动关闭这个浏览器页面。</p>
+          <h2>可以安全退出</h2>
         </div>
       </div>
 
@@ -144,6 +143,7 @@
             <div id="indicator-legend" class="indicator-legend"></div>
             <div id="trendline-legend" class="trendline-legend" hidden></div>
             <div id="ohlcv-tooltip" class="ohlcv-tooltip" hidden></div>
+            <div id="trendline-tooltip" class="ohlcv-tooltip trendline-detail-tooltip" hidden></div>
           </div>
         </section>
 
@@ -225,8 +225,8 @@
       </section>
     </main>
 
-    <script src="{{ url_for('static', filename='js/chart.js', v='20260726-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/chart.js', v='20260726-04') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260719-01') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260726-06') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260726-08') }}"></script>
   </body>
 </html>

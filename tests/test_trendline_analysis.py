@@ -16,6 +16,8 @@ from services.trendline_analysis_service import (
     _break_confirmation_offset,
     _cached_analysis_result,
     _consolidate_trend_families,
+    _event_metrics,
+    _extend_contact_evidence,
     _filter_display_noise,
     _is_flat_low_amplitude_noise,
     _is_display_fresh,
@@ -81,6 +83,34 @@ class TrendlineAnalysisTests(unittest.TestCase):
         self.assertGreater(repeated.touch_distribution, bridge.touch_distribution)
         self.assertLess(repeated.max_touch_gap, 0.80)
         self.assertGreaterEqual(bridge.max_touch_gap, 0.80)
+
+    def test_raw_wick_can_confirm_a_smoothed_structural_basin(self) -> None:
+        anchor_gap = np.full(45, 2.0)
+        anchor_gap[19:22] = [1.1, 0.9, 1.1]
+        anchor_gap[21:30] = np.linspace(1.1, 2.8, 9)
+        wick_gap = anchor_gap.copy()
+        wick_gap[20] = 0.20
+        body_gap = np.full(45, 1.0)
+
+        smoothed_only = _event_metrics(anchor_gap)
+        with_wick = _event_metrics(anchor_gap, wick_gap, body_gap)
+
+        self.assertEqual(smoothed_only.touches, 0)
+        self.assertEqual(with_wick.touch_indices, (20,))
+        self.assertGreater(with_wick.rejection, 0.0)
+
+    def test_projection_contacts_do_not_refit_line_geometry(self) -> None:
+        df = distributed_support(90)
+        fitted = fit_interval(df, 0, 59, "up")
+        self.assertIsNotNone(fitted)
+        assert fitted is not None
+
+        extended = _extend_contact_evidence(df, fitted)
+
+        self.assertEqual(extended.slope, fitted.slope)
+        self.assertEqual(extended.intercept, fitted.intercept)
+        self.assertGreaterEqual(extended.last_touch, fitted.last_touch)
+        self.assertGreaterEqual(extended.touches, fitted.touches)
 
     def test_distribution_penalty_is_smooth_and_tier_weighted(self) -> None:
         trend = fit_interval(distributed_support(), 0, 89, "up")
@@ -213,6 +243,55 @@ class TrendlineAnalysisTests(unittest.TestCase):
         )
         self.assertTrue(_is_flat_low_amplitude_noise(df, flat))
 
+    def test_market_range_does_not_rescue_a_flat_line(self) -> None:
+        df = make_ohlc(
+            100 + 12.0 * np.sin(np.arange(90) / 8),
+            seed=43,
+        )
+        trend = fit_interval(distributed_support(90), 0, 89, "up")
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        flat = replace(
+            trend,
+            first_touch=0,
+            last_touch=89,
+            slope=0.01,
+            intercept=100.0,
+        )
+
+        self.assertGreater(
+            (float(df["High"].max()) - float(df["Low"].min())) /
+            float(df["Low"].min()),
+            0.10,
+        )
+        self.assertTrue(_is_flat_low_amplitude_noise(df, flat))
+
+    def test_endpoint_move_over_ten_percent_protects_slow_long_line(self) -> None:
+        df = make_ohlc(np.linspace(100, 111, 150), seed=47)
+        df["High"] += 5.0
+        df["Low"] -= 5.0
+        trend = fit_interval(distributed_support(150), 0, 149, "up")
+        self.assertIsNotNone(trend)
+        assert trend is not None
+        slow_long = replace(
+            trend,
+            first_touch=0,
+            last_touch=149,
+            slope=11 / 149,
+            intercept=100.0,
+        )
+
+        self.assertLessEqual(
+            abs(slow_long.slope) * 20 / np.median(true_range(df)),
+            0.45,
+        )
+        self.assertGreater(
+            abs(float(slow_long.y(149)) - float(slow_long.y(0))) /
+            float(slow_long.y(0)),
+            0.10,
+        )
+        self.assertFalse(_is_flat_low_amplitude_noise(df, slow_long))
+
     def test_lower_scored_countertrend_between_two_lines_is_hidden(self) -> None:
         df = make_ohlc(np.linspace(100, 125, 80), seed=37)
         base = fit_interval(distributed_support(80), 0, 79, "up")
@@ -320,6 +399,14 @@ class TrendlineAnalysisTests(unittest.TestCase):
         self.assertEqual(payload["projection_end_index"], payload["end_index"])
         self.assertEqual(payload["fit_start_index"], 100 + trend.start)
         self.assertEqual(payload["fit_end_index"], 100 + trend.end)
+        self.assertEqual(
+            len(payload["touch_indices"]),
+            payload["touches"],
+        )
+        self.assertEqual(
+            len(set(payload["touch_indices"])),
+            payload["touches"],
+        )
 
         item.active = True
         active_payload = serialize_trend(

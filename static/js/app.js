@@ -904,8 +904,8 @@ function compareOverviewValues(left, right, key) {
   }
   if (key === "analysis_score") {
     return compareNullableNumbers(
-      left.analysis?.highest_score,
-      right.analysis?.highest_score,
+      analysisOverviewSortScore(left.analysis),
+      analysisOverviewSortScore(right.analysis),
     );
   }
   const numericResult = compareNullableNumbers(left[key], right[key]);
@@ -913,6 +913,21 @@ function compareOverviewValues(left, right, key) {
     return numericResult;
   }
   return compareStrings(left.symbol, right.symbol);
+}
+
+function analysisOverviewSortScore(analysis) {
+  const displayedScores = (analysis?.headline_trends || [])
+    .slice(0, 2)
+    .map((trend) => Number(trend.score))
+    .filter(Number.isFinite);
+  if (displayedScores.length) {
+    return Math.max(...displayedScores);
+  }
+  if (Array.isArray(analysis?.headline_trends)) {
+    return 0;
+  }
+  const fallback = Number(analysis?.highest_score);
+  return Number.isFinite(fallback) ? fallback : 0;
 }
 
 function compareNullableNumbers(left, right) {
@@ -1552,9 +1567,11 @@ async function shutdownSystem() {
   shutdownButton.disabled = true;
   shutdownButton.querySelector("span:last-child").textContent = "正在退出";
   setStatus("正在退出系统...", "warning");
+  shutdownNotice.hidden = false;
 
   if (heartbeatTimer) {
     window.clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
   }
 
   try {
@@ -1566,7 +1583,6 @@ async function shutdownSystem() {
   document.querySelectorAll("button, input, select").forEach((element) => {
     element.disabled = true;
   });
-  shutdownNotice.hidden = false;
 }
 
 symbolForm.addEventListener("submit", async (event) => {

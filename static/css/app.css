@@ -232,12 +232,10 @@ select {
 .shutdown-notice {
   position: fixed;
   inset: 0;
-  z-index: 10;
+  z-index: 100;
   display: grid;
   place-items: center;
-  margin-left: 232px;
-  background: var(--overlay-bg);
-  backdrop-filter: blur(4px);
+  background: var(--bg);
 }
 
 .shutdown-notice[hidden] {
@@ -257,11 +255,6 @@ select {
 .shutdown-notice h2 {
   margin: 0 0 8px;
   font-size: 22px;
-}
-
-.shutdown-notice p {
-  margin: 0;
-  color: var(--muted);
 }
 
 .view {
@@ -772,6 +765,42 @@ button:disabled {
   gap: 3px 12px;
 }
 
+.trendline-detail-tooltip {
+  z-index: 3;
+  width: 264px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.trendline-detail-tooltip strong {
+  font-size: 12px;
+}
+
+.trendline-detail-meta,
+.trendline-score-grid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 3px 14px;
+}
+
+.trendline-detail-meta span,
+.trendline-score-grid span {
+  color: var(--muted);
+}
+
+.trendline-detail-meta b,
+.trendline-score-grid b {
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  text-align: right;
+}
+
+.trendline-score-grid {
+  border-top: 1px solid var(--border);
+  margin-top: 7px;
+  padding-top: 6px;
+}
+
 .indicator-panel,
 .symbol-settings-panel {
   position: fixed;
@@ -1128,11 +1157,15 @@ button:disabled {
 
 .analysis-event-ended,
 .analysis-event-challenge_started {
-  color: var(--warning);
+  color: var(--danger);
 }
 
 .analysis-event-formed,
 .analysis-event-stage_formed,
+.analysis-event-new_touch {
+  color: var(--warning);
+}
+
 .analysis-event-challenge_resolved {
   color: var(--success);
 }

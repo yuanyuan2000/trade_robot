@@ -48,6 +48,14 @@ def payload(*trends: dict, data_count: int = 31) -> dict:
 
 
 class AnalysisOverviewTests(unittest.TestCase):
+    def test_no_active_trend_has_zero_sort_score(self) -> None:
+        summary = build_trendline_overview_summary(payload(
+            trend(active=False, status="broken"),
+        ))
+
+        self.assertEqual(summary["headline_trends"], [])
+        self.assertEqual(summary["highest_score"], 0.0)
+
     def test_formation_takes_priority_over_latest_touch(self) -> None:
         summary = build_trendline_overview_summary(payload(
             trend(
@@ -107,6 +115,7 @@ class AnalysisOverviewTests(unittest.TestCase):
             [item["id"] for item in summary["headline_trends"]],
             ["challenge", "primary", "stage"],
         )
+        self.assertEqual(summary["highest_score"], 75.0)
 
     def test_latest_touch_is_reported_after_formation(self) -> None:
         summary = build_trendline_overview_summary(payload(

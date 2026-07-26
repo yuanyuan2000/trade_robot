@@ -2,7 +2,7 @@
 
 本文保留公式、搜索空间和实现细节。更容易阅读、严格按实际运行顺序组织的主说明见
 `docs/trendline_algorithm.md`；实现仍以 `services/trendline_analysis_service.py`
-为准。当前算法版本为 `trendline-v11-trend-families-2`。
+为准。当前算法版本为 `trendline-v13-flat-line-veto`。
 
 本文描述的是项目内独立实现，不依赖 `algorithm/` 目录。外部导入的
 `algorithm/trendline_algorithm_v4_bundle/直线趋势线算法完整说明.md`
@@ -302,7 +302,7 @@ min_periods = 1
 ```
 
 算法先对候选线的 `gap` 序列做居中滚动平均，然后用 `find_peaks(-smooth_gap)` 找到
-靠近支撑/压力包络的局部挑战点。上涨线寻找回调低点，下跌线寻找反弹高点。
+靠近支撑/压力包络的局部挑战盆地。上涨线寻找回调低点，下跌线寻找反弹高点。
 
 首尾区域宽度仍为：
 
@@ -315,7 +315,7 @@ edge_width = max(4, interval_length // 15)
 
 ### 8.2 有效接触
 
-局部挑战点满足以下条件才是有效接触：
+拟合和初筛阶段，局部挑战点满足以下条件才是有效接触：
 
 ```text
 smooth_gap <= 0.75 ATR
@@ -324,7 +324,28 @@ smooth_gap <= 0.75 ATR
 也就是说，价格不必精确碰到趋势线；在趋势线正确一侧、距离不超过 0.75 ATR 的结构性
 回调或反弹也可算作挑战。
 
-### 8.3 触点后的拒绝质量
+### 8.3 入围后的固定几何证据补扫
+
+候选通过原有层级门槛和层内 NMS 后，保持 `slope`、`intercept`、拟合区间完整性和实体
+完整性不变，重新扫描固定直线。扫描终点为最新 K 线；若投影期已经确认反向突破或顺向
+加速结束，则停在最早确认位置之前。这样后续数据可以成为既有直线的新证据，但不能反向
+改变直线几何，也不能把未通过初筛的弱候选救回结果集。
+
+补扫仍由 `smooth_gap` 识别结构盆地，但在盆地中心左右
+`floor(smooth_window / 2)` 根内，用原始距离选择真正最近的一根：
+
+```text
+anchor_gap = d * (anchor - line) / ATR
+wick_gap   = d * (Low  - line) / ATR  # 上涨支撑
+wick_gap   = d * (High - line) / ATR  # 下跌压力
+contact_gap = min(anchor_gap, wick_gap)
+```
+
+只有 `body_gap >= -0.35 ATR` 的 K 线可进入原始触点通道，防止严重实体穿越被长影线伪装
+成拒绝。最终仍要求 `contact_gap <= 0.75 ATR`，且继续使用原有独立间距合并相邻接触。
+这里没有新增层级专属参数：上下方向、长中短期共用同一套触点带和实体保护阈值。
+
+### 8.4 触点后的拒绝质量
 
 观察窗口：
 
@@ -337,7 +358,7 @@ horizon = min(24, max(7, interval_length // 6))
 对可评价触点：
 
 ```text
-rebound = max(future_smooth_gap) - smooth_gap_at_touch
+rebound = max(future_smooth_gap) - contact_gap_at_touch
 stayed_intact = min(future_smooth_gap) > -0.85
 
 q_forward    = clip(rebound / 1.50, 0, 1)
@@ -348,7 +369,7 @@ q = 0.70 * q_forward + 0.30 * q_prominence
 若后续未保持完整，`q *= 0.20`。如果触点是浅假突破且随后保持完整：
 
 ```text
--0.45 <= smooth_gap_at_touch < 0
+-0.45 <= contact_gap_at_touch < 0
 ```
 
 则 `q` 增加 0.12，最高仍为 1。最终 `rejection` 是所有可评价触点 `q` 的均值；没有可
@@ -456,6 +477,32 @@ drift_t =
 它衡量方向一致性，但不是经过多重搜索校正后的统计显著性或 p 值。
 
 ## 11. 三类评分公式
+
+### 11.0 公式的阅读方法与统计区间
+
+以下公式中的 `integrity`、`body_integrity`、`proximity`、`touch_score`、
+`rejection`、`touch_distribution`、`efficiency`、`slope_strength`、
+`event_span` 和转换后的方向显著性都位于 `0～1`。
+
+每个“权重 × 指标”就是该项对基础总分的贡献。例如长期线的
+`touch_score = 0.80`，触点评分贡献为：
+
+```text
+100 * 0.22 * 0.80 = 17.6 分
+```
+
+需要区分以下统计范围：
+
+- 完整性、方向效率、斜率和 `drift_t` 主要在候选线拟合窗口
+  `fit_start..fit_end` 上计算；
+- 固定直线几何后，程序会向有效投影区间继续扫描接触事件，触点数量、分布和拒绝质量
+  可以包含后续触点；
+- `formation_end` 是绘图区分形成前拟合段和形成后延长段的里程碑，不是评分起点；
+- 层级由第一个到最后一个独立触点的 `structure_length` 决定，拟合长度则参与长度置信度。
+
+三套公式得到层级分后，还会统一应用第 9 节的触点分布惩罚，随后检查最低触点数、
+事件跨度、方向显著性、实体破坏和最低分等准入条件。因此“算出一个分数”和
+“最终获选显示”是两个步骤。面向日常阅读的逐项通俗解释见简版文档第 8 节。
 
 ### 11.1 长期结构分
 
@@ -922,7 +969,34 @@ tier_score - freshness_extra
 
 优先排序，结构跨度作为第二排序键。
 
-### 15.5 趋势族合并
+### 15.5 显示噪音硬过滤
+
+跨层级几何去重后，程序直接淘汰过于接近水平线的结果。所有量都只在首末有效触点之间
+计算：
+
+```text
+median_atr = median(ATR[first_touch:last_touch])
+slope_atr_per_20 = abs(slope) * 20 / median_atr
+line_move_ratio =
+    abs(line(last_touch) - line(first_touch))
+    / abs(line(first_touch))
+```
+
+同时满足以下条件即一票否决：
+
+```text
+slope_atr_per_20 <= 0.45
+line_move_ratio <= 0.10
+```
+
+`line_move_ratio` 只比较首末有效触点处的趋势线价格，不使用期间 K 线的最高价、最低价或
+振幅。第二个条件保护累计变化超过 10% 的缓慢长期趋势；第一个条件使用 ATR 标准化固定
+20 根斜率，避免不同资产价格单位影响判断。被过滤的近水平结构可能仍是有意义的水平
+支撑或压力，但不属于本模块输出的直线趋势。
+
+同一步骤还会删除首尾都被两条更高分同向趋势包住的低分反向噪音线。
+
+### 15.6 趋势族合并
 
 几何去重只处理近似同一条直线。精确去重后，程序还会合并“线的位置和斜率有所不同，
 但主要解释同一段行情”的同方向趋势。该步骤称为趋势族合并。
@@ -1051,6 +1125,8 @@ projection_end_index = 最新 K 线或 termination_index
 
 - `score`：长期结构公式的通用分；
 - `tier_score`：该线最终所属层级采用的分数；
+- `score_formula`：最终分实际采用的 `long`、`medium` 或 `short` 权重；部分近期或仍有效
+  的中期线可能采用短期推进公式；
 - `integrity`、`body_integrity`；
 - `body_breach_ratio`、`severe_body_breach_ratio`、`max_body_breach_run`；
 - `touches`、`touch_score`、`rejection`、`proximity`；
@@ -1272,11 +1348,23 @@ python3 scripts/validate_trendline_algorithm.py --all-symbols
 任何评分、搜索密度或阈值调整都应同时保存算法版本、标的数据截止日期和验证结果，避免
 只对当前肉眼案例变好、对未来样本反而退化。
 
-本次趋势族合并的修改前后快照：
+本次固定几何触点补扫的修改前后快照：
 
 ```text
-trendline_results/baselines/trendline-v10-after-acceleration-end.json
-trendline_results/baselines/trendline-v11-after-family-consolidation.json
+trendline_results/baselines/trendline-v11-before-extended-touch-evidence.json
+trendline_results/baselines/trendline-v12-after-extended-touch-evidence.json
 ```
 
-输出总数从 58 条降为 54 条，没有新增或替换，只删除了被族内主线充分解释的 4 条冗余线。
+16 个标的的最终输出总数从 54 条变为 55 条，平均最终分约从 79.3 变为 81.0，
+触点总数从 208 变为 238。GDX 目标长期压力线保持固定几何，触点由 3 个变为 6 个，
+最终分由 68.4 变为 83.3。
+
+近水平线过滤修改后的快照：
+
+```text
+trendline_results/baselines/trendline-v13-after-flat-line-veto.json
+```
+
+与 v12 同数据快照比较，SPX 和 SPY 的 2026-01-13 至 2026-04-13 近水平压力线被
+淘汰；USDINDEX 一条达到 `2.87 ATR/20根` 的真实下跌压力线不再被低市场振幅条件
+误删。最终输出仍为 55 条，27 个合成、真实和全标的审计案例全部通过。
