@@ -9,7 +9,9 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATABASE_PATH = DATA_DIR / "market_data.sqlite"
+INTRADAY_DATABASE_PATH = DATA_DIR / "intraday_data.sqlite"
 SCHEMA_PATH = BASE_DIR / "database" / "schema.sql"
+INTRADAY_SCHEMA_PATH = BASE_DIR / "database" / "intraday_schema.sql"
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -28,6 +30,17 @@ ANALYSIS_MAX_WORKERS = max(
 
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com/time_series"
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET = os.getenv("ALPACA_SECRET", "")
+ALPACA_DATA_BASE_URL = "https://data.alpaca.markets/v2"
+ALPACA_TRADING_BASE_URL = os.getenv(
+    "ALPACA_TRADING_BASE_URL",
+    "https://paper-api.alpaca.markets/v2",
+)
+# Alpaca Basic currently allows 200 Market Data REST requests/minute. Keep a
+# larger owner-wide safety margin for background imports and interactive calls.
+ALPACA_SAFE_REQUESTS_PER_MINUTE = 150
+INTRADAY_PRICE_SCALE = 1_000_000
 MARKET_INTERVAL = "1day"
 LOOKBACK_DAYS = 365
 API_OUTPUT_SIZE = 500

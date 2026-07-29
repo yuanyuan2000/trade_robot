@@ -1,6 +1,7 @@
 const statusEl = document.getElementById("market-status");
 const symbolForm = document.getElementById("symbol-form");
 const symbolInput = document.getElementById("symbol-input");
+const includeIntradayData = document.getElementById("include-intraday-data");
 const marketPageTitle = document.getElementById("market-page-title");
 const marketSubtitle = document.getElementById("market-subtitle");
 const chartTitle = document.getElementById("chart-title");
@@ -30,6 +31,7 @@ const customIndicatorForm = document.getElementById("custom-indicator-form");
 const customIndicatorType = document.getElementById("custom-indicator-type");
 const customIndicatorPeriod = document.getElementById("custom-indicator-period");
 const updateDataButton = document.getElementById("update-data-button");
+const overviewSymbolToggle = document.getElementById("overview-symbol-toggle");
 const symbolSettingsToggle = document.getElementById("symbol-settings-toggle");
 const symbolSettingsPanel = document.getElementById("symbol-settings-panel");
 const symbolSettingsClose = document.getElementById("symbol-settings-close");
@@ -47,6 +49,7 @@ let currentSymbolIndicators = [];
 let indicatorCatalog = [];
 let currentRawMarketData = [];
 let currentSymbolSettings = { show_weekend_data: true };
+let currentIntradaySync = { status: "not_initialized", row_count: 0 };
 let overviewPage = 1;
 let overviewTotalPages = 1;
 let overviewItems = [];
@@ -169,11 +172,50 @@ function sourceText(source) {
     twelvedata: "来自 Twelve Data API",
     api: "来自 Twelve Data API",
     stale_cache: "来自本地旧缓存",
+    alpaca: "来自 Alpaca",
+    "alpaca-minute": "来自 Alpaca 分钟数据",
+    "alpaca/database": "来自 Alpaca 分钟数据库",
   };
   return labels[source] || source || "未知来源";
 }
 
-async function loadMarketData(symbol) {
+async function loadPeriodMarketData(period, { silent = false } = {}) {
+  if (!currentSymbol) {
+    return;
+  }
+  if (!silent) {
+    setStatus(`正在加载 ${currentSymbol} ${getChartPeriodLabel()}...`, "neutral");
+  }
+  const intradayPeriod = /^(?:[1-9]\d{0,2}m|[1-9]\d?h)$/.test(period);
+  const params = new URLSearchParams({
+    symbol: currentSymbol,
+    period,
+    limit: intradayPeriod ? "300" : "2000",
+  });
+  const response = await fetch(`/api/market-bars?${params}`);
+  const payload = await parseJsonResponse(response);
+  if (!payload.ok) {
+    throw new Error(payload.error?.message || "K线数据加载失败。");
+  }
+  currentRawMarketData = payload.data || [];
+  currentSymbolSettings = payload.symbol_settings || currentSymbolSettings;
+  currentIntradaySync = payload.sync_state || currentIntradaySync;
+  updateDetailActions();
+  renderCurrentMarketData();
+  chartSource.textContent = sourceText(payload.source);
+  if (payload.warning) {
+    setStatus(payload.warning, "warning");
+  } else if (!silent) {
+    const firstDate = payload.data[0]?.date || "-";
+    const lastDate = payload.data.at(-1)?.endDate || payload.data.at(-1)?.date || "-";
+    setStatus(
+      `已加载 ${payload.symbol} ${getChartPeriodLabel()}，共 ${payload.data.length} 根，范围 ${firstDate} 至 ${lastDate}。`,
+      "success",
+    );
+  }
+}
+
+async function loadMarketData(symbol, { includeIntraday = false } = {}) {
   const normalized = symbol.trim().toUpperCase();
   if (!normalized) {
     setStatus("请输入股票代码。", "error");
@@ -182,14 +224,24 @@ async function loadMarketData(symbol) {
 
   symbolInput.value = normalized;
   currentSymbol = normalized;
+  resetChartPeriod("1D");
+  currentViewCode = "1D";
   showMarketDetail();
   updateChartTitle(normalized);
   chartSource.textContent = "加载中";
   clearTrendlineAnalysis();
-  setStatus(`正在加载 ${normalized} 2020年以来日线行情...`, "neutral");
+  setStatus(
+    includeIntraday
+      ? `正在获取 ${normalized} 2020年以来日线和分钟数据，首次导入可能需要数分钟...`
+      : `正在加载 ${normalized} 2020年以来日线行情...`,
+    "neutral",
+  );
 
   try {
     const params = new URLSearchParams({ symbol: normalized });
+    if (includeIntraday) {
+      params.set("include_intraday", "1");
+    }
     const response = await fetch(`/api/market-data?${params}`);
     const payload = await parseJsonResponse(response);
 
@@ -203,6 +255,11 @@ async function loadMarketData(symbol) {
 
     currentRawMarketData = payload.data;
     currentSymbolSettings = payload.symbol_settings || { show_weekend_data: true };
+    currentIntradaySync = payload.intraday_sync || {
+      status: "not_initialized",
+      row_count: 0,
+    };
+    includeIntradayData.checked = Number(currentIntradaySync.row_count || 0) > 0;
     currentSymbol = payload.canonical_symbol || payload.symbol || normalized;
     symbolInput.value = payload.symbol || normalized;
     showWeekendData.checked = Boolean(currentSymbolSettings.show_weekend_data);
@@ -210,6 +267,7 @@ async function loadMarketData(symbol) {
     await loadSymbolIndicators();
     updateChartTitle(payload.symbol);
     chartSource.textContent = sourceText(payload.source);
+    updateDetailActions();
 
     if (payload.warning) {
       setStatus(payload.warning, "warning");
@@ -225,6 +283,9 @@ async function loadMarketData(symbol) {
     }
     if (currentWorkspaceMode === "analysis") {
       await loadStoredTrendlineAnalysis(currentSymbol);
+    }
+    if (getChartPeriod() !== "1D") {
+      await loadPeriodMarketData(getChartPeriod(), { silent: true });
     }
   } catch (error) {
     setStatus(error.message || "前端无法连接本地服务，请确认后端仍在运行。", "error");
@@ -260,7 +321,7 @@ async function loadMarketOverviewInner(page = overviewPage) {
       } catch (error) {
         syncFailed = true;
         if (currentWorkspaceMode === "market") {
-          setStatus(error.message || "行情总览日K补齐失败，已保留本地数据。", "warning");
+          setStatus(error.message || "行情总览更新失败，已保留本地数据。", "warning");
         }
       }
     }
@@ -454,21 +515,21 @@ function renderAnalysisProgress(state) {
 async function syncMarketOverviewDaily() {
   overviewDailySyncDone = true;
   if (currentWorkspaceMode === "market") {
-    overviewSummary.textContent = "补齐日K中";
-    setStatus("正在自动补齐行情总览日K...", "neutral");
+    overviewSummary.textContent = "更新行情中";
+    setStatus("正在更新行情总览；已初始化标的同步分钟数据，其余标的更新日线...", "neutral");
   }
   const response = await fetch("/api/market-overview/sync-daily", { method: "POST" });
   const payload = await parseJsonResponse(response);
   if (!payload.ok) {
     overviewDailySyncDone = false;
-    throw new Error(payload.error?.message || "行情总览日K补齐失败。");
+    throw new Error(payload.error?.message || "行情总览更新失败。");
   }
 
   const result = await waitForOverviewSync();
   const failed = (result.items || []).filter((item) => item.status !== "success").length;
   const suffix = failed ? `，${failed} 个标的需要稍后重试` : "";
   if (currentWorkspaceMode === "market") {
-    setStatus(`已自动补齐总览日K，更新 ${result.updated_rows || 0} 条${suffix}。`, failed ? "warning" : "success");
+    setStatus(`行情总览更新完成，共写入 ${result.updated_rows || 0} 条日线${suffix}。`, failed ? "warning" : "success");
   }
 }
 
@@ -478,7 +539,7 @@ async function waitForOverviewSync() {
     const response = await fetch("/api/market-overview/sync-status");
     const payload = await parseJsonResponse(response);
     if (!payload.ok) {
-      throw new Error(payload.error?.message || "行情总览日K补齐状态读取失败。");
+      throw new Error(payload.error?.message || "行情总览更新状态读取失败。");
     }
     if (!payload.running) {
       if (payload.last_error) {
@@ -487,7 +548,7 @@ async function waitForOverviewSync() {
       return payload.last_result || { items: [], updated_rows: 0 };
     }
   }
-  throw new Error("行情总览日K补齐仍在后台进行，本地数据已先显示。");
+  throw new Error("行情总览更新仍在后台进行，本地数据已先显示。");
 }
 
 function sleep(milliseconds) {
@@ -1088,13 +1149,22 @@ async function updateCurrentMarketData() {
 
   updateDataButton.disabled = true;
   chartSource.textContent = "更新中";
-  setStatus(`正在检查并更新 ${currentSymbol} 自 2020-01-01 以来的数据...`, "neutral");
+  const includeIntraday = includeIntradayData.checked;
+  setStatus(
+    includeIntraday
+      ? `正在检查并补齐 ${currentSymbol} 的日线和分钟数据...`
+      : `正在检查并补齐 ${currentSymbol} 的日线数据...`,
+    "neutral",
+  );
 
   try {
     const response = await fetch("/api/market-data/update", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ symbol: currentSymbol }),
+      body: JSON.stringify({
+        symbol: currentSymbol,
+        include_intraday: includeIntraday,
+      }),
     });
     const payload = await parseJsonResponse(response);
     if (!payload.ok) {
@@ -1106,15 +1176,26 @@ async function updateCurrentMarketData() {
 
     currentRawMarketData = payload.data;
     currentSymbolSettings = payload.symbol_settings || currentSymbolSettings;
+    currentIntradaySync = payload.intraday_sync || currentIntradaySync;
     showWeekendData.checked = Boolean(currentSymbolSettings.show_weekend_data);
     renderCurrentMarketData();
     await loadSymbolIndicators();
     updateChartTitle(payload.symbol);
     chartSource.textContent = sourceText(payload.source);
+    updateDetailActions();
+    if (getChartPeriod() !== "1D") {
+      await loadPeriodMarketData(getChartPeriod(), { silent: true });
+    }
 
     const firstDate = payload.data[0]?.date || "-";
     const lastDate = payload.data[payload.data.length - 1]?.date || "-";
-    const actionText = payload.source === "api" ? "已从 API 更新" : "数据库已完整";
+    const actionText = includeIntraday && payload.source === "alpaca" && payload.derived_daily
+      ? "已从 Alpaca 更新分钟数据并重建日线"
+      : payload.source === "alpaca"
+        ? "已从 Alpaca 更新日线"
+      : payload.source === "api"
+        ? "已从 API 更新"
+        : "数据库已完整";
     setStatus(
       `${actionText}：${payload.symbol} 共 ${payload.data.length} 条数据，范围 ${firstDate} 至 ${lastDate}。`,
       "success",
@@ -1124,6 +1205,51 @@ async function updateCurrentMarketData() {
     chartSource.textContent = "更新失败";
   } finally {
     updateDataButton.disabled = false;
+  }
+}
+
+function updateDetailActions() {
+  const inOverview = Boolean(currentSymbolSettings.show_in_overview);
+  overviewSymbolToggle.classList.toggle("is-active", inOverview);
+  overviewSymbolToggle.title = inOverview ? "从行情总览移除" : "加入行情总览";
+  overviewSymbolToggle.setAttribute("aria-label", overviewSymbolToggle.title);
+  overviewSymbolToggle.innerHTML = inOverview
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12l4 4 10-10" /></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14" /><path d="M5 12h14" /></svg>';
+
+}
+
+async function toggleCurrentOverview() {
+  if (!currentSymbol) {
+    return;
+  }
+  const nextValue = !Boolean(currentSymbolSettings.show_in_overview);
+  overviewSymbolToggle.disabled = true;
+  try {
+    const response = await fetch(
+      `/api/market-overview/${encodeURIComponent(currentSymbol)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ show_in_overview: nextValue }),
+      },
+    );
+    const payload = await parseJsonResponse(response);
+    if (!payload.ok) {
+      throw new Error(payload.error?.message || "行情总览设置失败。");
+    }
+    currentSymbolSettings = payload.symbol_settings || currentSymbolSettings;
+    updateDetailActions();
+    setStatus(
+      nextValue
+        ? `已将 ${currentSymbol} 加入行情总览。`
+        : `已将 ${currentSymbol} 从行情总览移除。`,
+      "success",
+    );
+  } catch (error) {
+    setStatus(error.message || "行情总览设置失败。", "error");
+  } finally {
+    overviewSymbolToggle.disabled = false;
   }
 }
 
@@ -1138,6 +1264,10 @@ function renderCurrentMarketData() {
 async function runTrendlineAnalysis() {
   if (!currentSymbol) {
     setStatus("请先输入并加载一个标的。", "error");
+    return;
+  }
+  if (/^(?:[1-9]\d{0,2}m|[1-9]\d?h)$/.test(getChartPeriod())) {
+    setStatus("智能趋势线当前仍仅支持日线周期；分时K线可正常使用 MA/EMA 指标。", "warning");
     return;
   }
   if (analysisAlgorithm.value !== "trendlines") {
@@ -1587,7 +1717,9 @@ async function shutdownSystem() {
 
 symbolForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  await loadMarketData(symbolInput.value);
+  await loadMarketData(symbolInput.value, {
+    includeIntraday: includeIntradayData.checked,
+  });
 });
 backToOverview.addEventListener("click", () => {
   currentSymbol = "";
@@ -1738,6 +1870,7 @@ favoriteIndicators.addEventListener("click", (event) => {
 });
 customIndicatorForm.addEventListener("submit", createAndAddIndicator);
 updateDataButton.addEventListener("click", updateCurrentMarketData);
+overviewSymbolToggle.addEventListener("click", toggleCurrentOverview);
 runAnalysisButton.addEventListener("click", runTrendlineAnalysis);
 trendlineLegend.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action='toggle-trendline']");
@@ -1765,13 +1898,19 @@ symbolSettingsClose.addEventListener("click", () => {
 });
 showWeekendData.addEventListener("change", saveSymbolSettings);
 document.addEventListener("indicator-action", handleIndicatorAction);
-document.addEventListener("chart-period-change", async () => {
+document.addEventListener("chart-period-change", async (event) => {
   updateChartTitle(symbolInput.value.trim().toUpperCase() || "行情");
   currentViewCode = getChartPeriod();
   clearTrendlineAnalysis();
-  await loadSymbolIndicators();
-  if (currentWorkspaceMode === "analysis" && currentSymbol) {
-    setStatus("K线周期已切换，请重新点击智能识别。", "neutral");
+  try {
+    await loadPeriodMarketData(event.detail.period);
+    await loadSymbolIndicators();
+    if (currentWorkspaceMode === "analysis" && currentSymbol) {
+      setStatus("K线周期已切换，请重新点击智能识别。", "neutral");
+    }
+  } catch (error) {
+    renderCandles([]);
+    setStatus(error.message || "K线周期切换失败。", "error");
   }
 });
 

@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from config import FULL_HISTORY_START_DATE
 from database import repository
 from services.api_errors import MarketDataError
+from services.alpaca_data_client import fetch_stock_bars
+from services.intraday_bar_service import (
+    derive_daily_prices_from_minutes,
+    refresh_alpaca_capability,
+)
+from services.intraday_import_service import import_symbol_history
+from database import intraday_repository
 from services.twelve_data_client import (
     fetch_daily_prices as fetch_twelve_data_daily_prices,
     fetch_daily_prices_batch as fetch_twelve_data_daily_prices_batch,
@@ -17,6 +24,7 @@ from services.yahoo_finance_client import (
 
 
 OVERVIEW_DAILY_REFRESH_LOOKBACK_DAYS = 5
+INTRADAY_REFRESH_LOOKBACK_DAYS = 5
 TWELVEDATA_FREE_BATCH_SYMBOL_LIMIT = 8
 
 
@@ -32,11 +40,68 @@ def _source_symbol(alias: dict, provider: str) -> str | None:
     return alias.get("common_symbol")
 
 
+def _ensure_alpaca_capability(symbol: str) -> dict:
+    settings = repository.get_symbol(symbol)
+    if settings.get("alpaca_supported") is None:
+        return refresh_alpaca_capability(symbol)["symbol_settings"]
+    return settings
+
+
+def _fetch_alpaca_daily_prices(symbol: str, start_date: date) -> list[dict]:
+    end = (datetime.now(timezone.utc) - timedelta(minutes=20)).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z")
+    payload = fetch_stock_bars(
+        symbol,
+        timeframe="1Day",
+        start=start_date.isoformat(),
+        end=end,
+        feed="sip",
+        limit=10_000,
+        max_pages=2,
+    )
+    return [
+        {
+            "date": row["timestamp"][:10],
+            "open": row["open"],
+            "high": row["high"],
+            "low": row["low"],
+            "close": row["close"],
+            "volume": row["volume"],
+            "source_provider": "alpaca",
+            "source_timeframe": "1Day",
+            "is_complete": True,
+        }
+        for row in payload["data"]
+    ]
+
+
 def _fetch_daily_prices_with_fallback(alias: dict, start_date: date) -> tuple[list[dict], str, str]:
-    attempts = [
+    normalized = alias["common_symbol"]
+    attempts = []
+    try:
+        capability = _ensure_alpaca_capability(normalized)
+    except MarketDataError as exc:
+        repository.log_api_request(
+            provider="alpaca",
+            status="error",
+            symbol=normalized,
+            error_code=exc.code,
+            message=exc.detail or exc.message,
+        )
+        capability = {"alpaca_supported": False}
+    if capability.get("alpaca_supported"):
+        attempts.append(
+            (
+                "alpaca",
+                capability.get("alpaca_symbol") or normalized,
+                _fetch_alpaca_daily_prices,
+            )
+        )
+    attempts.extend([
         ("yahoo", _source_symbol(alias, "yahoo"), fetch_yahoo_daily_prices),
         ("twelvedata", _source_symbol(alias, "twelvedata"), fetch_twelve_data_daily_prices),
-    ]
+    ])
     first_error: MarketDataError | None = None
 
     for provider, provider_symbol, fetcher in attempts:
@@ -48,7 +113,10 @@ def _fetch_daily_prices_with_fallback(alias: dict, start_date: date) -> tuple[li
                 provider=provider,
                 status="success",
                 symbol=alias["common_symbol"],
-                message=f"Fetched {len(rows)} daily rows from {provider_symbol} since {FULL_HISTORY_START_DATE}.",
+                message=(
+                    f"Fetched {len(rows)} daily rows from {provider_symbol} "
+                    f"since {start_date.isoformat()}."
+                ),
             )
             return rows, provider, provider_symbol
         except MarketDataError as exc:
@@ -67,20 +135,45 @@ def _fetch_daily_prices_with_fallback(alias: dict, start_date: date) -> tuple[li
     raise ValueError("Symbol is required")
 
 
-def _has_full_history(symbol: str, start_date: date) -> bool:
+def _has_history_start(symbol: str, start_date: date) -> bool:
     coverage = repository.get_symbol_history_coverage(symbol)
-    if not coverage or not coverage["max_complete_date"]:
+    if not coverage or not coverage["min_date"]:
         return False
-
-    max_complete_date = date.fromisoformat(coverage["max_complete_date"])
-    min_date = date.fromisoformat(coverage["min_date"])
-    required_start = first_required_data_date(start_date)
-    required_latest = latest_required_data_date(date.today())
-    return min_date <= required_start and max_complete_date >= required_latest
+    return (
+        date.fromisoformat(coverage["min_date"])
+        <= first_required_data_date(start_date)
+    )
 
 
 def _has_cached_prices(symbol: str) -> bool:
     return repository.get_symbol_date_bounds(symbol) is not None
+
+
+def _intraday_incremental_start(latest_complete_at: str) -> str:
+    latest = datetime.fromisoformat(
+        latest_complete_at.replace("Z", "+00:00")
+    )
+    return (
+        latest - timedelta(days=INTRADAY_REFRESH_LOOKBACK_DAYS)
+    ).date().isoformat()
+
+
+def _has_initialized_intraday_history(sync_state: dict) -> bool:
+    earliest_at = sync_state.get("earliest_minute_at")
+    latest_complete_at = sync_state.get("latest_complete_minute_at")
+    if (
+        int(sync_state.get("row_count") or 0) <= 0
+        or not earliest_at
+        or not latest_complete_at
+    ):
+        return False
+    earliest_date = datetime.fromisoformat(
+        earliest_at.replace("Z", "+00:00")
+    ).date()
+    required_start = first_required_data_date(
+        date.fromisoformat(FULL_HISTORY_START_DATE)
+    )
+    return earliest_date <= required_start
 
 
 def first_required_data_date(start_date: date) -> date:
@@ -93,20 +186,17 @@ def first_required_data_date(start_date: date) -> date:
     return current
 
 
-def latest_required_data_date(today: date) -> date:
-    if today.weekday() == 5:
-        return today - timedelta(days=1)
-    if today.weekday() == 6:
-        return today - timedelta(days=2)
-    return today
-
-
-def get_market_data(symbol: str) -> dict:
+def get_market_data(symbol: str, *, include_intraday: bool = False) -> dict:
     if not normalize_symbol(symbol):
         raise ValueError("Symbol is required")
 
     alias = repository.resolve_symbol_alias(symbol)
     normalized = alias["common_symbol"]
+    if include_intraday:
+        return update_full_market_data(
+            normalized,
+            initialize_intraday=True,
+        )
     display_symbol = alias["display_name"]
     start_date = date.fromisoformat(FULL_HISTORY_START_DATE)
     source = "database"
@@ -114,7 +204,12 @@ def get_market_data(symbol: str) -> dict:
     if not _has_cached_prices(normalized):
         rows, provider, _provider_symbol = _fetch_daily_prices_with_fallback(alias, start_date)
         repository.upsert_symbol(normalized)
-        repository.upsert_daily_prices(normalized, rows)
+        repository.upsert_daily_prices(
+            normalized,
+            rows,
+            source_provider=provider,
+            source_timeframe="1Day",
+        )
         source = provider
 
     rows = repository.get_daily_prices(normalized, start_date.isoformat())
@@ -126,6 +221,7 @@ def get_market_data(symbol: str) -> dict:
             "source": source,
             "warning": f"没有可展示的 {FULL_HISTORY_START_DATE} 以来行情数据。",
             "symbol_settings": repository.get_symbol(normalized),
+            "intraday_sync": intraday_repository.get_sync_state(normalized),
             "data": [],
             "start_date": start_date.isoformat(),
         }
@@ -137,12 +233,17 @@ def get_market_data(symbol: str) -> dict:
         "source": source,
         "warning": None,
         "symbol_settings": repository.get_symbol(normalized),
+        "intraday_sync": intraday_repository.get_sync_state(normalized),
         "data": rows,
         "start_date": start_date.isoformat(),
     }
 
 
-def update_full_market_data(symbol: str) -> dict:
+def update_full_market_data(
+    symbol: str,
+    *,
+    initialize_intraday: bool = False,
+) -> dict:
     if not normalize_symbol(symbol):
         raise ValueError("Symbol is required")
 
@@ -151,21 +252,101 @@ def update_full_market_data(symbol: str) -> dict:
     display_symbol = alias["display_name"]
     start_date = date.fromisoformat(FULL_HISTORY_START_DATE)
     source = "database"
+    try:
+        capability = _ensure_alpaca_capability(normalized)
+    except MarketDataError as exc:
+        repository.log_api_request(
+            provider="alpaca",
+            status="error",
+            symbol=normalized,
+            error_code=exc.code,
+            message=exc.detail or exc.message,
+        )
+        capability = {"alpaca_supported": False}
 
-    if not _has_full_history(normalized, start_date):
+    sync_state = intraday_repository.get_sync_state(normalized)
+    intraday_ready = _has_initialized_intraday_history(sync_state)
+    if capability.get("alpaca_supported") and initialize_intraday:
+        if intraday_ready:
+            start_value = _intraday_incremental_start(
+                sync_state["latest_complete_minute_at"]
+            )
+            derive_start = start_value
+        else:
+            start_value = FULL_HISTORY_START_DATE
+            derive_start = None
+        import_result = import_symbol_history(normalized, start=start_value)
+        derived = derive_daily_prices_from_minutes(
+            normalized,
+            start_at=derive_start,
+        )
+        rows = repository.get_daily_prices(normalized, start_date.isoformat())
+        return {
+            "ok": True,
+            "symbol": display_symbol,
+            "canonical_symbol": normalized,
+            "source": "alpaca",
+            "warning": None,
+            "symbol_settings": repository.get_symbol(normalized),
+            "intraday_sync": import_result["sync_state"],
+            "derived_daily": derived,
+            "data": rows,
+            "start_date": start_date.isoformat(),
+        }
+
+    recent_start = _overview_sync_start_date(normalized)
+    if capability.get("alpaca_supported"):
+        rows = _fetch_alpaca_daily_prices(
+            capability.get("alpaca_symbol") or normalized,
+            recent_start,
+        )
+        repository.upsert_symbol(normalized)
+        repository.upsert_daily_prices(
+            normalized,
+            rows,
+            source_provider="alpaca",
+            source_timeframe="1Day",
+        )
+        source = "alpaca"
+    else:
+        rows, provider, _provider_symbol = _fetch_daily_prices_with_fallback(
+            alias,
+            recent_start,
+        )
+        repository.upsert_symbol(normalized)
+        repository.upsert_daily_prices(
+            normalized,
+            rows,
+            source_provider=provider,
+            source_timeframe="1Day",
+        )
+        source = provider
+
+    if recent_start > start_date and not _has_history_start(normalized, start_date):
         rows, provider, _provider_symbol = _fetch_daily_prices_with_fallback(alias, start_date)
         repository.upsert_symbol(normalized)
-        repository.upsert_daily_prices(normalized, rows)
+        repository.upsert_daily_prices(
+            normalized,
+            rows,
+            source_provider=provider,
+            source_timeframe="1Day",
+        )
         source = provider
 
     rows = repository.get_daily_prices(normalized, start_date.isoformat())
+    settings = repository.get_symbol(normalized)
     return {
         "ok": True,
         "symbol": display_symbol,
         "canonical_symbol": normalized,
         "source": source,
-        "warning": None,
-        "symbol_settings": repository.get_symbol(normalized),
+        "warning": (
+            settings.get("alpaca_error")
+            if settings.get("alpaca_supported") is False
+            else None
+        ),
+        "symbol_settings": settings,
+        "intraday_sync": intraday_repository.get_sync_state(normalized),
         "data": rows,
         "start_date": start_date.isoformat(),
     }
@@ -206,7 +387,16 @@ def sync_market_overview_daily_prices() -> dict:
         for alias in aliases
     }
 
-    pending_aliases = _sync_overview_daily_from_yahoo(aliases, batch_start_date, results)
+    pending_aliases = _sync_overview_daily_from_alpaca(
+        aliases,
+        batch_start_date,
+        results,
+    )
+    pending_aliases = _sync_overview_daily_from_yahoo(
+        pending_aliases,
+        batch_start_date,
+        results,
+    )
     _sync_overview_daily_from_twelve_data(pending_aliases, batch_start_date, results)
 
     updated_rows = sum(int(item["updated_rows"] or 0) for item in results.values())
@@ -221,6 +411,71 @@ def sync_market_overview_daily_prices() -> dict:
         "items": list(results.values()),
         "updated_rows": updated_rows,
     }
+
+
+def _sync_overview_daily_from_alpaca(
+    aliases: list[dict],
+    start_date: date,
+    results: dict[str, dict],
+) -> list[dict]:
+    pending = []
+    for alias in aliases:
+        normalized = alias["common_symbol"]
+        try:
+            capability = _ensure_alpaca_capability(normalized)
+            if not capability.get("alpaca_supported"):
+                pending.append(alias)
+                continue
+            sync_state = intraday_repository.get_sync_state(normalized)
+            intraday_ready = _has_initialized_intraday_history(sync_state)
+            if intraday_ready:
+                start_value = _intraday_incremental_start(
+                    sync_state["latest_complete_minute_at"]
+                )
+                import_result = import_symbol_history(
+                    normalized,
+                    start=start_value,
+                )
+                derived = derive_daily_prices_from_minutes(
+                    normalized,
+                    start_at=start_value,
+                )
+                updated_rows = derived["updated_rows"]
+                source = "alpaca-minute"
+                sync_status = import_result["sync_state"]["status"]
+            else:
+                rows = _fetch_alpaca_daily_prices(
+                    capability.get("alpaca_symbol") or normalized,
+                    start_date,
+                )
+                repository.upsert_symbol(normalized)
+                updated_rows = repository.upsert_daily_prices(
+                    normalized,
+                    rows,
+                    source_provider="alpaca",
+                    source_timeframe="1Day",
+                )
+                source = "alpaca"
+                sync_status = sync_state.get("status")
+            results[normalized].update(
+                {
+                    "source": source,
+                    "status": "success",
+                    "updated_rows": updated_rows,
+                    "error": None,
+                    "intraday_status": sync_status,
+                }
+            )
+        except MarketDataError as exc:
+            repository.log_api_request(
+                provider="alpaca",
+                status="error",
+                symbol=normalized,
+                error_code=exc.code,
+                message=exc.detail or exc.message,
+            )
+            pending.append(alias)
+    return pending
 
 
 def _sync_overview_daily_from_twelve_data(

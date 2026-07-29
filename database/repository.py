@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 import json
 import math
+import re
 import sqlite3
 
 from config import MAX_DB_PAGE_SIZE
@@ -10,6 +11,10 @@ from database.db import get_connection
 
 
 DEFAULT_CHART_VIEWS = [
+    {"view_code": "1m", "period_type": "minute", "period_value": 1, "name": "1分钟K"},
+    {"view_code": "15m", "period_type": "minute", "period_value": 15, "name": "15分钟K"},
+    {"view_code": "1h", "period_type": "minute", "period_value": 60, "name": "1小时K"},
+    {"view_code": "4h", "period_type": "minute", "period_value": 240, "name": "4小时K"},
     {"view_code": "1D", "period_type": "day", "period_value": 1, "name": "日K"},
     {"view_code": "3D", "period_type": "day", "period_value": 3, "name": "3日K"},
     {"view_code": "1W", "period_type": "week", "period_value": 1, "name": "周K"},
@@ -200,7 +205,7 @@ def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
             """
             INSERT INTO symbols
                 (symbol, name, exchange_name, currency, show_weekend_data, show_in_overview, display_order, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 name = COALESCE(excluded.name, symbols.name),
                 exchange_name = COALESCE(excluded.exchange_name, symbols.exchange_name),
@@ -257,7 +262,10 @@ def get_symbol(symbol: str) -> dict:
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT id, symbol, name, exchange_name, currency, show_weekend_data, show_in_overview, created_at, updated_at
+            SELECT id, symbol, name, exchange_name, currency,
+                   show_weekend_data, show_in_overview,
+                   alpaca_symbol, alpaca_supported, alpaca_checked_at, alpaca_error,
+                   created_at, updated_at
             FROM symbols
             WHERE id = ?
             """,
@@ -266,8 +274,46 @@ def get_symbol(symbol: str) -> dict:
     data = dict(row)
     data["show_weekend_data"] = bool(data["show_weekend_data"])
     data["show_in_overview"] = bool(data["show_in_overview"])
+    data["alpaca_supported"] = (
+        bool(data["alpaca_supported"])
+        if data["alpaca_supported"] is not None
+        else None
+    )
     data["display_symbol"] = get_symbol_display_name(data["symbol"])
     return data
+
+
+def set_alpaca_capability(
+    symbol: str,
+    *,
+    supported: bool,
+    alpaca_symbol: str | None = None,
+    error: str | None = None,
+) -> dict:
+    normalized = normalize_symbol_key(symbol)
+    upsert_symbol(normalized)
+    now = utc_now_iso()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE symbols
+            SET alpaca_symbol = ?,
+                alpaca_supported = ?,
+                alpaca_checked_at = ?,
+                alpaca_error = ?,
+                updated_at = ?
+            WHERE symbol = ?
+            """,
+            (
+                normalize_symbol_key(alpaca_symbol or normalized),
+                1 if supported else 0,
+                now,
+                error,
+                now,
+                normalized,
+            ),
+        )
+    return get_symbol(normalized)
 
 
 def get_symbol_price_snapshot(symbol: str) -> dict:
@@ -647,6 +693,7 @@ def update_symbol_settings(symbol: str, payload: dict) -> dict:
 
 def get_chart_view(symbol: str, view_code: str) -> dict:
     ensure_symbol_chart_views(symbol)
+    normalized_code = (view_code or "").strip()
     with get_connection() as conn:
         row = conn.execute(
             """
@@ -654,10 +701,52 @@ def get_chart_view(symbol: str, view_code: str) -> dict:
             FROM symbol_chart_views
             WHERE symbol = ? AND view_code = ?
             """,
-            (symbol, view_code),
+            (symbol, normalized_code),
         ).fetchone()
     if not row:
-        raise ValueError("Unknown chart view")
+        match = re.fullmatch(r"([1-9]\d{0,2})(m|h|D)", normalized_code)
+        if not match:
+            raise ValueError("Unknown chart view")
+        value = int(match.group(1))
+        suffix = match.group(2)
+        if suffix == "m":
+            period_type, period_value, name = "minute", value, f"{value}分钟K"
+        elif suffix == "h":
+            period_type, period_value, name = "minute", value * 60, f"{value}小时K"
+        else:
+            period_type, period_value, name = "day", value, f"{value}日K"
+        if period_type == "minute" and period_value > 390:
+            raise ValueError("Unknown chart view")
+        symbol_id = upsert_symbol(symbol)
+        now = utc_now_iso()
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO symbol_chart_views (
+                    symbol_id, symbol, view_code, period_type,
+                    period_value, name, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol_id, view_code) DO NOTHING
+                """,
+                (
+                    symbol_id,
+                    symbol,
+                    normalized_code,
+                    period_type,
+                    period_value,
+                    name,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM symbol_chart_views
+                WHERE symbol_id = ? AND view_code = ?
+                """,
+                (symbol_id, normalized_code),
+            ).fetchone()
     return dict(row)
 
 
@@ -977,7 +1066,13 @@ def delete_symbol_indicator(symbol: str, view_code: str, symbol_indicator_id: in
     return {"symbol_indicators": list_symbol_indicators(symbol, view_code)}
 
 
-def upsert_daily_prices(symbol: str, rows: list[dict]) -> int:
+def upsert_daily_prices(
+    symbol: str,
+    rows: list[dict],
+    *,
+    source_provider: str | None = None,
+    source_timeframe: str | None = None,
+) -> int:
     now = utc_now_iso()
     payload = [
         (
@@ -988,6 +1083,9 @@ def upsert_daily_prices(symbol: str, rows: list[dict]) -> int:
             row["low"],
             row["close"],
             row.get("volume", 0),
+            row.get("source_provider", source_provider),
+            row.get("source_timeframe", source_timeframe),
+            1 if row.get("is_complete", True) else 0,
             now,
             now,
         )
@@ -997,14 +1095,19 @@ def upsert_daily_prices(symbol: str, rows: list[dict]) -> int:
         conn.executemany(
             """
             INSERT INTO daily_prices
-                (symbol, date, open, high, low, close, volume, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (symbol, date, open, high, low, close, volume,
+                 source_provider, source_timeframe, is_complete,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol, date) DO UPDATE SET
                 open = excluded.open,
                 high = excluded.high,
                 low = excluded.low,
                 close = excluded.close,
                 volume = excluded.volume,
+                source_provider = excluded.source_provider,
+                source_timeframe = excluded.source_timeframe,
+                is_complete = excluded.is_complete,
                 updated_at = excluded.updated_at
             """,
             payload,
@@ -1054,7 +1157,9 @@ def get_symbol_history_coverage(symbol: str) -> dict | None:
             SELECT
                 MIN(date) AS min_date,
                 MAX(CASE
-                    WHEN date(COALESCE(updated_at, created_at)) = date THEN NULL
+                    WHEN is_complete = 0
+                      OR date(COALESCE(updated_at, created_at)) = date
+                    THEN NULL
                     ELSE date
                 END) AS max_complete_date,
                 MAX(date) AS max_date,

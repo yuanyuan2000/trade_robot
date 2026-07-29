@@ -1,0 +1,317 @@
+from __future__ import annotations
+
+from datetime import date
+import unittest
+from unittest.mock import patch
+
+import services.market_data_service as service
+
+
+class MarketDataAlpacaRoutingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.alias = {
+            "common_symbol": "GLD",
+            "display_name": "GLD",
+            "yahoo_symbol": "GLD",
+            "twelvedata_symbol": "GLD",
+        }
+
+    @patch.object(service.repository, "log_api_request")
+    @patch.object(service, "_fetch_alpaca_daily_prices")
+    @patch.object(service, "_ensure_alpaca_capability")
+    def test_supported_equity_uses_alpaca_first(
+        self,
+        capability,
+        fetch_alpaca,
+        _log,
+    ) -> None:
+        capability.return_value = {
+            "alpaca_supported": True,
+            "alpaca_symbol": "GLD",
+        }
+        fetch_alpaca.return_value = [{"date": "2024-01-02"}]
+
+        rows, provider, provider_symbol = service._fetch_daily_prices_with_fallback(
+            self.alias,
+            date(2024, 1, 1),
+        )
+
+        self.assertEqual(rows, [{"date": "2024-01-02"}])
+        self.assertEqual(provider, "alpaca")
+        self.assertEqual(provider_symbol, "GLD")
+
+    @patch.object(service.repository, "log_api_request")
+    @patch.object(service, "fetch_yahoo_daily_prices")
+    @patch.object(service, "_ensure_alpaca_capability")
+    def test_unsupported_symbol_keeps_existing_fallback(
+        self,
+        capability,
+        fetch_yahoo,
+        _log,
+    ) -> None:
+        capability.return_value = {"alpaca_supported": False}
+        fetch_yahoo.return_value = [{"date": "2024-01-02"}]
+
+        _, provider, _ = service._fetch_daily_prices_with_fallback(
+            self.alias,
+            date(2024, 1, 1),
+        )
+
+        self.assertEqual(provider, "yahoo")
+        fetch_yahoo.assert_called_once()
+
+    @patch.object(service, "update_full_market_data")
+    def test_query_checkbox_requests_intraday_initialization(self, update) -> None:
+        update.return_value = {"ok": True}
+
+        result = service.get_market_data("GLD", include_intraday=True)
+
+        self.assertEqual(result, {"ok": True})
+        update.assert_called_once_with("GLD", initialize_intraday=True)
+
+    @patch.object(service.repository, "log_api_request")
+    @patch.object(service, "_fetch_alpaca_daily_prices")
+    @patch.object(service, "derive_daily_prices_from_minutes")
+    @patch.object(service, "import_symbol_history")
+    @patch.object(service.intraday_repository, "get_sync_state")
+    @patch.object(service, "_ensure_alpaca_capability")
+    def test_overview_uses_incremental_minutes_only_after_initialization(
+        self,
+        capability,
+        get_sync_state,
+        import_history,
+        derive_daily,
+        fetch_daily,
+        _log,
+    ) -> None:
+        capability.return_value = {
+            "alpaca_supported": True,
+            "alpaca_symbol": "GLD",
+        }
+        get_sync_state.return_value = {
+            "status": "success",
+            "row_count": 100,
+            "earliest_minute_at": "2020-01-02T14:30:00Z",
+            "latest_complete_minute_at": "2024-01-05T20:00:00Z",
+        }
+        import_history.return_value = {"sync_state": {"status": "success"}}
+        derive_daily.return_value = {"updated_rows": 2}
+        results = {"GLD": {"status": "pending"}}
+
+        pending = service._sync_overview_daily_from_alpaca(
+            [self.alias],
+            date(2024, 1, 1),
+            results,
+        )
+
+        self.assertEqual(pending, [])
+        self.assertEqual(results["GLD"]["source"], "alpaca-minute")
+        self.assertEqual(results["GLD"]["updated_rows"], 2)
+        import_history.assert_called_once_with("GLD", start="2023-12-31")
+        derive_daily.assert_called_once_with(
+            "GLD",
+            start_at="2023-12-31",
+        )
+        fetch_daily.assert_not_called()
+
+    @patch.object(service.repository, "get_symbol")
+    @patch.object(service.repository, "get_daily_prices")
+    @patch.object(service.repository, "upsert_daily_prices")
+    @patch.object(service.repository, "upsert_symbol")
+    @patch.object(service, "_has_history_start")
+    @patch.object(service, "_overview_sync_start_date")
+    @patch.object(service, "_fetch_alpaca_daily_prices")
+    @patch.object(service, "import_symbol_history")
+    @patch.object(service.intraday_repository, "get_sync_state")
+    @patch.object(service, "_ensure_alpaca_capability")
+    @patch.object(service.repository, "resolve_symbol_alias")
+    def test_manual_daily_only_does_not_touch_initialized_minutes(
+        self,
+        resolve_alias,
+        capability,
+        get_sync_state,
+        import_history,
+        fetch_daily,
+        sync_start,
+        has_history_start,
+        _upsert_symbol,
+        _upsert_daily,
+        get_daily_prices,
+        get_symbol,
+    ) -> None:
+        resolve_alias.return_value = self.alias
+        capability.return_value = {
+            "alpaca_supported": True,
+            "alpaca_symbol": "GLD",
+        }
+        get_sync_state.return_value = {
+            "status": "success",
+            "row_count": 100,
+            "earliest_minute_at": "2020-01-02T14:30:00Z",
+            "latest_complete_minute_at": "2024-01-05T20:00:00Z",
+        }
+        sync_start.return_value = date(2024, 1, 1)
+        fetch_daily.return_value = [{"date": "2024-01-05"}]
+        has_history_start.return_value = True
+        get_daily_prices.return_value = [{"date": "2024-01-05"}]
+        get_symbol.return_value = {"alpaca_supported": True}
+
+        service.update_full_market_data("GLD", initialize_intraday=False)
+
+        fetch_daily.assert_called_once_with("GLD", date(2024, 1, 1))
+        import_history.assert_not_called()
+
+    @patch.object(service.repository, "get_symbol")
+    @patch.object(service.repository, "get_daily_prices")
+    @patch.object(service, "derive_daily_prices_from_minutes")
+    @patch.object(service, "import_symbol_history")
+    @patch.object(service.intraday_repository, "get_sync_state")
+    @patch.object(service, "_ensure_alpaca_capability")
+    @patch.object(service.repository, "resolve_symbol_alias")
+    def test_manual_intraday_initializes_from_2020_when_history_is_missing(
+        self,
+        resolve_alias,
+        capability,
+        get_sync_state,
+        import_history,
+        derive_daily,
+        get_daily_prices,
+        _get_symbol,
+    ) -> None:
+        resolve_alias.return_value = self.alias
+        capability.return_value = {
+            "alpaca_supported": True,
+            "alpaca_symbol": "GLD",
+        }
+        get_sync_state.return_value = {
+            "status": "not_initialized",
+            "row_count": 0,
+        }
+        import_history.return_value = {
+            "sync_state": {
+                "status": "success",
+                "row_count": 100,
+            }
+        }
+        derive_daily.return_value = {"updated_rows": 10}
+        get_daily_prices.return_value = [{"date": "2020-01-02"}]
+
+        service.update_full_market_data("GLD", initialize_intraday=True)
+
+        import_history.assert_called_once_with(
+            "GLD",
+            start=service.FULL_HISTORY_START_DATE,
+        )
+        derive_daily.assert_called_once_with("GLD", start_at=None)
+
+    @patch.object(service.repository, "get_symbol")
+    @patch.object(service.repository, "get_daily_prices")
+    @patch.object(service.repository, "upsert_daily_prices")
+    @patch.object(service.repository, "upsert_symbol")
+    @patch.object(service, "_has_history_start")
+    @patch.object(service, "_overview_sync_start_date")
+    @patch.object(service, "_fetch_daily_prices_with_fallback")
+    @patch.object(service.intraday_repository, "get_sync_state")
+    @patch.object(service, "_ensure_alpaca_capability")
+    @patch.object(service.repository, "resolve_symbol_alias")
+    def test_manual_daily_fallback_always_refreshes_recent_window(
+        self,
+        resolve_alias,
+        capability,
+        get_sync_state,
+        fetch_fallback,
+        sync_start,
+        has_history_start,
+        _upsert_symbol,
+        _upsert_daily,
+        get_daily_prices,
+        get_symbol,
+    ) -> None:
+        resolve_alias.return_value = self.alias
+        capability.return_value = {"alpaca_supported": False}
+        get_sync_state.return_value = {
+            "status": "not_initialized",
+            "row_count": 0,
+        }
+        sync_start.return_value = date(2024, 1, 1)
+        fetch_fallback.return_value = (
+            [{"date": "2024-01-05"}],
+            "yahoo",
+            "GLD",
+        )
+        has_history_start.return_value = True
+        get_daily_prices.return_value = [{"date": "2024-01-05"}]
+        get_symbol.return_value = {"alpaca_supported": False}
+
+        service.update_full_market_data("GLD", initialize_intraday=False)
+
+        fetch_fallback.assert_called_once_with(
+            self.alias,
+            date(2024, 1, 1),
+        )
+
+    @patch.object(service.repository, "upsert_daily_prices")
+    @patch.object(service.repository, "upsert_symbol")
+    @patch.object(service.repository, "log_api_request")
+    @patch.object(service, "_fetch_alpaca_daily_prices")
+    @patch.object(service, "import_symbol_history")
+    @patch.object(service.intraday_repository, "get_sync_state")
+    @patch.object(service, "_ensure_alpaca_capability")
+    def test_overview_does_not_start_full_minute_import(
+        self,
+        capability,
+        get_sync_state,
+        import_history,
+        fetch_daily,
+        _log,
+        _upsert_symbol,
+        _upsert_daily,
+    ) -> None:
+        capability.return_value = {
+            "alpaca_supported": True,
+            "alpaca_symbol": "GLD",
+        }
+        get_sync_state.return_value = {
+            "status": "not_initialized",
+            "row_count": 0,
+        }
+        fetch_daily.return_value = [{"date": "2024-01-02"}]
+        results = {"GLD": {"status": "pending"}}
+
+        service._sync_overview_daily_from_alpaca(
+            [self.alias],
+            date(2024, 1, 1),
+            results,
+        )
+
+        self.assertEqual(results["GLD"]["source"], "alpaca")
+        import_history.assert_not_called()
+
+    @patch.object(service, "_sync_overview_daily_from_twelve_data")
+    @patch.object(service, "_sync_overview_daily_from_yahoo")
+    @patch.object(service, "_sync_overview_daily_from_alpaca")
+    @patch.object(service, "_overview_sync_start_date")
+    @patch.object(service.repository, "list_overview_symbols")
+    def test_automatic_sync_is_limited_to_overview_symbols(
+        self,
+        list_overview,
+        sync_start,
+        sync_alpaca,
+        sync_yahoo,
+        sync_twelve,
+    ) -> None:
+        list_overview.return_value = [self.alias]
+        sync_start.return_value = date(2024, 1, 1)
+        sync_alpaca.return_value = []
+        sync_yahoo.return_value = []
+
+        service.sync_market_overview_daily_prices()
+
+        list_overview.assert_called_once_with()
+        self.assertEqual(sync_alpaca.call_args.args[0], [self.alias])
+        sync_yahoo.assert_called_once()
+        sync_twelve.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

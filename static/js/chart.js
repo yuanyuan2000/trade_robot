@@ -32,6 +32,10 @@ const chartState = {
 };
 
 const periodLabels = {
+  "1m": "1分钟K",
+  "15m": "15分钟K",
+  "1h": "1小时K",
+  "4h": "4小时K",
   "1D": "日K",
   "3D": "3日K",
   "1W": "周K",
@@ -64,6 +68,7 @@ function initChart() {
 function renderCandles(rows) {
   chartState.rawRows = rows.map((row) => ({
     date: row.date,
+    endDate: row.endDate,
     open: Number(row.open),
     high: Number(row.high),
     low: Number(row.low),
@@ -115,19 +120,54 @@ function getChartTrendlines() {
 function bindPeriodButtons() {
   document.querySelectorAll(".period-button").forEach((button) => {
     button.addEventListener("click", () => {
-      chartState.period = button.dataset.period;
-      document.querySelectorAll(".period-button").forEach((item) => {
-        item.classList.toggle("active", item === button);
-      });
-      rebuildPeriodCandles();
-      resetViewportToFullRange();
-      hideTooltip();
-      drawChart();
-      document.dispatchEvent(new CustomEvent("chart-period-change", {
-        detail: { period: chartState.period, label: periodLabels[chartState.period] },
-      }));
+      selectChartPeriod(button.dataset.period, button);
     });
   });
+  const customForm = document.getElementById("custom-bar-form");
+  const customValue = document.getElementById("custom-bar-value");
+  const customUnit = document.getElementById("custom-bar-unit");
+  customUnit?.addEventListener("change", () => {
+    const maximum = customUnit.value === "m" ? 390 : 365;
+    customValue.max = String(maximum);
+    if (Number(customValue.value) > maximum) {
+      customValue.value = String(maximum);
+    }
+  });
+  customForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = Number(customValue.value);
+    const unit = customUnit.value;
+    const max = unit === "m" ? 390 : 365;
+    if (!Number.isInteger(value) || value < 1 || value > max) {
+      return;
+    }
+    selectChartPeriod(`${value}${unit}`);
+  });
+}
+
+function selectChartPeriod(period, activeButton = null) {
+  chartState.period = period;
+  if (!periodLabels[period]) {
+    const match = period.match(/^(\d+)(m|D)$/);
+    periodLabels[period] = match?.[2] === "m"
+      ? `${match[1]}分钟K`
+      : `${match?.[1] || period}日K`;
+  }
+  document.querySelectorAll(".period-button").forEach((item) => {
+    item.classList.toggle("active", item === activeButton);
+  });
+  hideTooltip();
+  document.dispatchEvent(new CustomEvent("chart-period-change", {
+    detail: { period: chartState.period, label: periodLabels[chartState.period] },
+  }));
+}
+
+function resetChartPeriod(period = "1D") {
+  chartState.period = period;
+  document.querySelectorAll(".period-button").forEach((item) => {
+    item.classList.toggle("active", item.dataset.period === period);
+  });
+  hideTooltip();
 }
 
 function bindLegendEvents() {
@@ -229,19 +269,7 @@ function bindChartEvents() {
 }
 
 function rebuildPeriodCandles() {
-  if (chartState.period === "1D") {
-    chartState.candles = chartState.rawRows.map((row) => ({ ...row }));
-    recalculateIndicators();
-    return;
-  }
-
-  if (chartState.period === "3D") {
-    chartState.candles = aggregateByCount(chartState.rawRows, 3);
-    recalculateIndicators();
-    return;
-  }
-
-  chartState.candles = aggregateByCalendar(chartState.rawRows, chartState.period);
+  chartState.candles = chartState.rawRows.map((row) => ({ ...row }));
   recalculateIndicators();
 }
 
@@ -1355,6 +1383,10 @@ function formatVolume(value) {
 
 function formatDateLabel(candle, forceYear = false) {
   const source = candle.endDate || candle.date;
+  if (["1m", "15m", "1h", "4h"].includes(chartState.period)
+      || /^[1-9]\d{0,2}m$/.test(chartState.period)) {
+    return forceYear ? source.slice(0, 10) : source.slice(5, 16);
+  }
   if (forceYear) {
     return source.slice(0, 7);
   }

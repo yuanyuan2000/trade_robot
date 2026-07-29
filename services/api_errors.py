@@ -28,6 +28,16 @@ class InvalidApiKeyError(MarketDataError):
     message = "Twelve Data API Key 无效，请检查配置。"
 
 
+class MissingAlpacaCredentialsError(MarketDataError):
+    code = "MISSING_ALPACA_CREDENTIALS"
+    message = "未配置 Alpaca API Key 或 Secret，请检查 .env。"
+
+
+class InvalidAlpacaCredentialsError(MarketDataError):
+    code = "INVALID_ALPACA_CREDENTIALS"
+    message = "Alpaca API Key 或 Secret 无效，请检查配置。"
+
+
 class SymbolNotFoundError(MarketDataError):
     code = "SYMBOL_NOT_FOUND"
     message = "没有找到该股票代码，请确认代码是否正确。"

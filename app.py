@@ -25,14 +25,17 @@ from config import (
     FLASK_PORT,
     MAX_DB_PAGE_SIZE,
 )
-from database.db import backup_database, init_database
+from database.db import backup_databases, init_database
+from database.intraday_db import init_intraday_database
 from database import repository
+from services.alpaca_data_client import fetch_stock_bars
 from services.api_errors import MarketDataError
 from services.market_data_service import (
     get_market_data,
     sync_market_overview_daily_prices,
     update_full_market_data,
 )
+from services.intraday_bar_service import get_chart_bars
 from services.analysis_overview_service import (
     build_trendline_overview_summary,
     merge_analysis_overview,
@@ -99,12 +102,100 @@ def index():
 
 @app.route("/api/market-data")
 def market_data_query():
-    return market_data_response(request.args.get("symbol", ""))
+    return market_data_response(
+        request.args.get("symbol", ""),
+        include_intraday=request.args.get("include_intraday") in {"1", "true", "yes"},
+    )
 
 
 @app.route("/api/market-data/<path:symbol>")
 def market_data(symbol: str):
     return market_data_response(symbol)
+
+
+@app.route("/api/market-bars")
+def market_bars_query():
+    try:
+        return jsonify(
+            get_chart_bars(
+                request.args.get("symbol", ""),
+                request.args.get("period", "1D"),
+                int(request.args.get("limit", "1500")),
+            )
+        )
+    except ValueError as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "error": {
+                    "code": "INVALID_INPUT",
+                    "message": str(exc),
+                    "detail": None,
+                },
+            }
+        ), 400
+    except MarketDataError as exc:
+        return jsonify({"ok": False, "error": exc.to_dict()}), 502
+    except Exception as exc:
+        app.logger.exception("Unexpected aggregated market bars error")
+        return jsonify(
+            {
+                "ok": False,
+                "error": {
+                    "code": "UNKNOWN_ERROR",
+                    "message": "系统读取K线数据时发生未知错误。",
+                    "detail": str(exc),
+                },
+            }
+        ), 500
+
+
+@app.route("/api/alpaca/stock-bars")
+def alpaca_stock_bars():
+    """Diagnostic-only Alpaca endpoint; it does not write to SQLite."""
+    try:
+        return jsonify(
+            fetch_stock_bars(
+                request.args.get("symbol", ""),
+                timeframe=request.args.get("timeframe", "1Min"),
+                start=request.args.get("start", "2020-01-01"),
+                end=request.args.get("end") or None,
+                feed=request.args.get("feed", "sip"),
+                limit=int(request.args.get("limit", "1000")),
+                max_pages=int(request.args.get("max_pages", "1")),
+            )
+        )
+    except ValueError as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "INVALID_INPUT",
+                        "message": str(exc),
+                        "detail": None,
+                    },
+                }
+            ),
+            400,
+        )
+    except MarketDataError as exc:
+        return jsonify({"ok": False, "error": exc.to_dict()}), 502
+    except Exception as exc:
+        app.logger.exception("Unexpected Alpaca market data error")
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "UNKNOWN_ERROR",
+                        "message": "系统测试 Alpaca 行情数据时发生未知错误。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            500,
+        )
 
 
 @app.route("/api/analysis/trendlines")
@@ -163,9 +254,14 @@ def trendline_analysis_response(symbol: str):
         )
 
 
-def market_data_response(symbol: str):
+def market_data_response(symbol: str, include_intraday: bool = False):
     try:
-        return jsonify(get_market_data(symbol))
+        return jsonify(
+            get_market_data(
+                symbol,
+                include_intraday=include_intraday,
+            )
+        )
     except ValueError as exc:
         return (
             jsonify(
@@ -203,8 +299,16 @@ def market_data_response(symbol: str):
 def update_market_data():
     payload = request.get_json(silent=True) or {}
     symbol = payload.get("symbol") or request.args.get("symbol", "")
+    include_intraday = str(
+        payload.get("include_intraday", request.args.get("include_intraday", ""))
+    ).strip().lower() in {"1", "true", "yes", "on"}
     try:
-        return jsonify(update_full_market_data(symbol))
+        return jsonify(
+            update_full_market_data(
+                symbol,
+                initialize_intraday=include_intraday,
+            )
+        )
     except ValueError as exc:
         return (
             jsonify(
@@ -395,7 +499,7 @@ def market_overview_sync_daily():
                     "ok": False,
                     "error": {
                         "code": "UNKNOWN_ERROR",
-                        "message": "系统自动补齐行情总览日 K 时发生未知错误。",
+                        "message": "系统自动更新行情总览时发生未知错误。",
                         "detail": str(exc),
                     },
                 }
@@ -840,15 +944,34 @@ def db_table(table_name: str):
 
 @app.route("/api/db/backup", methods=["POST"])
 def db_backup():
+    payload = request.get_json(silent=True) or {}
     try:
-        backup_path = backup_database()
+        targets = payload.get("targets", ["main"])
+        if not isinstance(targets, list):
+            raise ValueError("targets must be a list")
+        backups = backup_databases(targets)
         return jsonify(
             {
                 "ok": True,
                 "message": "数据库备份完成。",
-                "path": str(backup_path),
-                "filename": backup_path.name,
+                "backups": backups,
+                "path": backups[0]["path"] if len(backups) == 1 else None,
+                "filename": backups[0]["filename"] if len(backups) == 1 else None,
             }
+        )
+    except ValueError as exc:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "INVALID_BACKUP_TARGET",
+                        "message": "数据库备份选择无效。",
+                        "detail": str(exc),
+                    },
+                }
+            ),
+            400,
         )
     except Exception as exc:
         app.logger.exception("Database backup failed")
@@ -1111,7 +1234,9 @@ def is_wsl() -> bool:
 
 def main() -> None:
     init_database()
+    init_intraday_database()
     configure_access_logging()
+    start_overview_sync()
     start_analysis_overview_refresh()
     if AUTO_OPEN_BROWSER:
         threading.Thread(target=open_browser, daemon=True).start()

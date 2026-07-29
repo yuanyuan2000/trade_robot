@@ -295,6 +295,36 @@ select {
   gap: 10px;
 }
 
+.search-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.search-option input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
+.db-backup-target {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.db-backup-target input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
 input,
 select {
   height: 38px;
@@ -380,6 +410,12 @@ button:disabled {
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 1.8;
+}
+
+#overview-symbol-toggle.is-active {
+  border-color: rgba(35, 116, 90, 0.45);
+  background: rgba(35, 116, 90, 0.14);
+  color: var(--success);
 }
 
 .status {
@@ -504,7 +540,13 @@ button:disabled {
 .chart-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  min-width: 0;
+  gap: 6px;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  overflow-x: auto;
+  padding: 5px 0;
+  scrollbar-width: thin;
 }
 
 .analysis-controls {
@@ -539,14 +581,56 @@ button:disabled {
   padding: 2px;
 }
 
-.period-button {
-  height: 30px;
-  min-width: 50px;
-  border: 0;
+.period-picker {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 5px;
+  flex-wrap: nowrap;
+  font-size: 12px;
+}
+
+.period-group,
+.custom-bar-period {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 2px;
+}
+
+.period-group > span {
+  color: var(--muted);
+  font-size: 11px;
+  margin-right: 1px;
+}
+
+.custom-bar-period input {
+  width: 46px;
+}
+
+.custom-bar-period select {
+  width: 58px;
+}
+
+.custom-bar-period input,
+.custom-bar-period select,
+.custom-bar-period button {
+  height: 27px;
+  min-height: 27px;
   border-radius: 6px;
+  padding: 0 7px;
+  font-size: 12px;
+}
+
+.period-button {
+  height: 27px;
+  min-width: 36px;
+  border: 0;
+  border-radius: 5px;
   background: transparent;
   color: var(--muted);
-  padding: 0 10px;
+  padding: 0 6px;
+  font-size: 12px;
 }
 
 .period-button:hover {

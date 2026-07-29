@@ -1,14 +1,28 @@
 from __future__ import annotations
 
 from datetime import datetime
-import sqlite3
 from pathlib import Path
+import shutil
+import sqlite3
 
-from config import DATA_DIR, DATABASE_PATH, SCHEMA_PATH
+from config import DATA_DIR, DATABASE_PATH, INTRADAY_DATABASE_PATH, SCHEMA_PATH
+from database.intraday_db import (
+    INTRADAY_WRITE_LOCK,
+    checkpoint_intraday_database,
+    init_intraday_database,
+)
+
+
+class ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            return super().__exit__(exc_type, exc, traceback)
+        finally:
+            self.close()
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_PATH, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -70,6 +84,10 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         column_name="display_order",
         definition="INTEGER NOT NULL DEFAULT 0",
     )
+    ensure_column(conn, "symbols", "alpaca_symbol", "TEXT")
+    ensure_column(conn, "symbols", "alpaca_supported", "INTEGER")
+    ensure_column(conn, "symbols", "alpaca_checked_at", "TEXT")
+    ensure_column(conn, "symbols", "alpaca_error", "TEXT")
     conn.execute(
         """
         UPDATE symbols
@@ -82,6 +100,14 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         table_name="daily_prices",
         column_name="updated_at",
         definition="TEXT",
+    )
+    ensure_column(conn, "daily_prices", "source_provider", "TEXT")
+    ensure_column(conn, "daily_prices", "source_timeframe", "TEXT")
+    ensure_column(
+        conn,
+        "daily_prices",
+        "is_complete",
+        "INTEGER NOT NULL DEFAULT 1",
     )
     conn.execute(
         """
@@ -144,19 +170,78 @@ def ensure_column(
 
 
 def backup_database() -> Path:
-    if not DATABASE_PATH.exists():
+    return Path(backup_databases(["main"])[0]["path"])
+
+
+def backup_databases(targets: list[str]) -> list[dict]:
+    normalized = []
+    for target in targets:
+        clean_target = str(target).strip().lower()
+        if clean_target not in {"main", "intraday"}:
+            raise ValueError(f"Unknown database target: {target}")
+        if clean_target not in normalized:
+            normalized.append(clean_target)
+    if not normalized:
+        raise ValueError("At least one database target is required")
+
+    if "main" in normalized:
         init_database()
+    if "intraday" in normalized:
+        init_intraday_database()
+        checkpoint_intraday_database("FULL")
 
     backup_dir = DATA_DIR / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = backup_dir / f"market_data_backup_{timestamp}.sqlite"
+    sources = {
+        "main": Path(DATABASE_PATH),
+        "intraday": Path(INTRADAY_DATABASE_PATH),
+    }
+    filenames = {
+        "main": f"market_data_backup_{timestamp}.sqlite",
+        "intraday": f"intraday_data_backup_{timestamp}.sqlite",
+    }
+    required_bytes = sum(sources[target].stat().st_size for target in normalized)
+    free_bytes = shutil.disk_usage(backup_dir).free
+    if free_bytes < required_bytes + 50 * 1024 * 1024:
+        raise OSError(
+            f"Insufficient disk space: need at least {required_bytes} bytes plus reserve."
+        )
 
-    with get_connection() as source:
-        target = sqlite3.connect(backup_path)
-        try:
-            source.backup(target)
-        finally:
-            target.close()
+    results = []
+    lock = INTRADAY_WRITE_LOCK if "intraday" in normalized else _NullLock()
+    with lock:
+        for target_name in normalized:
+            backup_path = backup_dir / filenames[target_name]
+            source = sqlite3.connect(sources[target_name])
+            destination = sqlite3.connect(backup_path)
+            try:
+                source.backup(destination, pages=2048)
+                check = destination.execute("PRAGMA quick_check").fetchone()
+                quick_check = str(check[0]) if check else "unknown"
+            finally:
+                destination.close()
+                source.close()
+            if quick_check != "ok":
+                raise sqlite3.DatabaseError(
+                    f"{target_name} backup quick_check failed: {quick_check}"
+                )
+            results.append(
+                {
+                    "target": target_name,
+                    "path": str(backup_path),
+                    "filename": backup_path.name,
+                    "size_bytes": backup_path.stat().st_size,
+                    "quick_check": quick_check,
+                }
+            )
 
-    return backup_path
+    return results
+
+
+class _NullLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None

@@ -5,8 +5,12 @@ CREATE TABLE IF NOT EXISTS symbols (
     exchange_name TEXT,
     currency TEXT,
     show_weekend_data INTEGER NOT NULL DEFAULT 1,
-    show_in_overview INTEGER NOT NULL DEFAULT 1,
+    show_in_overview INTEGER NOT NULL DEFAULT 0,
     display_order INTEGER NOT NULL DEFAULT 0,
+    alpaca_symbol TEXT,
+    alpaca_supported INTEGER,
+    alpaca_checked_at TEXT,
+    alpaca_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -20,6 +24,9 @@ CREATE TABLE IF NOT EXISTS daily_prices (
     low REAL NOT NULL,
     close REAL NOT NULL,
     volume REAL DEFAULT 0,
+    source_provider TEXT,
+    source_timeframe TEXT,
+    is_complete INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(symbol, date)

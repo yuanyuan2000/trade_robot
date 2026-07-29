@@ -1,41 +1,54 @@
 # 交易分析决策系统
 
-一个本地运行的交易分析工具。当前版本支持行情缓存、K 线查看、MA/EMA 指标配置记忆，以及开发阶段的 SQLite 数据库浏览。
+一个本地运行的交易行情与技术分析 Web 应用。系统以 SQLite 缓存 2020 年以来的日线和
+美股分钟行情，提供行情总览、K 线与指标、直线趋势线分析、数据增量更新、数据库浏览和
+可选择的双数据库备份。
 
-本项目当前优先保证 Windows 原生环境可运行，后续更新应尽可能同时兼容 Windows 和 Linux/WSL；如两者存在差异，优先支持 Windows。
+项目优先保证 Windows 原生环境可运行，同时尽量兼容 Linux / WSL。若平台行为存在差异，
+以 Windows 为优先支持环境。
 
-## 功能
+## 1. 系统概览
 
-- Flask 本地 Web 应用，启动后可自动打开浏览器。
-- 输入股票代码查看 2020-01-01 以来 OHLCV 行情。
-- 查看行情默认展示本地标的总览，可点击标的进入 K 线详情。
-- 默认夜间模式，可在侧边栏底部切换日间/夜间主题。
-- 优先读取 SQLite 缓存，缓存不足时调用 Twelve Data API。
-- 可一键检查并更新当前标的自 2020-01-01 以来的历史数据。
-- 打开行情总览时会自动补齐总览标的日 K，并回刷最近 5 个自然日以修正盘中未完成 K 线。
-- 行情总览支持自动更新开关，开启后每 5 分钟刷新一次总览标的最新价格。
-- 自研 Canvas K 线图，支持日K、3日K、周K、月K。
-- 支持拖拽平移、滚轮缩放、价格轴、时间轴、悬浮 OHLCV。
-- 默认显示最近 150 根 K 线，数据不足时按实际数量展示。
-- 左侧坐标轴显示价格，右侧坐标轴显示相对当前视图首根开盘价的涨跌幅。
-- 支持 MA、EMA 指标线。
-- 侧边栏提供智能分析模块，可在最新 150 根 K 线上识别上涨支撑线和下跌压力线。
-- 趋势线按短期（约 15 根以内）、中期（约 16～49 根）和长期（约 50 根以上）分层展示。
-- 趋势线算法包含多触点确认、首尾桥接过滤和跨层级几何去重。
-- 指标按“标的 + K 线视图”保存配置。
-- 支持收藏指标，并可快速添加到不同标的或视图。
-- 每个标的的每个视图最多同时设置 10 个指标。
-- 内置数据库浏览器，支持分页查看表内容。
-- 数据库浏览页面支持一键备份 SQLite 数据库。
-- 行情总览支持拖拽调整标的显示顺序，并自动保存到数据库。
-- 行情总览支持隐藏标的，隐藏不会删除数据库中的历史行情和指标配置。
-- 侧边栏提供“退出系统”按钮，可主动停止后端服务。
-- 明确退出会遮住整个界面、停止分析子进程并结束 Flask 主进程；直接关闭浏览器时，
-  `/api/session/close` 只负责无心跳后的自动退出兜底。高频 heartbeat 请求不写入终端访问日志。
+| 模块 | 当前能力 |
+| --- | --- |
+| 行情总览 | 展示自选标的、涨跌幅和更新时间；支持排序、拖拽和移除 |
+| 数据源 | 美股/ETF 优先 Alpaca；不支持时使用 Yahoo Finance、Twelve Data |
+| 历史范围 | 首次完整导入从 `2020-01-01` 开始 |
+| K 线 | `1m`、`15m`、`1h`、`4h`、`1D`、`3D`、`1W`、`1M` 及自定义周期 |
+| 指标 | MA、EMA；按“标的 + K线周期”保存配置 |
+| 智能分析 | 在日线周期识别上涨支撑线、下跌压力线和趋势结构事件 |
+| 本地存储 | 主数据库保存业务数据；分钟数据库压缩保存 1 分钟原始行情 |
+| 运维 | 数据库浏览、主库/分钟库可选备份、显式退出和浏览器关闭兜底 |
 
-## 安装
+核心数据流：
 
-### Windows
+```text
+Alpaca / Yahoo Finance / Twelve Data
+                  │
+                  ▼
+       行情路由、限流与增量导入
+            │             │
+            ▼             ▼
+  market_data.sqlite  intraday_data.sqlite
+            │             │
+            └──────┬──────┘
+                   ▼
+       Flask API → Canvas K线与分析界面
+```
+
+## 2. 快速开始
+
+### 2.1 环境要求
+
+- Python 3.10 或更高版本
+- Windows、Linux 或 WSL
+- Alpaca 账号：分钟历史和 Alpaca 美股/ETF 日线
+- Twelve Data Key：作为部分标的的日线备用源
+- Yahoo Finance 不需要 API Key
+
+### 2.2 Windows 安装
+
+PowerShell：
 
 ```powershell
 py -3 -m venv .venv
@@ -44,7 +57,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-如果 PowerShell 禁止执行激活脚本，可改用 CMD：
+如果 PowerShell 禁止执行激活脚本，可使用 CMD：
 
 ```cmd
 py -3 -m venv .venv
@@ -53,7 +66,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Linux / WSL
+### 2.3 Linux / WSL 安装
 
 ```bash
 python3 -m venv .venv
@@ -62,291 +75,473 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-创建 `.env`：
+### 2.4 配置 `.env`
+
+在项目根目录创建 `.env`：
 
 ```env
 TWELVEDATA_API_KEY=your_api_key_here
+ALPACA_API_KEY=your_alpaca_key_here
+ALPACA_SECRET=your_alpaca_secret_here
+
+FLASK_HOST=127.0.0.1
+FLASK_PORT=5000
+AUTO_OPEN_BROWSER=true
+AUTO_SHUTDOWN_ON_BROWSER_CLOSE=true
+ANALYSIS_MAX_WORKERS=4
+BROWSER_OPEN_COMMAND=
 ```
 
-## 启动
+可选配置说明：
 
-### Windows
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `FLASK_HOST` | `127.0.0.1` | 本地监听地址 |
+| `FLASK_PORT` | `5000` | Web 服务端口 |
+| `AUTO_OPEN_BROWSER` | `true` | 启动后自动打开浏览器 |
+| `AUTO_SHUTDOWN_ON_BROWSER_CLOSE` | `true` | 浏览器无心跳后自动退出 |
+| `ANALYSIS_MAX_WORKERS` | `4` | 趋势线冷计算进程上限，范围 1～4 |
+| `BROWSER_OPEN_COMMAND` | 空 | 自定义浏览器启动命令 |
+| `ALPACA_TRADING_BASE_URL` | Paper API | Alpaca 标的能力检测地址 |
+
+不要提交包含真实 Key 和 Secret 的 `.env`。
+
+### 2.5 启动
+
+Windows PowerShell：
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python app.py
 ```
 
-CMD：
+Windows CMD：
 
 ```cmd
 .venv\Scripts\activate.bat
 python app.py
 ```
 
-默认地址：
-
-```text
-http://127.0.0.1:5000
-```
-
-调试时不想自动打开浏览器：
-
-```powershell
-$env:AUTO_OPEN_BROWSER="false"
-python app.py
-```
-
-CMD：
-
-```cmd
-set AUTO_OPEN_BROWSER=false
-python app.py
-```
-
-### Linux / WSL
+Linux / WSL：
 
 ```bash
 source .venv/bin/activate
 python app.py
 ```
 
-调试时不想自动打开浏览器：
+默认访问地址：
+
+```text
+http://127.0.0.1:5000
+```
+
+调试时禁用自动打开浏览器：
+
+```powershell
+$env:AUTO_OPEN_BROWSER="false"
+python app.py
+```
 
 ```bash
 AUTO_OPEN_BROWSER=false python app.py
 ```
 
-## 配置
+## 3. 页面与使用方式
 
-`.env` 可配置：
+### 3.1 查看行情
 
-```env
-TWELVEDATA_API_KEY=your_api_key_here
-FLASK_HOST=127.0.0.1
-FLASK_PORT=5000
-AUTO_OPEN_BROWSER=true
-AUTO_SHUTDOWN_ON_BROWSER_CLOSE=true
-BROWSER_OPEN_COMMAND=
+查看行情页默认显示行情总览：
+
+- 点击任意行进入标的详情。
+- 点击列标题进行排序；在标的代码升序模式下可拖拽调整顺序。
+- 详情页的加号/勾选图标用于加入或移出总览。
+- 移出总览只改变显示与自动更新范围，不删除历史行情、分钟数据或指标配置。
+- 总览中的“自动更新”开关开启后，每 5 分钟执行一次行情同步。
+
+### 3.2 查询和更新单个标的
+
+查询框旁的“包含分钟数据”决定本次查询或手动更新是否处理分钟历史：
+
+- 数据库没有该标的日线时，首次查询自动获取 2020 年以来的日线。
+- 未勾选时，只读取或更新日线。
+- 勾选且 Alpaca 支持时：
+  - 没有完整分钟历史：从 2020 年开始初始化；
+  - 已有完整分钟历史：从最近数据附近增量更新。
+- Alpaca 不支持的标的只能使用日线，界面会给出提示。
+- 打开已有分钟数据的标的时，复选框默认勾选。
+- 详情页只保留一个更新图标，更新内容完全由复选框决定。
+
+每次进入标的详情默认回到 `1D` 周期。
+
+### 3.3 K 线交互
+
+- 拖拽图表平移，滚轮缩放。
+- 默认展示最近 150 根 K 线。
+- 分钟周期前端请求最新 300 根，再展示最近 150 根，避免 `1h`、`4h` 扫描过多历史。
+- 左轴显示价格，右轴显示相对当前视图首根开盘价的涨跌幅。
+- 光标命中蜡烛实体或影线时显示 OHLCV 浮层。
+- 支持夜间/日间主题。
+
+预设周期：
+
+| 分时 | 日线及以上 |
+| --- | --- |
+| `1m`、`15m`、`1h`、`4h` | `1D`、`3D`、`1W`、`1M` |
+
+自定义周期：
+
+- 分钟：1～390 分钟；
+- 日线：1～365 日；
+- 自定义视图首次使用时写入 `symbol_chart_views`。
+
+### 3.4 数据库浏览
+
+数据库浏览页当前分页读取主数据库中的业务表，支持：
+
+- 每页最多 50 行；
+- 跨当前表全部字段的文本搜索；
+- 页码跳转；
+- 选择备份主数据库、分钟数据库或两者。
+
+分钟数据库为大体量压缩库，目前不通过表格浏览器直接逐行展示，以免浏览器误加载大量
+分钟记录。
+
+## 4. 数据源与更新规则
+
+### 4.1 数据源优先级
+
+| 场景 | 数据源路由 |
+| --- | --- |
+| 首次获取日线 | Alpaca（支持时）→ Yahoo Finance → Twelve Data |
+| 总览批量同步 | Alpaca；失败或不支持的标的继续尝试 Yahoo，再尝试 Twelve Data |
+| 手动只更新日线 | Alpaca 支持时直接使用 Alpaca；不支持时按 Yahoo → Twelve Data |
+| 分钟历史 | 仅 Alpaca |
+
+`symbol_aliases` 保存公共代码、显示名称和不同供应商代码之间的映射，例如指数、收益率和
+贵金属可能在不同数据源中使用不同代码。
+
+### 4.2 启动与总览自动更新
+
+服务启动时立即启动一次后台同步，目标严格限定为当前显示在行情总览中的标的：
+
+- 总览内且已有完整分钟历史的 Alpaca 标的：增量更新分钟数据，再重建受影响日线；
+- 总览内但尚未初始化分钟历史的 Alpaca 标的：只更新日线，不自动下载多年分钟数据；
+- Alpaca 不支持的总览标的：按原有日线路由更新；
+- 不在总览中的标的：不会自动更新日线或分钟数据。
+
+页面的 5 分钟自动更新沿用同一范围和规则。单个标的失败不会中断其他标的，后续轮次可
+再次尝试。
+
+### 4.3 增量窗口
+
+- 日线和分钟增量更新都会回看最近 5 个自然日并按主键覆盖写入；
+- 正常交易周通常至少覆盖最近 2 个交易日，可修正未完成 K 线和迟到数据；
+- 分钟导入截止到当前 UTC 时间约 16 分钟前，并保留分钟精度；
+- 若检测到分钟库没有从 2020 年开始的完整历史，勾选分钟更新时会重新从 2020 年初始化；
+- 数据写入采用 UPSERT，可安全重复执行。
+
+### 4.4 Alpaca 限流与并发
+
+- 进程级安全上限为 150 次/分钟；
+- 请求会读取 Alpaca 返回的限流响应头，接近剩余额度时主动等待；
+- 单页最多 10,000 根；
+- 批量历史导入网络并发最多 2 个 worker；
+- 分钟数据库写入由进程内锁串行化；
+- 总览中的 Twelve Data 免费批量请求每轮最多处理 8 个供应商代码；
+- 免费延迟行情按约 15 分钟延迟使用，代码额外保留约 1 分钟缓冲。
+
+诊断接口只读取 Alpaca，不写数据库：
+
+```text
+GET /api/alpaca/stock-bars?symbol=GLD&timeframe=1Min&start=2020-01-02&end=2020-01-03&feed=sip&limit=1000&max_pages=1
 ```
 
-## 数据库
+`max_pages` 默认是 `1`，用于避免诊断请求意外下载多年数据。响应包含分页状态和 Alpaca
+限流响应头解析结果。
 
-SQLite 数据库文件：
+## 5. 分钟数据、聚合与时区
+
+### 5.1 存储和展示时区
+
+- Alpaca 原始分钟时间转换为 UTC epoch minute 存入分钟数据库；
+- 分钟 K 线展示和日线重建转换为 `America/New_York`；
+- Python `zoneinfo` 自动处理 EST（UTC-5）与 EDT（UTC-4）；
+- 分钟图仅使用美东常规交易时段 `09:30 <= time < 16:00`；
+- 从分钟数据生成的日线日期是美东交易日；
+- 行情总览的“更新时间”在前端转换为 `Asia/Shanghai` 显示；
+- 普通日线只有交易日期，不保存盘中时刻。
+
+分钟库会保存 Alpaca 返回的盘前盘后数据，但当前图表聚合和日线重建只使用常规交易时段。
+
+### 5.2 聚合规则
+
+- 分钟周期以美东交易日和 09:30 开盘为锚点分桶；
+- `1h`、`4h` 和自定义分钟 K 都从 1 分钟原始数据即时聚合；
+- `3D` 按连续日线行数聚合；
+- `1W` 按 ISO 周聚合；
+- `1M` 按自然月聚合；
+- OHLCV 规则为首根 Open、最高 High、最低 Low、末根 Close、成交量求和。
+
+当前不处理拆股、分红等复权。
+
+## 6. 双数据库设计
+
+数据库文件：
 
 ```text
 data/market_data.sqlite
+data/intraday_data.sqlite
 ```
 
-数据库备份文件会保存到：
+Schema：
+
+```text
+database/schema.sql
+database/intraday_schema.sql
+```
+
+启动时自动创建缺失表并执行兼容迁移。
+
+### 6.1 主数据库 `market_data.sqlite`
+
+主数据库保存业务配置、日线、指标和分析快照。
+
+| 表 | 作用 | 关键字段或约束 |
+| --- | --- | --- |
+| `symbols` | 标的主数据和界面设置 | `symbol` 唯一；总览显示、顺序、周末设置、Alpaca 能力 |
+| `daily_prices` | 日线 OHLCV | `UNIQUE(symbol, date)`；数据源、原周期、完整状态 |
+| `symbol_aliases` | 多数据源代码映射 | `common_symbol` 唯一；显示、Yahoo、Twelve Data 代码 |
+| `api_request_logs` | 数据源调用日志 | provider、symbol、状态、错误码、消息 |
+| `indicators` | 全局指标定义 | 指标类型和参数组合唯一 |
+| `symbol_chart_views` | 标的可用 K 线视图 | `UNIQUE(symbol_id, view_code)` |
+| `symbol_indicators` | 每个视图的指标配置 | 颜色、显隐、顺序；每视图同一指标唯一 |
+| `trendline_analysis_snapshots` | 趋势线完整结果和总览摘要 | 标的、周期、算法版本、数据指纹联合唯一 |
+
+关键字段说明：
+
+- `symbols.alpaca_supported`：`NULL` 未检测、`1` 支持、`0` 不支持；
+- `symbols.show_in_overview`：决定是否显示并参与自动行情更新；
+- `daily_prices.source_provider`：如 `alpaca`、`yahoo`、`twelvedata`；
+- `daily_prices.source_timeframe`：原始周期，分钟派生日线使用 `derived_1m`；
+- `daily_prices.is_complete`：标记当前日线是否完整；
+- `trendline_analysis_snapshots.payload_json`：完整分析结果；
+- `trendline_analysis_snapshots.summary_json`：行情总览使用的紧凑摘要。
+
+### 6.2 分钟数据库 `intraday_data.sqlite`
+
+分钟数据库专门保存大体量原始分钟历史和少量同步元数据。
+
+| 表 | 作用 | 关键字段或约束 |
+| --- | --- | --- |
+| `intraday_instruments` | 分钟标的字典 | 整数 ID、唯一 symbol、交易所时区 |
+| `minute_bars` | 1 分钟 OHLCV | `(instrument_id, minute_utc)` 复合主键 |
+| `minute_sync_state` | 每个标的同步状态 | 覆盖范围、行数、状态、最近成功和错误 |
+| `import_jobs` | 分页导入及断点续传 | 起止时间、page token、页数、行数和任务状态 |
+| `monthly_fingerprints` | 月度轻量质量快照 | 行数、首末分钟、16 字节摘要 |
+| `market_sessions` | 交易日历元数据表 | 开闭市 UTC 分钟和早收市标记；当前预留 |
+
+`minute_bars` 字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `instrument_id` | 对应 `intraday_instruments.id` |
+| `minute_utc` | UTC epoch minute |
+| `open_scaled` / `high_scaled` / `low_scaled` / `close_scaled` | 价格乘 `1,000,000` 后存整数 |
+| `volume` | 成交量整数 |
+| `trade_count` | 成交笔数，可为空 |
+| `vwap_scaled` | VWAP 缩放整数，可为空 |
+
+压缩和并发策略：
+
+- 价格使用百万分之一缩放整数，避免重复存储浮点文本；
+- `minute_bars` 和多个元数据表使用 `WITHOUT ROWID`；
+- SQLite page size 为 8192；
+- 使用 WAL、`synchronous=NORMAL` 和 30 秒 busy timeout；
+- 分钟写入使用单独的可重入锁；
+- 月度指纹用于低成本校验，不复制分钟数据。
+
+### 6.3 备份
+
+数据库浏览页可选择：
+
+- 仅主数据库；
+- 仅分钟数据库；
+- 两者同时备份。
+
+备份保存到：
 
 ```text
 data/backups/
 ```
 
-启动时会自动根据 `database/schema.sql` 创建缺失的数据表。
+分钟库备份前执行 WAL checkpoint；备份使用 SQLite Backup API，完成后执行
+`PRAGMA quick_check`。系统还会检查目标磁盘是否至少保留数据库总大小之外的 50 MiB
+空间。
 
-### symbols
+备份是用户点击按钮触发的快照，不是自动定时备份。
 
-标的表。
+## 7. 指标系统
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `id` | INTEGER | 主键 |
-| `symbol` | TEXT | 标的代码，唯一 |
-| `name` | TEXT | 标的名称 |
-| `exchange_name` | TEXT | 交易所名称 |
-| `currency` | TEXT | 计价货币 |
-| `show_weekend_data` | INTEGER | 是否显示周末 K 线 |
-| `show_in_overview` | INTEGER | 是否显示在行情总览 |
-| `display_order` | INTEGER | 行情总览显示顺序 |
-| `created_at` | TEXT | 创建时间 |
-| `updated_at` | TEXT | 更新时间 |
+当前支持：
 
-### daily_prices
+- `MA`：简单移动平均；
+- `EMA`：指数移动平均；
+- 周期范围 2～500；
+- 默认收藏 `EMA8`、`EMA13`、`MA20`；
+- 每个标的的每个 K 线视图最多同时设置 10 个指标；
+- 指标配置、颜色、显隐和顺序按“标的 + 视图”保存；
+- 指标基于当前视图的聚合 K 线重新计算，数据不足时不绘制对应线段。
 
-日线行情表。
+## 8. 智能趋势线分析
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `id` | INTEGER | 主键 |
-| `symbol` | TEXT | 标的代码 |
-| `date` | TEXT | 交易日期 |
-| `open` | REAL | 开盘价 |
-| `high` | REAL | 最高价 |
-| `low` | REAL | 最低价 |
-| `close` | REAL | 收盘价 |
-| `volume` | REAL | 成交量 |
-| `created_at` | TEXT | 创建时间 |
-| `updated_at` | TEXT | 更新时间 |
+智能分析目前只支持 `1D`、`3D`、`1W`、`1M`，默认分析最新 150 根 K 线。它寻找的是
+上涨行情下方的支撑线和下跌行情上方的压力线，而不是价格回归中轴。
 
-### trendline_analysis_snapshots
+主要行为：
 
-直线趋势线总览快照表。按标的、周期、算法版本和 K 线指纹保存完整识别结果、总览摘要与
-最新结构事件，程序重启后可以立即显示已经完成的标的，不需要等待整批重新计算。
+- 后台分析行情总览中的标的；
+- 快照按算法版本、周期、窗口、周末设置和数据指纹复用；
+- 冷计算最多使用 4 个进程，并至少为 Flask 和行情更新保留 1 个逻辑 CPU；
+- 子进程只读行情并计算，主进程串行写入 SQLite；
+- 单个标的失败不会中断整批；
+- 输出短期、中期、长期结构，以及趋势中、挑战中、已结束状态；
+- 每个趋势族最多保留一条主线和一条具有独立证据的阶段线；
+- 最终最多展示 6 条趋势线；
+- 总览摘要显示点位和最新事件，评分细节放在悬浮层。
 
-约束：`UNIQUE(symbol, date)`。
+核心算法包括 ATR 归一化、单侧包络拟合、多触点确认、实体穿越过滤、触点分布评分、
+跨层级几何去重和趋势族筛选。
 
-### api_request_logs
+详细说明：
 
-API 请求日志表。
+- [完整算法文档](docs/trendline_algorithm_complete.md)
+- [简明设计与案例](docs/trendline_algorithm.md)
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `id` | INTEGER | 主键 |
-| `provider` | TEXT | 数据源 |
-| `symbol` | TEXT | 标的代码 |
-| `status` | TEXT | 请求状态 |
-| `error_code` | TEXT | 错误码 |
-| `message` | TEXT | 日志消息 |
-| `created_at` | TEXT | 创建时间 |
+## 9. API 概览
 
-### indicators
+| 路径组 | 用途 |
+| --- | --- |
+| `/api/market-data` | 查询日线，可通过参数要求初始化分钟历史 |
+| `/api/market-data/update` | 根据“包含分钟数据”更新当前标的 |
+| `/api/market-bars` | 获取预设或自定义周期 K 线 |
+| `/api/market-overview/*` | 总览、排序、显隐、后台同步和状态 |
+| `/api/analysis/trendlines/*` | 单标的趋势线分析 |
+| `/api/analysis-overview/*` | 分析总览、快照和刷新状态 |
+| `/api/indicators/*` | 指标定义与收藏 |
+| `/api/symbols/*/chart-views/*` | 视图和标的指标配置 |
+| `/api/db/*` | 主库浏览和双数据库备份 |
+| `/api/alpaca/stock-bars` | Alpaca 只读诊断 |
+| `/api/session/*`、`/api/system/shutdown` | 心跳、关闭兜底和显式退出 |
 
-全局指标定义表。
+## 10. 导入、质量检查与测试
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `id` | INTEGER | 主键 |
-| `code` | TEXT | 指标代码，唯一 |
-| `name` | TEXT | 指标名称 |
-| `indicator_type` | TEXT | 指标类型，当前支持 `MA`、`EMA` |
-| `params_json` | TEXT | 指标参数 JSON |
-| `is_favorite` | INTEGER | 是否收藏 |
-| `description` | TEXT | 指标说明 |
-| `created_at` | TEXT | 创建时间 |
-| `updated_at` | TEXT | 更新时间 |
+### 10.1 分钟数据冒烟测试
 
-默认收藏指标：`EMA8`、`EMA13`、`MA20`。
-
-### symbol_chart_views
-
-标的 K 线视图表。
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `id` | INTEGER | 主键 |
-| `symbol_id` | INTEGER | 标的 ID |
-| `symbol` | TEXT | 标的代码 |
-| `view_code` | TEXT | 视图代码，如 `1D`、`3D`、`1W`、`1M` |
-| `period_type` | TEXT | 周期类型，如 `day`、`week`、`month` |
-| `period_value` | INTEGER | 周期数值 |
-| `name` | TEXT | 视图名称 |
-| `created_at` | TEXT | 创建时间 |
-| `updated_at` | TEXT | 更新时间 |
-
-默认视图：`1D`、`3D`、`1W`、`1M`。
-
-### symbol_indicators
-
-标的视图指标配置表。
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `id` | INTEGER | 主键 |
-| `symbol_id` | INTEGER | 标的 ID |
-| `symbol` | TEXT | 标的代码 |
-| `chart_view_id` | INTEGER | K 线视图 ID |
-| `view_code` | TEXT | 视图代码 |
-| `indicator_id` | INTEGER | 指标 ID |
-| `color` | TEXT | 指标线颜色 |
-| `visible` | INTEGER | 是否显示 |
-| `sort_order` | INTEGER | 排序 |
-| `created_at` | TEXT | 创建时间 |
-| `updated_at` | TEXT | 更新时间 |
-
-约束：`UNIQUE(symbol_id, view_code, indicator_id)`。
-
-## 指标说明
-
-- `MA`：简单移动平均线。
-- `EMA`：指数移动平均线。
-- 指标基于当前 K 线视图重新计算。
-- 数据不足时指标值为空，不绘制对应线段。
-
-## 智能趋势线分析
-
-程序启动后会在后台分析总览内全部标的的最新 150 根日 K。侧边栏打开“智能分析”
-会先显示四列 K 线分析总览：标的代码、最新价格、行情更新时间和直线趋势线摘要。计算
-期间页面持续显示完成数量、并行进程数和剩余数量；点击任意标的所在行进入其 K 线分析，已有快照会
-直接绘制。自动更新开关用于每 5 分钟检查并刷新分析结果。若算法版本、周期、窗口、
-周末设置和完整 K 线指纹均未变化，后台直接复用持久化快照，不重新执行趋势线搜索。
-
-批量刷新先在主进程逐个检查数据指纹，只把需要冷计算的标的交给进程池。进程池最多使用
-4 个进程，并至少为 Flask 和行情更新保留 1 个逻辑 CPU；任务不足或机器核心数较少时会
-自动降低并发数。子进程只读取行情并计算趋势线，快照统一由主进程按完成顺序串行写入
-SQLite，最终结果仍按总览标的顺序排列。单个标的计算失败不会中断其余任务。可通过环境
-变量 `ANALYSIS_MAX_WORKERS` 把上限调低到 `1`～`4`，设为 `1` 即使用串行冷计算。
-
-直线趋势线列优先显示仍有效或正在被挑战的主线和阶段线，并用简短事件标出今日确认、
-新增触点、进入挑战、重回趋势和今日结束。主表显示趋势线在最新 K 线处的点位；评分、
-触点数、形成日期、最近触点和 ATR 距离放在悬浮详情中。若直接显示的两条线都属于中期，
-按趋势首端到最新显示点位的完整时间跨度分别标为“中长期”和“中短期”。事件由同一次分析中的最近两根 K 线推断，
-不会为了总览再单独运行一次“前一天的 150 根 K 线”。
-
-点击第四列排序时，使用该行直接显示的前两条趋势中较高的评分。趋势结束和进入挑战使用
-红色提示；趋势形成和新增触点使用黄色提示；重回趋势使用绿色提示。
-
-也可以直接搜索标的并选择 K 线周期，再点击“智能识别”。算法输出的不是价格回归中轴，
-而是上涨行情的下侧支撑线或下跌行情的上侧压力线。
-
-智能分析每次打开时默认隐藏指标线和指标图例；点击图表工具栏的指标按钮后，本次分析才显示指标图例。该临时显示状态不会覆盖查看行情页面保存的指标可见性。
-
-当前算法的主要步骤：
-
-1. 使用 14 根滚动中位真实波幅（ATR）统一不同资产的价格距离。
-2. 以实体边缘为主、影线为辅构造支撑/压力参考点。
-3. 在多种长度和起止日期上拟合稳健的单侧分位包络，并补充显著市场枢轴两两连线。
-4. 分开评估影线穿越和实体穿越，连续 3 根实体被穿越时直接淘汰候选。
-5. 使用平滑序列定位结构盆地，再用原始锚点和上下对称的影线距离确认快速触线与拒绝。
-6. 入围后保持直线几何不变，补扫至最新 K 线或趋势结束前，将后续独立触点纳入证据。
-7. 结合触点跨度与分布，对首尾集中、中间悬空的结构连续减分。
-8. 分别使用短期推进分、中期趋势分和长期结构分筛选结果。
-9. 将长、中、短期结果统一比较，合并时间高度重叠且几何位置近似相同的重复线。
-10. 将解释同一段行情的相似线归为趋势族，保留主线及至多一条具有独立证据的阶段线。
-11. 将趋势线画成形成、确认和延伸三段；已结束线延长到反向突破或持续加速位置。
-
-每个独立有效触点会在线上显示一个小圆点。连续贴线的一簇只保留算法选出的代表触点，
-因此标记数量与悬浮详情中的有效触点数一致。
-
-对 150 根日 K，默认分层和主要门槛如下：
-
-| 层级 | 长度 | 默认分数门槛 | 主要结构要求 |
-| --- | ---: | ---: | --- |
-| 短期 | 7～15 | 64 | 至少2次触线，分布差时最高额外减8% |
-| 中期 | 16～49 | 70 | 至少2次触线，分布差时最高额外减14% |
-| 长期 | 50～150 | 55 | 至少3次触线，分布差时最高额外减16% |
-
-三次及以上独立触线会得到非线性加分；触点覆盖多个时间区段时继续加分。跨层级去重使用 ATR 归一化后的稳健距离分位数和共享时间比例，不会仅因日期重叠就删除前后错开的加速阶段。重复候选分数相差不超过 10 分时，优先保留有效触点跨度更长的一条。
-
-近水平线采用统一硬过滤：趋势线每20根移动不超过 `0.45 ATR`，且首末有效触点处的
-线价变化不超过10%时直接淘汰。10%只比较首末触点线价，不使用期间K线最高最低跨度。
-
-相似但不完全重合的同方向线还会进入趋势族筛选。主线优先考虑是否尚未结束，再综合评分、触点分布和结构跨度；阶段线必须至少包含 2 个主线不能解释的独立触点，与主线连续分离至少 8 根，且斜率差达到 25%。每个趋势族最多显示 1 条主线和 1 条阶段线。
-
-历史线距今超过 75 根时至少需要 78 分，超过 105 根时至少需要 80 分。状态只分为“趋势中”“挑战中”“已结束”：前两者延伸到最新 K 线，已结束线延伸到反向突破或持续加速位置。反向突破使用连续两根超过 0.30 ATR 或单根超过 0.80 ATR 的收盘确认；顺向远离达到 4.00 ATR、后续至少 3 根且始终未回到 1.50 ATR 内时，视为旧趋势被更快趋势替代。75 分以上使用实线，否则使用虚线。最终总共最多展示 6 条线。
-
-图表光标接近具体趋势线时会显示小型详情浮层，包含趋势状态、点位、触点日期和各项评分
-证据。OHLCV 浮层只在光标实际命中蜡烛实体或影线时出现，查看行情和智能分析共用该规则。
-
-完整的生产算法步骤、全部阈值、数学评价和等价性能优化讨论见
-[docs/trendline_algorithm_complete.md](docs/trendline_algorithm_complete.md)；较短的设计概览和
-验证案例见 [docs/trendline_algorithm.md](docs/trendline_algorithm.md)。
-
-运行快速单元测试：
+限制每个标的一页：
 
 ```bash
-python3 -m unittest tests.test_analysis_overview tests.test_trendline_analysis -v
+python -m scripts.validate_intraday_data \
+  --import-history \
+  --symbols GLD \
+  --max-pages 1 \
+  --workers 1
 ```
 
-运行模拟行情和数据库真实标的完整验证：
+### 10.2 完整分钟导入和质量验证
 
 ```bash
-python3 scripts/validate_trendline_algorithm.py
+python -m scripts.validate_intraday_data \
+  --import-history \
+  --symbols GLD SPY NVDA MU XLE \
+  --workers 1
 ```
 
-追加审计 SQLite 中的全部标的：
+脚本支持 page token 断点续传。完整导入后会：
+
+- 从常规交易时段分钟数据重建日线；
+- 检查 SQLite `quick_check`；
+- 检查 OHLC 合法性和负成交量；
+- 统计常规交易时段每日日志数量和最长缺口；
+- 检查 2020 年起点及最新覆盖；
+- 输出数据库大小和每行平均占用。
+
+只验证现有分钟库：
 
 ```bash
-python3 scripts/validate_trendline_algorithm.py --all-symbols
+python -m scripts.validate_intraday_data --symbols GLD SPY NVDA MU XLE
 ```
+
+### 10.3 趋势线验证
+
+快速单元测试：
+
+```bash
+python -m unittest tests.test_analysis_overview tests.test_trendline_analysis -v
+```
+
+模拟行情和数据库真实标的验证：
+
+```bash
+python scripts/validate_trendline_algorithm.py
+```
+
+审计 SQLite 中的全部标的：
+
+```bash
+python scripts/validate_trendline_algorithm.py --all-symbols
+```
+
+### 10.4 完整测试
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+当前测试覆盖 Alpaca 客户端与限流、分钟存储、断点续传、K 线聚合、数据源路由、接口、
+分析总览、并行调度和趋势线算法。
+
+## 11. 项目结构
+
+```text
+trade_robot/
+├── app.py                         # Flask 路由、后台任务和进程生命周期
+├── config.py                      # 环境变量、路径和限流配置
+├── database/
+│   ├── schema.sql                 # 主数据库 schema
+│   ├── intraday_schema.sql        # 分钟数据库 schema
+│   ├── db.py                      # 主库连接、迁移和双库备份
+│   ├── intraday_db.py             # 分钟库连接、WAL 和锁
+│   ├── repository.py              # 主数据库仓储
+│   └── intraday_repository.py     # 分钟数据库仓储
+├── services/
+│   ├── market_data_service.py     # 数据源路由和自动/手动更新
+│   ├── alpaca_data_client.py      # Alpaca 请求、分页、限流和错误转换
+│   ├── intraday_import_service.py # 分钟历史导入和断点续传
+│   ├── intraday_bar_service.py    # 分钟聚合、时区和日线重建
+│   ├── intraday_quality_service.py# 分钟数据质量检查
+│   ├── yahoo_finance_client.py    # Yahoo Finance 日线和快照
+│   ├── twelve_data_client.py      # Twelve Data 日线和批量请求
+│   ├── analysis_overview_service.py
+│   └── trendline_analysis_service.py
+├── static/
+│   ├── js/app.js                  # 页面状态、查询、更新和总览
+│   ├── js/chart.js                # Canvas K 线、指标和趋势线绘制
+│   ├── js/database_browser.js     # 主库浏览和备份交互
+│   └── css/app.css
+├── templates/index.html
+├── scripts/                       # 导入、质量验证、快照与诊断脚本
+├── tests/                         # unittest 测试
+└── docs/                          # 趋势线算法文档
+```
+
+## 12. 当前边界
+
+- 分钟历史仅支持 Alpaca 可识别的美股和 ETF；
+- 不在行情总览中的标的不会自动更新，但可以手动查询或更新；
+- 总览自动同步不会替未初始化标的下载 2020 年以来的分钟历史；
+- 趋势线智能识别暂不支持分钟周期；
+- 当前不处理复权；
+- 分钟图和分钟派生日线只使用美东常规交易时段；
+- `market_sessions` 已建立 schema，但尚未成为当前聚合流程的数据来源；
+- 数据库浏览器只分页展示主数据库，分钟库通过质量脚本检查；
+- 系统定位为本机单用户应用，不应直接暴露到公网。

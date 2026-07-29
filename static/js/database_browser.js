@@ -68,17 +68,35 @@ async function loadTablePage() {
 
 async function backupDatabase() {
   const button = document.getElementById("backup-db");
+  const targets = [];
+  if (document.getElementById("backup-main-db").checked) {
+    targets.push("main");
+  }
+  if (document.getElementById("backup-intraday-db").checked) {
+    targets.push("intraday");
+  }
+  if (!targets.length) {
+    setDbStatus("请至少选择一个要备份的数据库。", "error");
+    return;
+  }
   button.disabled = true;
   setDbStatus("正在备份数据库...", "neutral");
 
   try {
-    const response = await fetch("/api/db/backup", { method: "POST" });
+    const response = await fetch("/api/db/backup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targets }),
+    });
     const payload = await response.json();
     if (!payload.ok) {
       setDbStatus(payload.error?.message || "数据库备份失败。", "error");
       return;
     }
-    setDbStatus(`备份完成：${payload.path}`, "success");
+    const summary = (payload.backups || [])
+      .map((item) => `${item.target === "main" ? "主数据库" : "分钟数据库"}：${item.filename}`)
+      .join("；");
+    setDbStatus(`备份完成：${summary}`, "success");
   } catch (error) {
     setDbStatus("无法连接后端，数据库备份失败。", "error");
   } finally {
