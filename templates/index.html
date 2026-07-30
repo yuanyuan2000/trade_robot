@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260730-04') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260731-03') }}">
   </head>
   <body class="theme-dark">
     <aside class="sidebar">
@@ -24,6 +24,10 @@
         <button class="nav-item" type="button" data-view="market-view" data-mode="analysis">
           <span class="nav-icon">⌬</span>
           <span>智能分析</span>
+        </button>
+        <button class="nav-item" type="button" data-view="backtest-view">
+          <span class="nav-icon">↻</span>
+          <span>历史回测</span>
         </button>
         <button class="nav-item" type="button" data-view="database-view">
           <span class="nav-icon">▤</span>
@@ -72,7 +76,16 @@
           <div class="panel-title">
             <h3 id="overview-title">行情总览</h3>
             <div class="overview-title-actions">
-              <label class="switch-control" title="每5分钟刷新总览最新价格">
+              <button id="analysis-refresh-all" class="tool-icon-button" type="button"
+                title="更新全部趋势线分析" aria-label="更新全部趋势线分析" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20 6v5h-5" />
+                  <path d="M4 18v-5h5" />
+                  <path d="M6.1 9a7 7 0 0 1 11.5-2.6L20 9" />
+                  <path d="M17.9 15a7 7 0 0 1-11.5 2.6L4 15" />
+                </svg>
+              </button>
+              <label id="overview-live-control" class="switch-control" title="每5分钟刷新总览最新价格">
                 <input id="overview-live-toggle" type="checkbox">
                 <span class="switch-track" aria-hidden="true"></span>
                 <span id="overview-live-label" class="switch-label">自动更新</span>
@@ -211,6 +224,147 @@
         </aside>
       </section>
 
+      <section id="backtest-view" class="view">
+        <div id="backtest-list-page">
+          <header class="page-header">
+            <div>
+              <h2>历史回测</h2>
+              <p>设计、运行并审计历史策略</p>
+            </div>
+            <button id="backtest-new-strategy" type="button">新建策略</button>
+          </header>
+          <div id="backtest-status" class="status neutral">准备就绪</div>
+          <section class="panel backtest-list-panel">
+            <div class="panel-title">
+              <h3>已保存策略</h3>
+              <span id="backtest-strategy-count">加载中</span>
+            </div>
+            <div class="table-wrap">
+              <table id="backtest-strategy-table"></table>
+            </div>
+          </section>
+        </div>
+
+        <div id="backtest-workspace" hidden>
+          <header class="backtest-toolbar">
+            <div class="backtest-toolbar-primary">
+              <button id="backtest-back" class="tool-icon-button" type="button" title="返回策略列表" aria-label="返回策略列表">←</button>
+              <input id="backtest-strategy-name" class="backtest-name-input" type="text" maxlength="100" aria-label="策略名称">
+              <span id="backtest-mode-badge" class="backtest-badge"></span>
+            </div>
+            <div class="backtest-toolbar-actions">
+              <button id="backtest-save" type="button">保存</button>
+              <button id="backtest-validate" type="button">验证</button>
+              <button id="backtest-settings" type="button">设置</button>
+              <button id="backtest-run" class="primary-action" type="button">运行</button>
+              <button id="backtest-cancel" class="danger-action" type="button" hidden>取消</button>
+            </div>
+          </header>
+          <div id="backtest-workspace-status" class="status neutral">请选择策略配置并保存</div>
+
+          <div class="backtest-grid">
+            <section class="panel backtest-designer">
+              <div class="panel-title">
+                <h3>策略设计</h3>
+                <span id="backtest-revision"></span>
+              </div>
+              <div class="backtest-designer-scroll">
+                <label class="backtest-field">
+                  <span>策略说明</span>
+                  <textarea id="backtest-description" rows="2" placeholder="说明策略目标和适用范围"></textarea>
+                </label>
+
+                <section class="backtest-editor-section">
+                  <div class="backtest-section-title">
+                    <h4>标的与仓位上限</h4>
+                    <button id="backtest-add-symbol" type="button">添加标的</button>
+                  </div>
+                  <p id="backtest-selection-help" class="backtest-help"></p>
+                  <div id="backtest-symbols" class="backtest-stack"></div>
+                </section>
+
+                <section id="backtest-visual-editor" class="backtest-editor-section">
+                  <div class="backtest-section-title">
+                    <h4>交易规则</h4>
+                    <button id="backtest-add-rule" type="button">添加规则</button>
+                  </div>
+                  <p class="backtest-help">具体时间使用美东时间；信号读取上一根完整分钟，并按目标分钟开盘价成交。</p>
+                  <div id="backtest-rules" class="backtest-stack"></div>
+                </section>
+
+                <section id="backtest-competition-editor" class="backtest-editor-section" hidden>
+                  <h4>竞争选标</h4>
+                  <label class="backtest-field">
+                    <span>候选条件</span>
+                    <input id="backtest-competition-eligibility" type="text" placeholder="price > ma(20)">
+                  </label>
+                  <label class="backtest-field">
+                    <span>评分公式</span>
+                    <input id="backtest-competition-score" type="text" placeholder="(price - close(5)) / atr(5)">
+                  </label>
+                  <div class="backtest-inline-fields">
+                    <label class="backtest-field">
+                      <span>检查时间</span>
+                      <input id="backtest-competition-when" type="text" value="OPEN">
+                    </label>
+                    <label class="backtest-field">
+                      <span>胜出仓位 %</span>
+                      <input id="backtest-competition-weight" type="number" min="0.01" max="100" step="0.01">
+                    </label>
+                    <label class="backtest-check-field">
+                      <input id="backtest-competition-cash" type="checkbox">
+                      <span>无合格标的时空仓</span>
+                    </label>
+                  </div>
+                </section>
+
+                <section id="backtest-code-editor" class="backtest-editor-section" hidden>
+                  <h4 id="backtest-code-title">代码策略参数</h4>
+                  <p id="backtest-code-description" class="backtest-help"></p>
+                  <div id="backtest-code-params" class="backtest-stack"></div>
+                </section>
+
+                <section class="backtest-editor-section">
+                  <h4>历史运行</h4>
+                  <div id="backtest-run-history" class="backtest-run-history"></div>
+                </section>
+              </div>
+            </section>
+
+            <section class="panel backtest-results">
+              <div id="backtest-metrics" class="backtest-metrics">
+                <div class="backtest-empty">运行后显示关键指标</div>
+              </div>
+              <div class="backtest-chart-wrap">
+                <canvas id="backtest-equity-chart"></canvas>
+                <div id="backtest-chart-empty" class="backtest-chart-empty">等待回测结果</div>
+              </div>
+              <div id="backtest-trade-summary" class="backtest-trade-summary"></div>
+            </section>
+
+            <section class="panel backtest-log-panel">
+              <div class="backtest-log-toolbar">
+                <div>
+                  <h3>日志输出</h3>
+                  <span id="backtest-log-count">0 条</span>
+                </div>
+                <div class="backtest-log-actions">
+                  <select id="backtest-log-level" aria-label="日志级别">
+                    <option value="DEBUG">DEBUG</option>
+                    <option value="INFO" selected>INFO</option>
+                    <option value="ERROR">ERROR</option>
+                  </select>
+                  <button id="backtest-download-log" type="button">下载日志</button>
+                </div>
+              </div>
+              <div id="backtest-log-output" class="backtest-log-output">
+                <div class="backtest-empty">暂无日志</div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </section>
+
       <section id="database-view" class="view">
         <header class="page-header">
           <div>
@@ -261,8 +415,91 @@
       </section>
     </main>
 
+    <dialog id="backtest-create-dialog" class="backtest-dialog">
+      <form id="backtest-create-form">
+        <div class="backtest-dialog-header">
+          <h3>新建策略</h3>
+          <button type="button" data-close-dialog="backtest-create-dialog">×</button>
+        </div>
+        <label class="backtest-field">
+          <span>策略名称</span>
+          <input id="backtest-create-name" type="text" maxlength="100" required value="新策略">
+        </label>
+        <label class="backtest-field">
+          <span>选标模式</span>
+          <select id="backtest-create-selection">
+            <option value="single">single</option>
+            <option value="distribution">distribution</option>
+            <option value="competition">competition</option>
+          </select>
+        </label>
+        <div class="backtest-dialog-actions">
+          <button type="button" data-close-dialog="backtest-create-dialog">取消</button>
+          <button class="primary-action" type="submit">创建</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="backtest-settings-dialog" class="backtest-dialog backtest-settings-dialog">
+      <form id="backtest-settings-form">
+        <div class="backtest-dialog-header">
+          <h3>回测运行设置</h3>
+          <button type="button" data-close-dialog="backtest-settings-dialog">×</button>
+        </div>
+        <div class="backtest-settings-grid">
+          <label class="backtest-field">
+            <span>开始日期</span>
+            <input id="backtest-start-date" type="date" required>
+          </label>
+          <label class="backtest-field">
+            <span>结束日期</span>
+            <input id="backtest-end-date" type="date" required>
+          </label>
+          <label class="backtest-field">
+            <span>初始资金</span>
+            <input id="backtest-initial-capital" type="number" min="0.01" step="0.01" required>
+          </label>
+          <label class="backtest-field">
+            <span>每股手续费</span>
+            <input id="backtest-commission-share" type="number" min="0" step="0.0001" required>
+          </label>
+          <label class="backtest-field">
+            <span>每笔最低手续费</span>
+            <input id="backtest-minimum-commission" type="number" min="0" step="0.01" required>
+          </label>
+          <label class="backtest-field">
+            <span>滑点（基点）</span>
+            <input id="backtest-slippage" type="number" min="0" max="1000" step="0.01" required>
+          </label>
+          <label class="backtest-field">
+            <span>比较基准</span>
+            <select id="backtest-benchmark">
+              <option value="none">无</option>
+              <option value="SPY">SPY</option>
+              <option value="GLD">GLD</option>
+              <option value="auto">自动</option>
+            </select>
+          </label>
+          <label class="backtest-field">
+            <span>无风险年化利率</span>
+            <input id="backtest-risk-free" type="number" min="-1" max="1" step="0.001">
+          </label>
+          <label class="backtest-check-field">
+            <input id="backtest-fractional" type="checkbox">
+            <span>允许碎股（默认关闭）</span>
+          </label>
+        </div>
+        <p class="backtest-help">手续费按每笔 max(股数×每股手续费, 最低手续费) 计算；买卖双边收取。滑点会分别抬高买价、压低卖价。</p>
+        <div class="backtest-dialog-actions">
+          <button type="button" data-close-dialog="backtest-settings-dialog">取消</button>
+          <button class="primary-action" type="submit">保存设置</button>
+        </div>
+      </form>
+    </dialog>
+
     <script src="{{ url_for('static', filename='js/chart.js', v='20260730-04') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260730-02') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260730-04') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest.js', v='20260731-03') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260731-03') }}"></script>
   </body>
 </html>

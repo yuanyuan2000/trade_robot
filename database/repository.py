@@ -1115,17 +1115,25 @@ def upsert_daily_prices(
     return len(payload)
 
 
-def get_daily_prices(symbol: str, start_date: str | None = None) -> list[dict]:
+def get_daily_prices(
+    symbol: str,
+    start_date: str | None = None,
+    *,
+    include_metadata: bool = False,
+) -> list[dict]:
     params: list[str] = [symbol]
     where = "symbol = ?"
     if start_date:
         where += " AND date >= ?"
         params.append(start_date)
+    fields = "date, open, high, low, close, volume"
+    if include_metadata:
+        fields += ", source_provider, source_timeframe, is_complete, updated_at"
 
     with get_connection() as conn:
         rows = conn.execute(
             f"""
-            SELECT date, open, high, low, close, volume
+            SELECT {fields}
             FROM daily_prices
             WHERE {where}
             ORDER BY date ASC

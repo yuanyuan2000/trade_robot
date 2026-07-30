@@ -1,0 +1,829 @@
+from __future__ import annotations
+
+from datetime import date, timedelta
+import math
+import unittest
+from unittest.mock import patch
+
+from services.backtest.code_strategies import RapidDropAtrRotationStrategy
+from services.backtest.data import (
+    HistoricalDataSet,
+    _epoch_minute,
+    _validate_bar,
+    load_historical_dataset,
+)
+from services.backtest.dsl import compile_expression
+from services.backtest.engine import BacktestEngine
+from services.backtest.errors import BacktestValidationError
+from services.backtest.metrics import calculate_metrics
+from services.backtest.portfolio import OrderIntent, Portfolio
+from services.backtest.validation import (
+    validate_settings,
+    validate_strategy_payload,
+)
+
+
+def business_dates(start: str, count: int) -> list[str]:
+    current = date.fromisoformat(start)
+    result = []
+    while len(result) < count:
+        if current.weekday() < 5:
+            result.append(current.isoformat())
+        current += timedelta(days=1)
+    return result
+
+
+def daily_rows(
+    dates: list[str],
+    closes: list[float],
+    *,
+    opens: list[float] | None = None,
+) -> list[dict]:
+    opens = opens or closes
+    return [
+        {
+            "date": trading_date,
+            "open": opens[index],
+            "high": max(opens[index], closes[index]) + 1,
+            "low": min(opens[index], closes[index]) - 1,
+            "close": closes[index],
+            "volume": 1000,
+        }
+        for index, trading_date in enumerate(dates)
+    ]
+
+
+def visual_strategy(
+    *,
+    rule: dict,
+    symbols: list[dict] | None = None,
+    selection_mode: str = "single",
+) -> dict:
+    return {
+        "name": "测试策略",
+        "design_mode": "visual",
+        "selection_mode": selection_mode,
+        "definition": {
+            "symbols": symbols or [{"symbol": "SPY", "max_weight": 100}],
+            "rules": [
+                {
+                    "id": "test-rule",
+                    "name": "测试规则",
+                    "enabled": True,
+                    "priority": 10,
+                    "action": "BUY",
+                    "sizing_mode": "TARGET",
+                    "value": 100,
+                    "condition": "true",
+                    "when": "OPEN",
+                    **rule,
+                }
+            ],
+        },
+        "default_settings": {},
+    }
+
+
+def settings(start: str, end: str, **overrides) -> dict:
+    return {
+        "start_date": start,
+        "end_date": end,
+        "initial_capital": 10_000,
+        "commission_per_share": 0,
+        "minimum_commission": 0,
+        "slippage_bps": 0,
+        "allow_fractional_shares": False,
+        "benchmark": "none",
+        "risk_free_rate": 0,
+        "strict_data": True,
+        **overrides,
+    }
+
+
+class DslSafetyTests(unittest.TestCase):
+    def test_expression_supports_boolean_arithmetic_and_history(self) -> None:
+        expression = compile_expression(
+            "price > ma(20) AND (position <= 0.5 OR close(1) = open(1))"
+        )
+        self.assertEqual(expression.max_lookback, 20)
+
+    def test_expression_rejects_zero_lookback_and_arbitrary_code(self) -> None:
+        with self.assertRaises(BacktestValidationError):
+            compile_expression("close(0) > 1")
+        with self.assertRaises(BacktestValidationError):
+            compile_expression("__import__('os').system('whoami')")
+        with self.assertRaises(BacktestValidationError):
+            compile_expression("price.__class__")
+
+    def test_non_finite_numbers_and_invalid_bars_are_rejected(self) -> None:
+        with self.assertRaises(BacktestValidationError):
+            validate_settings({"initial_capital": math.nan})
+        with self.assertRaises(BacktestValidationError):
+            validate_settings({"strict_data": False})
+        payload = visual_strategy(
+            rule={},
+            symbols=[{"symbol": "SPY", "max_weight": math.inf}],
+        )
+        with self.assertRaises(BacktestValidationError):
+            validate_strategy_payload(payload)
+        issue = _validate_bar(
+            {
+                "date": "2024-01-02",
+                "open": 10,
+                "high": math.inf,
+                "low": 9,
+                "close": 10,
+                "volume": 100,
+            },
+            symbol="SPY",
+            granularity="daily",
+        )
+        self.assertIn("NaN", issue["reason"])
+
+    def test_code_strategy_times_must_be_valid_and_ordered(self) -> None:
+        with self.assertRaises(BacktestValidationError):
+            RapidDropAtrRotationStrategy.validate_params(
+                {"risk_check_time": "25:00"}
+            )
+        with self.assertRaises(BacktestValidationError):
+            RapidDropAtrRotationStrategy.validate_params(
+                {
+                    "risk_check_time": "10:00",
+                    "selection_time": "09:40",
+                }
+            )
+
+
+class DataPreflightTests(unittest.TestCase):
+    def _session(self) -> dict:
+        return {
+            "trading_date": "2024-01-02",
+            "open_minute_utc": _epoch_minute("2024-01-02", "09:30"),
+            "close_minute_utc": _epoch_minute("2024-01-02", "16:00"),
+            "is_early_close": False,
+        }
+
+    @patch(
+        "services.backtest.data.ensure_market_sessions"
+    )
+    @patch(
+        "services.backtest.data.repository.get_daily_prices"
+    )
+    def test_incomplete_daily_bar_fails_closed(
+        self,
+        get_daily,
+        get_sessions,
+    ) -> None:
+        get_sessions.return_value = [self._session()]
+        rows = daily_rows(
+            ["2024-01-01", "2024-01-02"],
+            [10, 11],
+        )
+        rows[-1]["is_complete"] = 0
+        get_daily.return_value = rows
+
+        with self.assertRaisesRegex(Exception, "日线数据"):
+            load_historical_dataset(
+                universe=["SPY"],
+                additional_symbols=[],
+                start_date="2024-01-02",
+                end_date="2024-01-02",
+                intraday_events=[],
+                minimum_lookback=1,
+            )
+
+    @patch(
+        "services.backtest.data.ensure_corporate_actions",
+        return_value=[],
+    )
+    @patch(
+        "services.backtest.data.ensure_market_sessions"
+    )
+    @patch(
+        "services.backtest.data.repository.get_daily_prices"
+    )
+    def test_loaded_snapshot_has_reproducible_hashes(
+        self,
+        get_daily,
+        get_sessions,
+        _get_actions,
+    ) -> None:
+        get_sessions.return_value = [self._session()]
+        rows = daily_rows(
+            ["2024-01-01", "2024-01-02"],
+            [10, 11],
+        )
+        for row in rows:
+            row["is_complete"] = 1
+        get_daily.return_value = rows
+
+        dataset = load_historical_dataset(
+            universe=["SPY"],
+            additional_symbols=[],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+            intraday_events=[],
+            minimum_lookback=1,
+        )
+
+        self.assertEqual(len(dataset.manifest["symbols"]["SPY"]["daily_sha256"]), 64)
+        self.assertEqual(len(dataset.manifest["market_calendar_sha256"]), 64)
+
+
+class PortfolioAccountingTests(unittest.TestCase):
+    def test_round_trip_cash_and_fifo_pnl_include_both_commissions(self) -> None:
+        portfolio = Portfolio(
+            1000,
+            commission_per_share=0,
+            minimum_commission=1,
+            slippage_bps=0,
+        )
+        buy = portfolio.execute(
+            OrderIntent("SPY", "BUY", "TARGET", 100, "buy"),
+            reference_price=10,
+            marks={"SPY": 10},
+            event_time="2024-01-02 OPEN",
+        )
+        sell = portfolio.execute(
+            OrderIntent("SPY", "SELL", "TARGET", 0, "sell"),
+            reference_price=12,
+            marks={"SPY": 12},
+            event_time="2024-01-03 OPEN",
+        )
+
+        self.assertEqual(buy["quantity"], 99)
+        self.assertAlmostEqual(float(portfolio.cash), 1196.0, places=8)
+        self.assertAlmostEqual(sell["realized_pnl"], 196.0, places=8)
+        self.assertAlmostEqual(float(portfolio.total_commission), 2.0, places=8)
+
+    def test_slippage_changes_fill_cash_and_realized_pnl_exactly(self) -> None:
+        portfolio = Portfolio(
+            1000,
+            commission_per_share=0.01,
+            minimum_commission=1,
+            slippage_bps=100,
+        )
+        buy = portfolio.execute(
+            OrderIntent("SPY", "BUY", "TARGET", 50, "buy"),
+            reference_price=10,
+            marks={"SPY": 10},
+            event_time="2024-01-02 10:00",
+        )
+        sell = portfolio.execute(
+            OrderIntent("SPY", "SELL", "TARGET", 0, "sell"),
+            reference_price=12,
+            marks={"SPY": 12},
+            event_time="2024-01-03 10:00",
+        )
+
+        self.assertEqual(buy["quantity"], 49)
+        self.assertAlmostEqual(buy["fill_price"], 10.1, places=8)
+        self.assertAlmostEqual(sell["fill_price"], 11.88, places=8)
+        self.assertAlmostEqual(float(portfolio.cash), 1085.22, places=8)
+        self.assertAlmostEqual(sell["realized_pnl"], 85.22, places=8)
+        self.assertAlmostEqual(float(portfolio.total_slippage), 10.78, places=8)
+
+    def test_invalid_negative_target_is_rejected_instead_of_clipped(self) -> None:
+        portfolio = Portfolio(1000)
+        with self.assertRaises(Exception):
+            portfolio.execute(
+                OrderIntent("SPY", "SELL", "DELTA", 10, "invalid"),
+                reference_price=10,
+                marks={"SPY": 10},
+                event_time="2024-01-02 OPEN",
+            )
+
+    def test_commission_adjusted_quantity_never_exceeds_target_weight(self) -> None:
+        portfolio = Portfolio(1000, minimum_commission=1)
+        trade = portfolio.execute(
+            OrderIntent("SPY", "BUY", "TARGET", 50, "target"),
+            reference_price=10,
+            marks={"SPY": 10},
+            event_time="2024-01-02 OPEN",
+        )
+        self.assertEqual(trade["quantity"], 49)
+        self.assertLessEqual(trade["position_weight_after"], 0.5)
+
+    def test_risk_metrics_include_first_session_return_from_initial_cash(self) -> None:
+        points = [
+            {
+                "trading_date": "2024-01-02",
+                "equity": 90,
+                "positions_value": 90,
+                "benchmark_return_rate": None,
+            },
+            {
+                "trading_date": "2024-01-03",
+                "equity": 90,
+                "positions_value": 90,
+                "benchmark_return_rate": None,
+            },
+        ]
+
+        metrics = calculate_metrics(
+            points,
+            [],
+            initial_capital=100,
+        )
+
+        self.assertGreater(metrics["annualized_volatility"], 0)
+        self.assertAlmostEqual(metrics["max_drawdown"], 0.1, places=12)
+
+    def test_fractional_binary_sizing_handles_large_minimum_commission(self) -> None:
+        portfolio = Portfolio(
+            1000,
+            minimum_commission=100,
+            allow_fractional_shares=True,
+        )
+        trade = portfolio.execute(
+            OrderIntent("SPY", "BUY", "TARGET", 100, "target"),
+            reference_price=10,
+            marks={"SPY": 10},
+            event_time="2024-01-02 OPEN",
+        )
+        self.assertAlmostEqual(trade["quantity"], 90, places=6)
+        self.assertAlmostEqual(float(portfolio.cash), 0, places=6)
+
+    def test_sell_target_accounts_for_commission_reducing_equity(self) -> None:
+        portfolio = Portfolio(1000, minimum_commission=100)
+        portfolio.execute(
+            OrderIntent("SPY", "BUY", "TARGET", 100, "buy"),
+            reference_price=10,
+            marks={"SPY": 10},
+            event_time="2024-01-02 OPEN",
+        )
+
+        trade = portfolio.execute(
+            OrderIntent("SPY", "SELL", "TARGET", 50, "rebalance"),
+            reference_price=10,
+            marks={"SPY": 10},
+            event_time="2024-01-03 OPEN",
+        )
+
+        self.assertEqual(trade["quantity"], 50)
+        self.assertLessEqual(trade["position_weight_after"], 0.5)
+
+
+class EngineTimingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dates = business_dates("2023-11-01", 25)
+        self.run_dates = self.dates[-3:]
+        closes = [10.0] * 21 + [11.0, 12.0, 13.0, 14.0]
+        opens = [10.0] * 22 + [20.0, 21.0, 22.0]
+        self.daily = daily_rows(self.dates, closes, opens=opens)
+
+    def test_open_rule_reads_previous_close_and_fills_current_open(self) -> None:
+        dataset = HistoricalDataSet(
+            daily={"SPY": self.daily},
+            sessions=self.run_dates,
+        )
+        strategy = visual_strategy(
+            rule={"condition": "price > ma(20)", "when": "OPEN"}
+        )
+
+        result = BacktestEngine(
+            strategy,
+            settings(self.run_dates[0], self.run_dates[-1]),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0]["reference_price"], 20.0)
+        self.assertEqual(result.trades[0]["fill_price"], 20.0)
+        self.assertEqual(result.trades[0]["quantity"], 500)
+
+    def test_close_signal_never_fills_same_close(self) -> None:
+        dataset = HistoricalDataSet(
+            daily={"SPY": self.daily},
+            sessions=self.run_dates,
+        )
+        strategy = visual_strategy(
+            rule={"condition": "price > close(1)", "when": "CLOSE"}
+        )
+
+        result = BacktestEngine(
+            strategy,
+            settings(self.run_dates[0], self.run_dates[-1]),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0]["event_time"], f"{self.run_dates[1]} 09:30 America/New_York")
+        self.assertEqual(result.trades[0]["reference_price"], 21.0)
+        self.assertNotEqual(result.trades[0]["reference_price"], 13.0)
+
+    def test_intraday_signal_uses_previous_minute_and_current_open(self) -> None:
+        first = self.run_dates[0]
+        previous = _epoch_minute(first, "09:40") - 1
+        current = previous + 1
+        minute = {
+            previous: {
+                "open": 10,
+                "high": 12,
+                "low": 9,
+                "close": 11,
+            },
+            current: {
+                "open": 20,
+                "high": 999,
+                "low": 1,
+                "close": 999,
+            },
+        }
+        dataset = HistoricalDataSet(
+            daily={"SPY": self.daily},
+            sessions=[first],
+            minute={"SPY": minute},
+            required_intraday_events=["09:40"],
+        )
+        strategy = visual_strategy(
+            rule={"condition": "price = 11", "when": "09:40"}
+        )
+
+        result = BacktestEngine(
+            strategy,
+            settings(first, first),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0]["reference_price"], 20.0)
+        self.assertEqual(result.trades[0]["quantity"], 500)
+
+    def test_explicit_0930_requires_minute_data_unlike_open(self) -> None:
+        dataset = HistoricalDataSet(
+            daily={"SPY": self.daily},
+            sessions=self.run_dates,
+        )
+        strategy = visual_strategy(
+            rule={"condition": "true", "when": "09:30"}
+        )
+
+        with self.assertRaisesRegex(Exception, "上一分钟行情"):
+            BacktestEngine(
+                strategy,
+                settings(self.run_dates[0], self.run_dates[-1]),
+                dataset=dataset,
+            ).run()
+
+    def test_changing_current_minute_future_values_does_not_change_order(self) -> None:
+        first = self.run_dates[0]
+        previous = _epoch_minute(first, "09:40") - 1
+        current = previous + 1
+        trades = []
+        for future_close in (21, 9999):
+            dataset = HistoricalDataSet(
+                daily={"SPY": self.daily},
+                sessions=[first],
+                minute={
+                    "SPY": {
+                        previous: {"open": 10, "high": 11, "low": 9, "close": 11},
+                        current: {
+                            "open": 20,
+                            "high": future_close,
+                            "low": 1,
+                            "close": future_close,
+                        },
+                    }
+                },
+                required_intraday_events=["09:40"],
+            )
+            strategy = visual_strategy(
+                rule={"condition": "price > 10", "when": "09:40"}
+            )
+            result = BacktestEngine(
+                strategy,
+                settings(first, first),
+                dataset=dataset,
+            ).run()
+            trades.append(result.trades)
+
+        self.assertEqual(trades[0], trades[1])
+
+
+class CorporateActionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dates = business_dates("2023-11-01", 24)
+        self.run_dates = self.dates[-3:]
+
+    def test_forward_split_adjusts_position_and_history_without_equity_jump(self) -> None:
+        closes = [100.0] * 22 + [50.0, 50.0]
+        opens = list(closes)
+        action = {
+            "provider_id": "split-1",
+            "action_type": "forward_split",
+            "symbol": "SPY",
+            "process_date": self.run_dates[1],
+            "ex_date": self.run_dates[1],
+            "old_rate": 1,
+            "new_rate": 2,
+        }
+        dataset = HistoricalDataSet(
+            daily={"SPY": daily_rows(self.dates, closes, opens=opens)},
+            sessions=self.run_dates,
+            corporate_actions=[action],
+        )
+        strategy = visual_strategy(rule={"condition": "true", "when": "OPEN"})
+
+        result = BacktestEngine(
+            strategy,
+            settings(self.run_dates[0], self.run_dates[-1]),
+            dataset=dataset,
+        ).run()
+
+        second = result.equity_points[1]
+        self.assertEqual(second["positions"]["SPY"]["quantity"], 200)
+        self.assertAlmostEqual(second["equity"], 10_000, places=8)
+        context = dataset.expression_context(
+            symbol="SPY",
+            trading_date=self.run_dates[1],
+            event="OPEN",
+            price=50,
+            position=1,
+        )
+        self.assertAlmostEqual(context.resolve_function("close", 1), 50, places=8)
+
+    def test_cash_dividend_is_receivable_then_cash_without_equity_loss(self) -> None:
+        closes = [100.0] * 22 + [99.0, 99.0]
+        opens = list(closes)
+        action = {
+            "provider_id": "dividend-1",
+            "action_type": "cash_dividend",
+            "symbol": "SPY",
+            "process_date": self.run_dates[1],
+            "ex_date": self.run_dates[1],
+            "payable_date": self.run_dates[2],
+            "cash_rate": 1,
+        }
+        dataset = HistoricalDataSet(
+            daily={"SPY": daily_rows(self.dates, closes, opens=opens)},
+            sessions=self.run_dates,
+            corporate_actions=[action],
+        )
+        strategy = visual_strategy(rule={"condition": "true", "when": "OPEN"})
+
+        result = BacktestEngine(
+            strategy,
+            settings(self.run_dates[0], self.run_dates[-1]),
+            dataset=dataset,
+        ).run()
+
+        self.assertAlmostEqual(result.equity_points[1]["receivables"], 100, places=8)
+        self.assertAlmostEqual(result.equity_points[1]["equity"], 10_000, places=8)
+        self.assertAlmostEqual(result.equity_points[2]["receivables"], 0, places=8)
+        self.assertAlmostEqual(result.equity_points[2]["cash"], 1, places=8)
+        self.assertEqual(
+            result.equity_points[2]["positions"]["SPY"]["quantity"],
+            101,
+        )
+        self.assertAlmostEqual(result.equity_points[2]["equity"], 10_000, places=8)
+
+    def test_reverse_split_fraction_fails_without_cash_in_lieu_data(self) -> None:
+        portfolio = Portfolio(1000, allow_fractional_shares=False)
+        portfolio.execute(
+            OrderIntent("SPY", "BUY", "TARGET", 100, "buy"),
+            reference_price=30,
+            marks={"SPY": 30},
+            event_time="2024-01-02 OPEN",
+        )
+
+        with self.assertRaisesRegex(Exception, "现金替代"):
+            portfolio.apply_corporate_actions(
+                [
+                    {
+                        "symbol": "SPY",
+                        "action_type": "reverse_split",
+                        "old_rate": 10,
+                        "new_rate": 1,
+                    }
+                ],
+                trading_date="2024-01-03",
+            )
+
+
+class StrategyModeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dates = business_dates("2023-10-02", 12)
+        self.run_dates = self.dates[-2:]
+
+    def test_distribution_allocates_independent_capped_positions(self) -> None:
+        dataset = HistoricalDataSet(
+            daily={
+                "SPY": daily_rows(self.dates, [10.0] * len(self.dates)),
+                "GLD": daily_rows(self.dates, [20.0] * len(self.dates)),
+            },
+            sessions=self.run_dates,
+        )
+        strategy = visual_strategy(
+            rule={"condition": "true", "value": 50},
+            symbols=[
+                {"symbol": "SPY", "max_weight": 50},
+                {"symbol": "GLD", "max_weight": 50},
+            ],
+            selection_mode="distribution",
+        )
+
+        result = BacktestEngine(
+            strategy,
+            settings(self.run_dates[0], self.run_dates[-1]),
+            dataset=dataset,
+        ).run()
+
+        positions = result.equity_points[0]["positions"]
+        self.assertEqual(positions["SPY"]["quantity"], 500)
+        self.assertEqual(positions["GLD"]["quantity"], 250)
+        self.assertAlmostEqual(positions["SPY"]["weight"], 0.5, places=8)
+        self.assertAlmostEqual(positions["GLD"]["weight"], 0.5, places=8)
+
+    def test_competition_sells_old_winner_before_buying_new_winner(self) -> None:
+        spy_closes = [10.0] * 10 + [30.0, 30.0]
+        gld_closes = [20.0] * len(self.dates)
+        dataset = HistoricalDataSet(
+            daily={
+                "SPY": daily_rows(self.dates, spy_closes),
+                "GLD": daily_rows(self.dates, gld_closes),
+            },
+            sessions=self.run_dates,
+        )
+        strategy = {
+            "name": "竞争测试",
+            "design_mode": "visual",
+            "selection_mode": "competition",
+            "definition": {
+                "symbols": [
+                    {"symbol": "SPY", "max_weight": 100},
+                    {"symbol": "GLD", "max_weight": 100},
+                ],
+                "rules": [
+                    {
+                        "id": "never-hold",
+                        "name": "不触发风险规则",
+                        "enabled": True,
+                        "priority": 10,
+                        "action": "HOLD",
+                        "sizing_mode": "TARGET",
+                        "value": 0,
+                        "condition": "false",
+                        "when": "OPEN",
+                    }
+                ],
+                "competition": {
+                    "eligibility": "true",
+                    "score": "price",
+                    "target_weight": 100,
+                    "cash_when_none": True,
+                    "when": "OPEN",
+                },
+            },
+            "default_settings": {},
+        }
+
+        result = BacktestEngine(
+            strategy,
+            settings(self.run_dates[0], self.run_dates[-1]),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(
+            [(trade["side"], trade["symbol"]) for trade in result.trades],
+            [("BUY", "GLD"), ("SELL", "GLD"), ("BUY", "SPY")],
+        )
+        self.assertGreaterEqual(
+            result.trades[2]["event_time"],
+            result.trades[1]["event_time"],
+        )
+
+    def test_competition_does_not_override_partial_risk_sell(self) -> None:
+        spy_closes = [10.0] * 10 + [30.0, 30.0]
+        gld_closes = [20.0] * 10 + [10.0, 10.0]
+        dataset = HistoricalDataSet(
+            daily={
+                "SPY": daily_rows(self.dates, spy_closes),
+                "GLD": daily_rows(self.dates, gld_closes),
+            },
+            sessions=self.run_dates,
+        )
+        strategy = {
+            "name": "竞争部分风控测试",
+            "design_mode": "visual",
+            "selection_mode": "competition",
+            "definition": {
+                "symbols": [
+                    {"symbol": "SPY", "max_weight": 100},
+                    {"symbol": "GLD", "max_weight": 100},
+                ],
+                "rules": [
+                    {
+                        "id": "partial-risk",
+                        "name": "急跌减仓",
+                        "enabled": True,
+                        "priority": 10,
+                        "action": "SELL",
+                        "sizing_mode": "TARGET",
+                        "value": 50,
+                        "condition": "price < close(2)",
+                        "when": "OPEN",
+                    }
+                ],
+                "competition": {
+                    "eligibility": "true",
+                    "score": "price",
+                    "target_weight": 100,
+                    "cash_when_none": True,
+                    "when": "OPEN",
+                },
+            },
+            "default_settings": {},
+        }
+
+        result = BacktestEngine(
+            strategy,
+            settings(self.run_dates[0], self.run_dates[-1]),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(
+            [(trade["side"], trade["symbol"]) for trade in result.trades],
+            [("BUY", "GLD"), ("SELL", "GLD")],
+        )
+        self.assertEqual(result.trades[-1]["quantity"], 500)
+        self.assertEqual(result.trades[-1]["position_weight_after"], 0.5)
+        self.assertEqual(
+            set(result.equity_points[-1]["positions"]),
+            {"GLD"},
+        )
+
+    def test_code_strategy_risk_exit_then_rotates_to_next_winner(self) -> None:
+        symbols = ["SPY", "GLD", "NVDA", "MU", "XLE"]
+        daily = {
+            symbol: daily_rows(self.dates, [100.0] * len(self.dates))
+            for symbol in symbols
+        }
+        minute: dict[str, dict[int, dict]] = {symbol: {} for symbol in symbols}
+        first, second = self.run_dates
+        scores_day_one = {"SPY": 101, "GLD": 102, "NVDA": 110, "MU": 103, "XLE": 104}
+        scores_day_two = {"SPY": 101, "GLD": 102, "NVDA": 95, "MU": 103, "XLE": 108}
+        for trading_date, scores, nvda_risk in (
+            (first, scores_day_one, 100),
+            (second, scores_day_two, 90),
+        ):
+            for symbol in symbols:
+                for event, signal in (
+                    ("09:40", nvda_risk if symbol == "NVDA" else 100),
+                    ("10:00", scores[symbol]),
+                ):
+                    current = _epoch_minute(trading_date, event)
+                    minute[symbol][current - 1] = {
+                        "open": signal,
+                        "high": signal,
+                        "low": signal,
+                        "close": signal,
+                    }
+                    minute[symbol][current] = {
+                        "open": signal,
+                        "high": signal,
+                        "low": signal,
+                        "close": signal,
+                    }
+        dataset = HistoricalDataSet(
+            daily=daily,
+            sessions=self.run_dates,
+            minute=minute,
+            required_intraday_events=["09:40", "10:00"],
+        )
+        strategy = {
+            "name": "代码策略测试",
+            "design_mode": "code",
+            "selection_mode": "competition",
+            "code_key": "rapid_drop_atr_rotation",
+            "code_version": "1.0.0",
+            "definition": {
+                "symbols": [
+                    {"symbol": symbol, "max_weight": 100}
+                    for symbol in symbols
+                ],
+                "params": {},
+            },
+            "default_settings": {},
+        }
+
+        result = BacktestEngine(
+            strategy,
+            settings(first, second),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(
+            [(trade["side"], trade["symbol"]) for trade in result.trades],
+            [
+                ("BUY", "NVDA"),
+                ("SELL", "NVDA"),
+                ("BUY", "XLE"),
+            ],
+        )
+        self.assertIn("09:40", result.trades[1]["event_time"])
+        self.assertIn("10:00", result.trades[2]["event_time"])
+
+
+if __name__ == "__main__":
+    unittest.main()

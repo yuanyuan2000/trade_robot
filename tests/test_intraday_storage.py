@@ -101,6 +101,35 @@ class IntradayStorageTests(unittest.TestCase):
         info = intraday_db.intraday_database_info()
         self.assertEqual(info["page_size"], intraday_db.INTRADAY_PAGE_SIZE)
 
+    def test_calendar_refresh_removes_dates_no_longer_returned(self) -> None:
+        repository.upsert_market_sessions(
+            [
+                {
+                    "trading_date": "2024-07-03",
+                    "open_minute_utc": 100,
+                    "close_minute_utc": 200,
+                    "is_early_close": True,
+                }
+            ],
+            coverage_start="2024-07-01",
+            coverage_end="2024-07-05",
+        )
+        self.assertEqual(
+            len(repository.get_market_sessions("2024-07-01", "2024-07-05")),
+            1,
+        )
+
+        repository.upsert_market_sessions(
+            [],
+            coverage_start="2024-07-01",
+            coverage_end="2024-07-05",
+        )
+
+        self.assertEqual(
+            repository.get_market_sessions("2024-07-01", "2024-07-05"),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

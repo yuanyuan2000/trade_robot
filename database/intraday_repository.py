@@ -319,6 +319,118 @@ def list_instruments() -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def upsert_market_sessions(
+    sessions: list[dict],
+    *,
+    coverage_start: str,
+    coverage_end: str,
+) -> None:
+    now = utc_now_iso()
+    with INTRADAY_WRITE_LOCK:
+        with get_intraday_connection() as conn:
+            conn.execute(
+                """
+                DELETE FROM market_sessions
+                WHERE trading_date >= ? AND trading_date <= ?
+                """,
+                (coverage_start, coverage_end),
+            )
+            conn.executemany(
+                """
+                INSERT INTO market_sessions (
+                    trading_date, open_minute_utc, close_minute_utc,
+                    is_early_close, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(trading_date) DO UPDATE SET
+                    open_minute_utc = excluded.open_minute_utc,
+                    close_minute_utc = excluded.close_minute_utc,
+                    is_early_close = excluded.is_early_close,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        item["trading_date"],
+                        int(item["open_minute_utc"]),
+                        int(item["close_minute_utc"]),
+                        int(bool(item.get("is_early_close"))),
+                        now,
+                    )
+                    for item in sessions
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO market_calendar_sync_state (
+                    id, coverage_start, coverage_end, status, last_error, synced_at
+                )
+                VALUES (1, ?, ?, 'success', NULL, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    coverage_start = MIN(
+                        market_calendar_sync_state.coverage_start,
+                        excluded.coverage_start
+                    ),
+                    coverage_end = MAX(
+                        market_calendar_sync_state.coverage_end,
+                        excluded.coverage_end
+                    ),
+                    status = 'success',
+                    last_error = NULL,
+                    synced_at = excluded.synced_at
+                """,
+                (coverage_start, coverage_end, now),
+            )
+
+
+def mark_market_calendar_sync_error(
+    *,
+    coverage_start: str,
+    coverage_end: str,
+    error: str,
+) -> None:
+    with INTRADAY_WRITE_LOCK:
+        with get_intraday_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO market_calendar_sync_state (
+                    id, coverage_start, coverage_end, status, last_error, synced_at
+                )
+                VALUES (1, ?, ?, 'error', ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = CASE
+                        WHEN market_calendar_sync_state.status = 'success'
+                        THEN 'success'
+                        ELSE 'error'
+                    END,
+                    last_error = excluded.last_error,
+                    synced_at = excluded.synced_at
+                """,
+                (coverage_start, coverage_end, error, utc_now_iso()),
+            )
+
+
+def get_market_calendar_coverage() -> dict | None:
+    with get_intraday_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM market_calendar_sync_state WHERE id = 1"
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_market_sessions(start_date: str, end_date: str) -> list[dict]:
+    with get_intraday_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM market_sessions
+            WHERE trading_date >= ? AND trading_date <= ?
+            ORDER BY trading_date
+            """,
+            (start_date, end_date),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_storage_quality_summary(symbol: str) -> dict:
     instrument = get_instrument(symbol)
     if not instrument:
@@ -433,6 +545,109 @@ def get_minute_bars(
         }
         for row in rows
     ]
+
+
+def get_minute_bars_at(
+    symbol: str,
+    minute_values: list[int],
+) -> dict[int, dict]:
+    """Return exact stored minutes without scanning an instrument's full history."""
+    instrument = get_instrument(symbol)
+    requested = sorted({int(value) for value in minute_values})
+    if not instrument or not requested:
+        return {}
+    result: dict[int, dict] = {}
+    with get_intraday_connection() as conn:
+        for start in range(0, len(requested), 800):
+            chunk = requested[start : start + 800]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"""
+                SELECT minute_utc, open_scaled, high_scaled, low_scaled,
+                       close_scaled, volume, trade_count, vwap_scaled
+                FROM minute_bars
+                WHERE instrument_id = ?
+                  AND minute_utc IN ({placeholders})
+                """,
+                (int(instrument["id"]), *chunk),
+            ).fetchall()
+            for row in rows:
+                minute = int(row["minute_utc"])
+                result[minute] = {
+                    "minute_utc": minute,
+                    "timestamp": epoch_minute_to_iso(minute),
+                    "open": unscale_price(row["open_scaled"]),
+                    "high": unscale_price(row["high_scaled"]),
+                    "low": unscale_price(row["low_scaled"]),
+                    "close": unscale_price(row["close_scaled"]),
+                    "volume": int(row["volume"]),
+                    "trade_count": row["trade_count"],
+                    "vwap": unscale_price(row["vwap_scaled"]),
+                }
+    return result
+
+
+def resolve_minute_event_gaps(
+    symbol: str,
+    requests: list[dict],
+) -> dict[int, dict]:
+    """Resolve sparse/no-trade event minutes within their regular session."""
+    instrument = get_instrument(symbol)
+    if not instrument or not requests:
+        return {}
+    normalized = [
+        (
+            int(item["target_minute"]),
+            int(item["open_minute"]),
+            int(item["close_minute"]),
+        )
+        for item in requests
+    ]
+    result: dict[int, dict] = {}
+    with get_intraday_connection() as conn:
+        for start in range(0, len(normalized), 200):
+            chunk = normalized[start : start + 200]
+            values = ",".join("(?, ?, ?)" for _ in chunk)
+            params = [value for item in chunk for value in item]
+            rows = conn.execute(
+                f"""
+                WITH requested(target_minute, open_minute, close_minute) AS (
+                    VALUES {values}
+                )
+                SELECT
+                    requested.target_minute,
+                    (
+                        SELECT MAX(previous.minute_utc)
+                        FROM minute_bars AS previous
+                        WHERE previous.instrument_id = ?
+                          AND previous.minute_utc >= requested.open_minute
+                          AND previous.minute_utc < requested.target_minute
+                    ) AS signal_minute,
+                    (
+                        SELECT MIN(next.minute_utc)
+                        FROM minute_bars AS next
+                        WHERE next.instrument_id = ?
+                          AND next.minute_utc >= requested.target_minute
+                          AND next.minute_utc < requested.close_minute
+                    ) AS fill_minute
+                FROM requested
+                """,
+                (*params, int(instrument["id"]), int(instrument["id"])),
+            ).fetchall()
+            for row in rows:
+                result[int(row["target_minute"])] = {
+                    "signal_minute": (
+                        int(row["signal_minute"])
+                        if row["signal_minute"] is not None
+                        else None
+                    ),
+                    "fill_minute": (
+                        int(row["fill_minute"])
+                        if row["fill_minute"] is not None
+                        else None
+                    ),
+                }
+    return result
 
 
 def iter_minute_bars(

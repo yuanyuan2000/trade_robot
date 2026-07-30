@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import multiprocessing
 import os
@@ -13,7 +14,7 @@ import threading
 import time
 import webbrowser
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 from config import (
     ANALYSIS_MAX_WORKERS,
@@ -28,6 +29,7 @@ from config import (
 from database.db import backup_databases, init_database
 from database.intraday_db import init_intraday_database
 from database import repository
+from database import backtest_repository
 from services.alpaca_data_client import fetch_stock_bars
 from services.api_errors import MarketDataError
 from services.market_data_service import (
@@ -46,6 +48,17 @@ from services.trendline_analysis_service import (
     analyze_symbol_trendlines,
     get_trendline_analysis_signature,
 )
+from services.backtest.errors import BacktestError
+from services.backtest.service import (
+    code_strategy_catalog,
+    create_default_strategy,
+    create_strategy as create_backtest_strategy_service,
+    duplicate_strategy,
+    run_manager as backtest_run_manager,
+    update_strategy as update_backtest_strategy_service,
+    validate_saved_strategy,
+)
+from services.backtest.presets import ensure_shipped_strategy_presets
 
 
 app = Flask(__name__)
@@ -571,10 +584,8 @@ def start_overview_sync() -> bool:
 
 
 def run_overview_sync() -> None:
-    analysis_refresh_needed = False
     try:
         result = sync_market_overview_daily_prices()
-        analysis_refresh_needed = True
         with overview_sync_lock:
             overview_sync_state["last_result"] = result
             overview_sync_state["last_error"] = None
@@ -587,8 +598,6 @@ def run_overview_sync() -> None:
     finally:
         with overview_sync_lock:
             overview_sync_state["running"] = False
-        if analysis_refresh_needed:
-            start_analysis_overview_refresh(queue_if_running=True)
 
 
 def overview_sync_snapshot() -> dict:
@@ -914,6 +923,250 @@ def patch_market_overview_symbol(symbol: str):
         )
 
 
+def backtest_error_response(exc: Exception):
+    if isinstance(exc, BacktestError):
+        error = exc.to_dict()
+        status = 400
+    elif isinstance(exc, RuntimeError):
+        error = {
+            "code": "REVISION_CONFLICT",
+            "message": str(exc),
+            "detail": None,
+        }
+        status = 409
+    elif isinstance(exc, ValueError):
+        error = {
+            "code": "INVALID_BACKTEST_REQUEST",
+            "message": str(exc),
+            "detail": None,
+        }
+        status = 400
+    else:
+        app.logger.exception("Unexpected backtest API error")
+        error = {
+            "code": "UNKNOWN_BACKTEST_ERROR",
+            "message": "历史回测服务发生未知错误。",
+            "detail": str(exc),
+        }
+        status = 500
+    return jsonify({"ok": False, "error": error}), status
+
+
+@app.route("/api/backtest/strategies")
+def backtest_strategies():
+    try:
+        ensure_shipped_strategy_presets()
+        strategies = backtest_repository.list_strategies()
+        latest_runs = backtest_repository.latest_runs_by_strategy()
+        return jsonify(
+            {
+                "ok": True,
+                "strategies": [
+                    {
+                        **strategy,
+                        "latest_run": latest_runs.get(strategy["id"]),
+                    }
+                    for strategy in strategies
+                ],
+            }
+        )
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/strategies", methods=["POST"])
+def create_backtest_strategy():
+    payload = request.get_json(silent=True) or {}
+    try:
+        if str(payload.get("design_mode") or "visual") != "visual":
+            raise ValueError("代码策略只能由项目代码内置，不能在前端或公共接口中新建。")
+        if "definition" not in payload:
+            strategy = create_default_strategy(
+                name=str(payload.get("name") or "未命名策略"),
+                design_mode="visual",
+                selection_mode=str(payload.get("selection_mode") or "single"),
+            )
+        else:
+            strategy = create_backtest_strategy_service(payload)
+        return jsonify({"ok": True, "strategy": strategy}), 201
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/strategies/<int:strategy_id>")
+def get_backtest_strategy(strategy_id: int):
+    try:
+        return jsonify(
+            {
+                "ok": True,
+                "strategy": backtest_repository.get_strategy(strategy_id),
+                "runs": backtest_repository.list_runs(strategy_id, limit=20),
+            }
+        )
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/strategies/<int:strategy_id>", methods=["PATCH"])
+def patch_backtest_strategy(strategy_id: int):
+    try:
+        strategy = update_backtest_strategy_service(
+            strategy_id,
+            request.get_json(silent=True) or {},
+        )
+        return jsonify({"ok": True, "strategy": strategy})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/strategies/<int:strategy_id>", methods=["DELETE"])
+def delete_backtest_strategy(strategy_id: int):
+    try:
+        strategy = backtest_repository.delete_strategy(strategy_id)
+        return jsonify({"ok": True, "strategy": strategy})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route(
+    "/api/backtest/strategies/<int:strategy_id>/duplicate",
+    methods=["POST"],
+)
+def duplicate_backtest_strategy(strategy_id: int):
+    payload = request.get_json(silent=True) or {}
+    try:
+        strategy = duplicate_strategy(strategy_id, payload.get("name"))
+        return jsonify({"ok": True, "strategy": strategy}), 201
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route(
+    "/api/backtest/strategies/<int:strategy_id>/validate",
+    methods=["POST"],
+)
+def validate_backtest_strategy(strategy_id: int):
+    try:
+        return jsonify(validate_saved_strategy(strategy_id))
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/code-strategies")
+def backtest_code_strategies():
+    try:
+        return jsonify({"ok": True, "strategies": code_strategy_catalog()})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route(
+    "/api/backtest/strategies/<int:strategy_id>/runs",
+    methods=["POST"],
+)
+def start_backtest_run(strategy_id: int):
+    payload = request.get_json(silent=True) or {}
+    try:
+        run = backtest_run_manager.start(strategy_id, payload.get("settings"))
+        return jsonify({"ok": True, "run": run}), 202
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/strategies/<int:strategy_id>/runs")
+def list_backtest_runs(strategy_id: int):
+    try:
+        return jsonify(
+            {
+                "ok": True,
+                "runs": backtest_repository.list_runs(strategy_id),
+            }
+        )
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/runs/<int:run_id>")
+def get_backtest_run(run_id: int):
+    try:
+        return jsonify({"ok": True, "run": backtest_run_manager.run_status(run_id)})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/runs/<int:run_id>/cancel", methods=["POST"])
+def cancel_backtest_run(run_id: int):
+    try:
+        return jsonify({"ok": True, "run": backtest_run_manager.cancel(run_id)})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/runs/<int:run_id>/results")
+def backtest_run_results(run_id: int):
+    try:
+        return jsonify({"ok": True, **backtest_run_manager.result(run_id)})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/runs/<int:run_id>/logs")
+def backtest_run_logs(run_id: int):
+    try:
+        logs = backtest_repository.get_logs(
+            run_id,
+            level=request.args.get("level", "DEBUG"),
+            after_sequence=int(request.args.get("after", "0")),
+            limit=int(request.args.get("limit", "1000")),
+        )
+        return jsonify({"ok": True, "logs": logs})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/runs/<int:run_id>/events")
+def backtest_run_events(run_id: int):
+    try:
+        equity_after = max(0, int(request.args.get("equity_after", "0")))
+        trade_after = max(0, int(request.args.get("trade_after", "0")))
+        log_after = max(0, int(request.args.get("log_after", "0")))
+        backtest_repository.get_run(run_id, include_snapshot=False)
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+    @stream_with_context
+    def stream():
+        cursors = {
+            "equity": equity_after,
+            "trade": trade_after,
+            "log": log_after,
+        }
+        while True:
+            payload = backtest_run_manager.events_since(
+                run_id,
+                equity_after=cursors["equity"],
+                trade_after=cursors["trade"],
+                log_after=cursors["log"],
+            )
+            cursors = payload["next"]
+            yield (
+                "event: update\n"
+                f"data: {json.dumps(payload, ensure_ascii=False, allow_nan=False)}\n\n"
+            )
+            if payload["run"]["status"] in {"completed", "failed", "cancelled"}:
+                break
+            time.sleep(0.75)
+
+    return Response(
+        stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.route("/api/db/tables")
 def db_tables():
     return jsonify({"ok": True, "tables": repository.list_tables()})
@@ -1139,7 +1392,7 @@ def shutdown_if_inactive() -> None:
             and last_heartbeat_at is not None
             and now_utc() - last_heartbeat_at > timedelta(seconds=3)
         )
-    if should_shutdown:
+    if should_shutdown and not backtest_run_manager.has_active_runs():
         os._exit(0)
 
 
@@ -1153,6 +1406,7 @@ def shutdown_process() -> None:
 
 
 def terminate_child_processes() -> None:
+    backtest_run_manager.shutdown()
     terminate_analysis_process_executor()
     children = multiprocessing.active_children()
     for process in children:
@@ -1235,9 +1489,10 @@ def is_wsl() -> bool:
 def main() -> None:
     init_database()
     init_intraday_database()
+    ensure_shipped_strategy_presets()
+    backtest_run_manager.recover_interrupted_runs()
     configure_access_logging()
     start_overview_sync()
-    start_analysis_overview_refresh()
     if AUTO_OPEN_BROWSER:
         threading.Thread(target=open_browser, daemon=True).start()
     app.run(host=FLASK_HOST, port=FLASK_PORT, debug=True, use_reloader=False)

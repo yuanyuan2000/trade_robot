@@ -22,8 +22,11 @@ class ClosingConnection(sqlite3.Connection):
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DATABASE_PATH, factory=ClosingConnection)
+    conn = sqlite3.connect(DATABASE_PATH, timeout=30, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
@@ -150,6 +153,21 @@ def migrate_database(conn: sqlite3.Connection) -> None:
             window_size,
             algorithm_version,
             computed_at DESC
+        )
+        """
+    )
+    ensure_column(
+        conn,
+        table_name="backtest_equity_points",
+        column_name="receivables",
+        definition="REAL NOT NULL DEFAULT 0",
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS backtest_strategy_seed_state (
+            seed_key TEXT PRIMARY KEY,
+            strategy_id INTEGER,
+            seeded_at TEXT NOT NULL
         )
         """
     )

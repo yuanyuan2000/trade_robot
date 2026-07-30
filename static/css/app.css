@@ -89,7 +89,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -1512,6 +1513,455 @@ td {
   color: var(--table-cell-text);
 }
 
+.backtest-list-panel {
+  overflow: hidden;
+}
+
+.backtest-strategy-row {
+  cursor: pointer;
+}
+
+.backtest-strategy-row:hover {
+  background: var(--panel-hover);
+}
+
+.backtest-row-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.backtest-row-actions button,
+.backtest-section-title button,
+.backtest-log-actions button,
+.backtest-toolbar button,
+.backtest-dialog button,
+.backtest-run-history button {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-muted);
+  color: var(--text);
+  cursor: pointer;
+  padding: 7px 11px;
+}
+
+.backtest-row-actions button:hover,
+.backtest-section-title button:hover,
+.backtest-log-actions button:hover,
+.backtest-toolbar button:hover,
+.backtest-dialog button:hover,
+.backtest-run-history button:hover {
+  background: var(--soft-hover);
+}
+
+.backtest-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.backtest-toolbar-primary,
+.backtest-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.backtest-name-input {
+  width: min(420px, 42vw);
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  padding: 7px 9px;
+  font-size: 20px;
+  font-weight: 680;
+}
+
+.backtest-name-input:hover,
+.backtest-name-input:focus {
+  border-color: var(--border);
+  background: var(--field-bg);
+  outline: none;
+}
+
+.backtest-badge {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  padding: 4px 9px;
+  font-size: 12px;
+}
+
+.backtest-toolbar .primary-action,
+.backtest-dialog .primary-action,
+#backtest-new-strategy {
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  background: var(--accent);
+  color: var(--button-text);
+  cursor: pointer;
+  padding: 8px 14px;
+}
+
+.backtest-toolbar .danger-action {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+  color: var(--danger);
+}
+
+.backtest-grid {
+  display: grid;
+  grid-template-columns: minmax(370px, 42%) minmax(480px, 58%);
+  grid-template-rows: minmax(530px, calc(100vh - 330px)) minmax(220px, 30vh);
+  gap: 14px;
+}
+
+.backtest-designer,
+.backtest-results,
+.backtest-log-panel {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.backtest-designer-scroll {
+  height: calc(100% - 54px);
+  overflow: auto;
+  padding: 14px;
+}
+
+.backtest-editor-section {
+  border-top: 1px solid var(--border);
+  margin-top: 18px;
+  padding-top: 15px;
+}
+
+.backtest-editor-section h4 {
+  margin: 0 0 11px;
+  font-size: 14px;
+}
+
+.backtest-section-title,
+.backtest-log-toolbar,
+.backtest-dialog-header,
+.backtest-dialog-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.backtest-section-title h4,
+.backtest-log-toolbar h3,
+.backtest-dialog-header h3 {
+  margin: 0;
+}
+
+.backtest-stack {
+  display: grid;
+  gap: 9px;
+}
+
+.backtest-field {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.backtest-field input,
+.backtest-field select,
+.backtest-field textarea,
+.backtest-inline-fields input,
+.backtest-inline-fields select,
+.backtest-log-actions select {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--field-bg);
+  color: var(--text);
+  padding: 8px 9px;
+}
+
+.backtest-field textarea {
+  resize: vertical;
+}
+
+.backtest-help {
+  margin: 7px 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.backtest-symbol-row {
+  display: grid;
+  grid-template-columns: minmax(100px, 1fr) 130px 34px;
+  gap: 7px;
+}
+
+.backtest-symbol-row input,
+.backtest-rule input,
+.backtest-rule select,
+.backtest-code-param input {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--field-bg);
+  color: var(--text);
+  padding: 7px 8px;
+}
+
+.backtest-remove-button {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-muted);
+  color: var(--danger);
+  cursor: pointer;
+}
+
+.backtest-rule {
+  display: grid;
+  grid-template-columns: 28px 68px 78px 72px 68px 30px;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--panel-hover);
+  padding: 7px;
+  font-size: 12px;
+}
+
+.backtest-rule .backtest-rule-condition {
+  grid-column: 2 / -1;
+  font-size: 12px;
+}
+
+.backtest-rule input,
+.backtest-rule select {
+  padding: 5px 6px;
+  font-size: 12px;
+}
+
+.backtest-rule-enabled {
+  display: grid;
+  place-items: center;
+}
+
+.backtest-rule-enabled input {
+  width: auto;
+}
+
+.backtest-inline-fields,
+.backtest-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.backtest-check-field {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.backtest-code-param {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(100px, 0.8fr);
+  align-items: center;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.backtest-run-history {
+  display: grid;
+  gap: 7px;
+}
+
+.backtest-run-item {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.backtest-results {
+  display: grid;
+  grid-template-rows: auto minmax(340px, 1fr) auto;
+}
+
+.backtest-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(110px, 1fr));
+  gap: 1px;
+  border-bottom: 1px solid var(--border);
+  background: var(--border);
+}
+
+.backtest-metric {
+  min-width: 0;
+  background: var(--surface);
+  padding: 11px 13px;
+}
+
+.backtest-metric span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.backtest-metric strong {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backtest-chart-wrap {
+  position: relative;
+  min-height: 340px;
+  background: var(--chart-bg);
+}
+
+#backtest-equity-chart {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+}
+
+.backtest-chart-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.backtest-chart-empty[hidden] {
+  display: none;
+}
+
+.backtest-trade-summary {
+  min-height: 39px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  padding: 10px 13px;
+  font-size: 12px;
+}
+
+.backtest-log-panel {
+  grid-column: 1 / -1;
+}
+
+.backtest-log-toolbar {
+  min-height: 52px;
+  border-bottom: 1px solid var(--border);
+  padding: 0 13px;
+}
+
+.backtest-log-toolbar > div,
+.backtest-log-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.backtest-log-toolbar span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.backtest-log-output {
+  height: calc(100% - 52px);
+  overflow: auto;
+  background: var(--chart-bg);
+  padding: 9px 12px;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.backtest-log-line {
+  display: grid;
+  grid-template-columns: 58px minmax(145px, auto) 1fr;
+  gap: 9px;
+  border-bottom: 1px solid var(--table-row-border);
+  padding: 4px 0;
+}
+
+.backtest-log-line .level-ERROR {
+  color: var(--danger);
+}
+
+.backtest-log-line .level-WARN {
+  color: var(--warning);
+}
+
+.backtest-log-line .level-INFO {
+  color: var(--success);
+}
+
+.backtest-empty {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  padding: 18px;
+  text-align: center;
+}
+
+.backtest-dialog {
+  width: min(520px, calc(100vw - 32px));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  padding: 0;
+}
+
+.backtest-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.backtest-dialog form {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+}
+
+.backtest-dialog-header {
+  border-bottom: 1px solid var(--border);
+  margin: -2px -2px 2px;
+  padding-bottom: 12px;
+}
+
+.backtest-dialog-header button {
+  border: 0;
+  background: transparent;
+  font-size: 20px;
+  padding: 2px 6px;
+}
+
+.backtest-dialog-actions {
+  border-top: 1px solid var(--border);
+  margin-top: 3px;
+  padding-top: 13px;
+  justify-content: flex-end;
+}
+
+.backtest-settings-dialog {
+  width: min(680px, calc(100vw - 32px));
+}
+
 .empty-cell {
   color: var(--muted);
   text-align: center;
@@ -1572,5 +2022,49 @@ td {
     right: 18px;
     left: 18px;
     width: auto;
+  }
+
+  .backtest-toolbar,
+  .backtest-toolbar-primary,
+  .backtest-toolbar-actions {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .backtest-name-input {
+    flex: 1;
+    width: auto;
+    min-width: 180px;
+  }
+
+  .backtest-grid {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .backtest-designer,
+  .backtest-results {
+    min-height: 560px;
+  }
+
+  .backtest-log-panel {
+    min-height: 280px;
+  }
+
+  .backtest-metrics {
+    grid-template-columns: repeat(2, minmax(110px, 1fr));
+  }
+
+  .backtest-rule {
+    grid-template-columns: 34px repeat(2, minmax(80px, 1fr));
+  }
+
+  .backtest-rule .backtest-rule-condition {
+    grid-column: 1 / -1;
+  }
+
+  .backtest-inline-fields,
+  .backtest-settings-grid {
+    grid-template-columns: 1fr;
   }
 }

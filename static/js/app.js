@@ -16,6 +16,8 @@ const overviewNext = document.getElementById("overview-next");
 const overviewPageText = document.getElementById("overview-page-text");
 const overviewLiveToggle = document.getElementById("overview-live-toggle");
 const overviewLiveLabel = document.getElementById("overview-live-label");
+const overviewLiveControl = document.getElementById("overview-live-control");
+const analysisRefreshAll = document.getElementById("analysis-refresh-all");
 const overviewTitle = document.getElementById("overview-title");
 const analysisOverviewProgress = document.getElementById("analysis-overview-progress");
 const analysisTrendTooltip = document.getElementById("analysis-trend-tooltip");
@@ -62,8 +64,6 @@ let overviewDailySyncDone = false;
 let overviewLiveTimer;
 let overviewLiveRefreshInFlight = false;
 let marketOverviewAutoUpdate = false;
-let analysisOverviewAutoUpdate = false;
-let analysisOverviewTimer;
 let analysisOverviewStatusTimer;
 let analysisOverviewLoadInFlight;
 let lastAnalysisRefreshState = {};
@@ -106,32 +106,20 @@ function applyWorkspaceMode(mode) {
   marketSubtitle.textContent = isAnalysis ? "K线智能识别与算法分析" : "2020年以来行情数据";
   overviewTitle.textContent = isAnalysis ? "K线分析总览" : "行情总览";
   overviewLiveLabel.textContent = "自动更新";
-  overviewLiveToggle.checked = isAnalysis
-    ? analysisOverviewAutoUpdate
-    : marketOverviewAutoUpdate;
-  overviewLiveToggle.parentElement.title = isAnalysis
-    ? "定期检查并更新直线趋势线分析"
-    : "每5分钟刷新总览最新价格";
+  overviewLiveToggle.checked = marketOverviewAutoUpdate;
+  overviewLiveControl.hidden = isAnalysis;
+  analysisRefreshAll.hidden = !isAnalysis;
+  overviewLiveControl.title = "每5分钟刷新总览最新价格";
   analysisOverviewProgress.hidden = !isAnalysis;
   if (isAnalysis) {
     if (overviewLiveTimer) {
       window.clearInterval(overviewLiveTimer);
       overviewLiveTimer = null;
     }
-    if (analysisOverviewAutoUpdate && !analysisOverviewTimer) {
-      analysisOverviewTimer = window.setInterval(
-        () => startAnalysisOverviewRefresh({ silent: true }),
-        overviewLiveRefreshMs,
-      );
-    }
     if (!marketOverviewPanel.hidden) {
       renderAnalysisProgress(lastAnalysisRefreshState);
     }
   } else {
-    if (analysisOverviewTimer) {
-      window.clearInterval(analysisOverviewTimer);
-      analysisOverviewTimer = null;
-    }
     if (marketOverviewAutoUpdate && !overviewLiveTimer) {
       overviewLiveTimer = window.setInterval(
         refreshOverviewLivePrices,
@@ -504,6 +492,7 @@ function renderAnalysisProgress(state) {
     return;
   }
   const running = Boolean(state.running);
+  analysisRefreshAll.disabled = running;
   const hasError = Boolean(state.last_error);
   analysisOverviewProgress.hidden = false;
   analysisOverviewProgress.className = `analysis-overview-progress${running ? " is-running" : ""}${hasError ? " is-error" : ""}`;
@@ -899,24 +888,6 @@ function setOverviewLiveRefresh(enabled) {
   refreshOverviewLivePrices();
   overviewLiveTimer = window.setInterval(refreshOverviewLivePrices, overviewLiveRefreshMs);
   setStatus("总览自动更新已开启，每5分钟刷新一次最新价格。", "success");
-}
-
-function setAnalysisOverviewAutoUpdate(enabled) {
-  analysisOverviewAutoUpdate = enabled;
-  if (analysisOverviewTimer) {
-    window.clearInterval(analysisOverviewTimer);
-    analysisOverviewTimer = null;
-  }
-  if (!enabled) {
-    setStatus("K 线分析自动更新已关闭。", "neutral");
-    return;
-  }
-  startAnalysisOverviewRefresh();
-  analysisOverviewTimer = window.setInterval(
-    () => startAnalysisOverviewRefresh({ silent: true }),
-    overviewLiveRefreshMs,
-  );
-  setStatus("K 线分析自动更新已开启，每 5 分钟检查一次数据变化。", "success");
 }
 
 function renderOverviewHeader(header) {
@@ -1838,12 +1809,9 @@ overviewTable.addEventListener("dragend", async () => {
 });
 shutdownButton.addEventListener("click", shutdownSystem);
 overviewLiveToggle.addEventListener("change", () => {
-  if (currentWorkspaceMode === "analysis") {
-    setAnalysisOverviewAutoUpdate(overviewLiveToggle.checked);
-  } else {
-    setOverviewLiveRefresh(overviewLiveToggle.checked);
-  }
+  setOverviewLiveRefresh(overviewLiveToggle.checked);
 });
+analysisRefreshAll.addEventListener("click", () => startAnalysisOverviewRefresh());
 themeToggle.addEventListener("click", () => {
   const nextTheme = document.body.classList.contains("theme-dark") ? "light" : "dark";
   applyTheme(nextTheme);
@@ -1916,12 +1884,12 @@ document.addEventListener("chart-period-change", async (event) => {
 
 bindNavigation();
 bindDatabaseBrowser();
+initBacktest();
 initChart();
 initTheme();
 startHeartbeat();
 loadIndicatorCatalog();
 loadMarketOverview();
-startAnalysisOverviewRefresh({ silent: true });
 
 function escapeHtml(value) {
   return String(value)

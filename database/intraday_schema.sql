@@ -28,6 +28,15 @@ CREATE TABLE IF NOT EXISTS market_sessions (
     updated_at TEXT NOT NULL
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS market_calendar_sync_state (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    coverage_start TEXT NOT NULL,
+    coverage_end TEXT NOT NULL,
+    status TEXT NOT NULL,
+    last_error TEXT,
+    synced_at TEXT NOT NULL
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS minute_sync_state (
     instrument_id INTEGER PRIMARY KEY,
     earliest_minute_utc INTEGER,
