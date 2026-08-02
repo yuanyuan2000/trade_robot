@@ -56,6 +56,7 @@ class Portfolio:
         self,
         initial_cash: float,
         *,
+        leverage_multiplier: float = 1,
         commission_per_share: float = 0,
         minimum_commission: float = 0,
         slippage_bps: float = 0,
@@ -66,6 +67,9 @@ class Portfolio:
             raise BacktestOrderError("初始资金必须大于 0。")
         self.initial_cash = D(initial_cash)
         self.cash = D(initial_cash)
+        self.leverage_multiplier = D(leverage_multiplier)
+        if self.leverage_multiplier < ONE:
+            raise BacktestOrderError("杠杆倍率不能小于 1。")
         self.commission_per_share = D(commission_per_share)
         self.minimum_commission = D(minimum_commission)
         self.slippage_bps = D(slippage_bps)
@@ -119,10 +123,26 @@ class Portfolio:
         return self.cash + self.receivable_value + self.market_value(marks)
 
     def weight(self, symbol: str, marks: dict[str, float | Decimal]) -> Decimal:
+        """Return strategy-normalized weight, independent of account leverage."""
         equity = self.equity(marks)
         if equity <= ZERO:
             return ZERO
-        return self.quantity(symbol) * D(marks[symbol]) / equity
+        return (
+            self.quantity(symbol)
+            * D(marks[symbol])
+            / equity
+            / self.leverage_multiplier
+        )
+
+    def gross_leverage(self, marks: dict[str, float | Decimal]) -> Decimal:
+        equity = self.equity(marks)
+        if equity <= ZERO:
+            return ZERO
+        return self.market_value(marks) / equity
+
+    @property
+    def borrowed_cash(self) -> Decimal:
+        return max(ZERO, -self.cash)
 
     def snapshot(self, marks: dict[str, float | Decimal]) -> dict:
         result = {}
@@ -138,6 +158,11 @@ class Portfolio:
                 "price": float(price),
                 "market_value": float(market_value),
                 "weight": float(market_value / equity) if equity > ZERO else 0.0,
+                "strategy_weight": (
+                    float(market_value / equity / self.leverage_multiplier)
+                    if equity > ZERO
+                    else 0.0
+                ),
                 "unrealized_pnl": float(market_value - position.cost_basis),
             }
         return result
@@ -191,7 +216,11 @@ class Portfolio:
                 amount = position.quantity * rate
                 if amount <= ZERO:
                     continue
-                payable_date = action.get("payable_date") or trading_date
+                payable_date = action.get("payable_date")
+                if not payable_date:
+                    raise BacktestOrderError(
+                        f"{symbol} 现金分红缺少支付日，不能安全入账。"
+                    )
                 item = {
                     "symbol": symbol,
                     "amount": amount,
@@ -258,7 +287,7 @@ class Portfolio:
         if current_equity <= ZERO:
             raise BacktestOrderError("账户权益不为正，无法继续交易。")
         current_value = position.quantity * D(reference_price)
-        current_weight = current_value / current_equity
+        current_weight = current_value / current_equity / self.leverage_multiplier
 
         if action == "BUY":
             target_weight = (
@@ -273,7 +302,8 @@ class Portfolio:
                 )
             if target_weight <= current_weight + EPSILON:
                 return None
-            desired_value = current_equity * target_weight - current_value
+            actual_target_weight = target_weight * self.leverage_multiplier
+            desired_value = current_equity * actual_target_weight - current_value
             return self._buy(
                 intent,
                 desired_value=desired_value,
@@ -282,7 +312,7 @@ class Portfolio:
                 event_time=event_time,
                 current_equity=current_equity,
                 current_value=current_value,
-                target_weight=target_weight,
+                target_weight=actual_target_weight,
             )
 
         target_weight = (
@@ -305,7 +335,7 @@ class Portfolio:
             sell_all=target_weight == ZERO,
             current_equity=current_equity,
             current_value=current_value,
-            target_weight=target_weight,
+            target_weight=target_weight * self.leverage_multiplier,
         )
 
     def _quantity_step(self, symbol: str) -> Decimal:
@@ -339,7 +369,8 @@ class Portfolio:
         target_weight: Decimal,
     ) -> dict | None:
         fill = self.fill_price("BUY", reference_price)
-        raw_upper = min(desired_value / fill, self.cash / fill)
+        raw_upper = desired_value / fill
+        current_market_value = self.market_value(marks)
 
         def allowed(quantity: Decimal) -> bool:
             if quantity <= ZERO:
@@ -350,10 +381,15 @@ class Portfolio:
             projected_equity = current_equity - commission - slippage
             projected_value = current_value + quantity * reference_price
             return (
-                total_cost <= self.cash + EPSILON
-                and
                 projected_equity > ZERO
                 and projected_value / projected_equity <= target_weight + EPSILON
+                and (
+                    self.leverage_multiplier > ONE
+                    or total_cost <= self.cash + EPSILON
+                )
+                and (
+                    current_market_value + quantity * reference_price
+                ) / projected_equity <= self.leverage_multiplier + EPSILON
             )
 
         step = self._quantity_step(intent.symbol)
@@ -375,9 +411,6 @@ class Portfolio:
         commission = self.commission(quantity)
         gross = quantity * fill
         total_cost = gross + commission
-        if total_cost > self.cash + EPSILON:
-            raise BacktestOrderError("可用现金不足以支付买入金额和手续费。")
-
         position = self._position(intent.symbol)
         position.lots.append(
             Lot(quantity=quantity, unit_cost=(gross + commission) / quantity)
@@ -461,9 +494,6 @@ class Portfolio:
             return None
         commission = self.commission(quantity)
         gross = quantity * fill
-        if self.cash + gross < commission - EPSILON:
-            raise BacktestOrderError("卖出所得与现金不足以支付最低手续费。")
-
         remaining = quantity
         removed_cost = ZERO
         while remaining > EPSILON:
@@ -497,6 +527,36 @@ class Portfolio:
             realized_pnl=realized,
             marks=marks,
         )
+
+    def liquidate_all(
+        self,
+        *,
+        marks: dict[str, float | Decimal],
+        event_time: str,
+        reason: str = "账户爆仓强制平仓",
+    ) -> list[dict]:
+        """Close every long position even when account equity is non-positive."""
+        trades: list[dict] = []
+        for symbol in sorted(self.positions):
+            position = self._position(symbol)
+            if position.quantity <= ZERO:
+                continue
+            if symbol not in marks:
+                raise BacktestOrderError(f"缺少 {symbol} 的强平价格。")
+            intent = OrderIntent(symbol, "SELL", "TARGET", 0, reason)
+            trade = self._sell(
+                intent,
+                reference_price=D(marks[symbol]),
+                marks=marks,
+                event_time=event_time,
+                sell_all=True,
+                current_equity=self.equity(marks),
+                current_value=position.quantity * D(marks[symbol]),
+                target_weight=ZERO,
+            )
+            if trade:
+                trades.append(trade)
+        return trades
 
     def _trade_dict(
         self,

@@ -83,6 +83,23 @@ class FailingPreflightEngine:
         )
 
 
+class LiquidatedEngine(FakeEngine):
+    def run(self):
+        result = super().run()
+        result.metrics.update(
+            {
+                "ending_equity": -5,
+                "total_return": -1.05,
+                "liquidated": True,
+            }
+        )
+        result.termination_reason = "LIQUIDATED"
+        result.liquidation = {
+            "liquidation_time": "2024-01-02 10:00 America/New_York"
+        }
+        return result
+
+
 class CancellableEngine:
     def __init__(
         self,
@@ -159,6 +176,7 @@ class BacktestRunManagerTests(unittest.TestCase):
 
         self.assertEqual(status["status"], "completed")
         self.assertEqual(status["metrics"]["ending_equity"], 100)
+        self.assertIn("OPEN若", status["configuration_summary"])
         self.assertEqual(
             backtest_repository.get_equity_points(run["id"])[0]["equity"],
             100,
@@ -192,6 +210,33 @@ class BacktestRunManagerTests(unittest.TestCase):
         logs = backtest_repository.get_logs(run["id"], level="ERROR")
         self.assertEqual(logs[0]["message"], "公司行动核验失败。")
         self.assertEqual(logs[0]["context"]["detail"]["provider"], "test")
+
+    @patch("services.backtest.service.BacktestEngine", LiquidatedEngine)
+    def test_liquidation_is_completed_with_full_result_and_outcome(self) -> None:
+        run = self.manager.start(
+            self.strategy["id"],
+            {
+                **self.strategy["default_settings"],
+                "start_date": "2024-01-02",
+                "end_date": "2024-01-02",
+                "initial_capital": 100,
+                "benchmark": "none",
+                "leverage_multiplier": 3,
+            },
+        )
+        deadline = time.monotonic() + 2
+        status = run
+        while time.monotonic() < deadline:
+            status = self.manager.run_status(run["id"])
+            if status["status"] == "completed":
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["termination_reason"], "LIQUIDATED")
+        self.assertTrue(status["metrics"]["liquidated"])
+        self.assertIn("10:00", status["current_time"])
+        self.assertEqual(len(self.manager.result(run["id"])["equity_points"]), 1)
 
     def test_terminal_partial_output_is_readable_after_manager_restart(self) -> None:
         run = backtest_repository.create_run(

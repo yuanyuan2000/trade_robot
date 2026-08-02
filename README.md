@@ -189,6 +189,11 @@ AUTO_OPEN_BROWSER=false python app.py
 - 左轴显示价格，右轴显示相对当前视图首根开盘价的涨跌幅。
 - 光标命中蜡烛实体或影线时显示 OHLCV 浮层。
 - 支持夜间/日间主题。
+- 美股/ETF 可选择“全复权”“仅拆股复权”或“原始价格”；页面列出当前范围内的拆股、
+  分红和更名等公司行动。只有明确标记为 Alpaca 原始价格的数据才执行复权，未知口径会
+  保持原样并提示，避免重复复权。
+- 行情读取期间同一状态条显示同步进度；完成后该位置切换为公司行动摘要，不同时占用
+  两行空间。
 
 预设周期：
 
@@ -222,11 +227,18 @@ AUTO_OPEN_BROWSER=false python app.py
 - 删除会真实移除策略记录；已完成运行仍保留不可变策略快照和结果。
 - 非代码策略支持 single、distribution、competition，公式支持 OHLCV、MA、EMA、ATR
   和布尔/比较运算。
-- 设置起止日期、初始资金、每股/最低手续费、滑点、碎股、无风险利率及比较基准后运行。
+- 设置起止日期、初始资金、1–10 倍账户杠杆、每股/最低手续费、滑点、碎股、无风险利率
+  及比较基准后运行。杠杆账户按分钟监控权益，爆仓后强平并提前结束，但仍生成完整结果。
 - 新策略默认结束日期为当前日期前一天、每股手续费 0.01 美元、每笔最低手续费 1 美元、
   年化无风险利率 4.5%。
 - 工作区实时显示策略/基准曲线、关键指标、成交摘要和 DEBUG/INFO/ERROR 分级日志。
-- 日志可下载为纯文本 LOG 或双工作表 XLS；XLS 分为逐笔买卖明细和代码策略自定义分析。
+- 新建运行会保存一行不可变的运行参数摘要，点击历史运行“查看”时展示；旧运行没有摘要
+  时保持空白。
+- 页面右上“回测结果”展示所有策略的历次运行总览，可按页查看回测区间、标的、杠杆、
+  收益和最大回撤；点击某行进入只读历史详情，运行设置仍通过右上角按钮查看且不能修改。
+  批量“删除”会让所选终态运行从普通界面消失，并清除详细日志及每日权益/持仓节点；
+  数据库保留隐藏的策略快照、运行设置和总览指标，供将来实现摘要恢复。
+- 日志可下载为纯文本 LOG 或 XLS；XLS 包含运行摘要、逐笔买卖明细和代码策略自定义分析。
   急跌/ATR 策略的自定义表按日为每个候选成对展示评分公式与结果，并横向列出各硬过滤、
   最终操作和卖出 PnL；七星策略按日展示全池评分、各类过滤结果和最终操作。
 - 资金曲线支持鼠标十字线，显示对应日期、权益、现金、收益率和各标的持仓比例。
@@ -318,7 +330,11 @@ GET /api/alpaca/stock-bars?symbol=GLD&timeframe=1Min&start=2020-01-02&end=2020-0
 - `1M` 按自然月聚合；
 - OHLCV 规则为首根 Open、最高 High、最低 Low、末根 Close、成交量求和。
 
-当前不处理拆股、分红等复权。
+美股/ETF 的日线与日线聚合周期按界面选择应用公司行动复权；分钟图先按交易日聚合后使用
+同一日级因子，避免同一交易日内因子不一致。原始 K 线始终保留在数据库中，不回写改造。
+回测成交和账户盯市使用原始价格，技术指标使用截至当时可知的拆股/分红复权历史。
+详细口径与全标的审计见
+[公司行动与价格口径](docs/corporate_actions.md)。
 
 ## 6. 双数据库设计
 
@@ -346,6 +362,8 @@ database/intraday_schema.sql
 | --- | --- | --- |
 | `symbols` | 标的主数据和界面设置 | `symbol` 唯一；总览显示、顺序、周末设置、Alpaca 能力 |
 | `daily_prices` | 日线 OHLCV | `UNIQUE(symbol, date)`；数据源、原周期、完整状态 |
+| `instrument_symbols` / `instrument_identifiers` | 标的身份沿革 | CUSIP/ISIN 与新旧代码的有效期映射 |
+| `corporate_actions` / `corporate_action_legs` | 公司行动 | 事件公共字段及 source/target/acquirer 等参与方 |
 | `symbol_aliases` | 多数据源代码映射 | `common_symbol` 唯一；显示、Yahoo、Twelve Data 代码 |
 | `api_request_logs` | 数据源调用日志 | provider、symbol、状态、错误码、消息 |
 | `indicators` | 全局指标定义 | 指标类型和参数组合唯一 |
@@ -360,6 +378,8 @@ database/intraday_schema.sql
 - `daily_prices.source_provider`：如 `alpaca`、`yahoo`、`twelvedata`；
 - `daily_prices.source_timeframe`：原始周期，分钟派生日线使用 `derived_1m`；
 - `daily_prices.is_complete`：标记当前日线是否完整；
+- `daily_prices.price_basis`：`raw`、`split_adjusted`、`total_return_adjusted` 或
+  `unknown`，复权前必须核验；
 - `trendline_analysis_snapshots.payload_json`：完整分析结果；
 - `trendline_analysis_snapshots.summary_json`：行情总览使用的紧凑摘要。
 
@@ -603,6 +623,6 @@ trade_robot/
 - 回测支持拆股动态复权和现金分红；其他页面仍展示数据库原始 OHLC；
 - 分钟图和分钟派生日线只使用美东常规交易时段；
 - 回测使用官方交易日历缓存；现有 K 线聚合流程仍沿用自身常规交易时段逻辑；
-- 回测不模拟订单簿、部分成交、市场冲击、税费、融资融券等；固定滑点需由使用者保守设置；
+- 回测不模拟订单簿、部分成交、市场冲击、税费和融资利息；固定滑点需由使用者保守设置；
 - 数据库浏览器只分页展示主数据库，分钟库通过质量脚本检查；
 - 系统定位为本机单用户应用，不应直接暴露到公网。

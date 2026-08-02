@@ -24,6 +24,10 @@ def calculate_metrics(
     risk_free_rate: float = 0,
     total_commission: float = 0,
     total_slippage: float = 0,
+    termination_reason: str | None = None,
+    liquidation: dict | None = None,
+    leverage_multiplier: float = 1,
+    max_observed_gross_leverage: float = 0,
 ) -> dict:
     if not equity_points:
         return {}
@@ -42,7 +46,7 @@ def calculate_metrics(
     annualized_return = (
         (ending / float(initial_capital)) ** (DAYS_PER_YEAR / elapsed_days) - 1
         if elapsed_days > 0 and ending > 0
-        else total_return
+        else total_return if ending > 0 else None
     )
     volatility = (
         pstdev(daily_returns) * math.sqrt(TRADING_DAYS_PER_YEAR)
@@ -70,6 +74,9 @@ def calculate_metrics(
         if excess and downside_deviation > 1e-15
         else None
     )
+    if ending <= 0:
+        sharpe = None
+        sortino = None
 
     running_peak = float(initial_capital)
     running_peak_date = "INITIAL"
@@ -116,7 +123,11 @@ def calculate_metrics(
         "annualized_volatility": volatility,
         "sharpe_ratio": sharpe,
         "sortino_ratio": sortino,
-        "calmar_ratio": _ratio(annualized_return, max_drawdown),
+        "calmar_ratio": (
+            _ratio(annualized_return, max_drawdown)
+            if annualized_return is not None
+            else None
+        ),
         "trade_count": len(trades),
         "closed_trade_count": len(sells),
         "win_rate": len(wins) / len(sells) if sells else None,
@@ -127,7 +138,11 @@ def calculate_metrics(
         "total_commission": float(total_commission),
         "total_slippage": float(total_slippage),
         "average_exposure": fmean(exposures) if exposures else 0.0,
-        "turnover": _ratio(gross_turnover, average_equity),
+        "turnover": (
+            _ratio(gross_turnover, average_equity)
+            if average_equity > 0
+            else None
+        ),
         "benchmark_total_return": (
             float(benchmark_return) if benchmark_return is not None else None
         ),
@@ -138,6 +153,17 @@ def calculate_metrics(
         ),
         "session_count": len(equity_points),
         "elapsed_calendar_days": elapsed_days,
+        "leverage_multiplier": float(leverage_multiplier),
+        "max_gross_leverage": max(
+            float(max_observed_gross_leverage),
+            max(
+                (float(point.get("gross_leverage") or 0) for point in equity_points),
+                default=0.0,
+            ),
+        ),
+        "termination_reason": termination_reason,
+        "liquidated": termination_reason == "LIQUIDATED",
+        "liquidation": liquidation,
         "calculation": {
             "return_frequency": "daily_close",
             "trading_days_per_year": TRADING_DAYS_PER_YEAR,

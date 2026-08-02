@@ -206,9 +206,10 @@ def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
             INSERT INTO symbols
                 (symbol, name, exchange_name, currency, show_weekend_data,
                  show_in_overview, display_order, asset_class, quantity_step,
+                 alpaca_asset_id, cusip, isin,
                  history_start_date, history_start_source,
                  history_start_verified, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 name = COALESCE(excluded.name, symbols.name),
                 exchange_name = COALESCE(excluded.exchange_name, symbols.exchange_name),
@@ -218,6 +219,9 @@ def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
                     ELSE symbols.asset_class
                 END,
                 quantity_step = COALESCE(excluded.quantity_step, symbols.quantity_step),
+                alpaca_asset_id = COALESCE(excluded.alpaca_asset_id, symbols.alpaca_asset_id),
+                cusip = COALESCE(excluded.cusip, symbols.cusip),
+                isin = COALESCE(excluded.isin, symbols.isin),
                 history_start_date = COALESCE(
                     excluded.history_start_date,
                     symbols.history_start_date
@@ -240,6 +244,9 @@ def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
                 next_order,
                 metadata.get("asset_class") or "us_equity",
                 metadata.get("quantity_step"),
+                metadata.get("alpaca_asset_id"),
+                metadata.get("cusip"),
+                metadata.get("isin"),
                 metadata.get("history_start_date"),
                 metadata.get("history_start_source"),
                 1 if metadata.get("history_start_verified") else 0,
@@ -290,8 +297,9 @@ def get_symbol(symbol: str) -> dict:
             """
             SELECT id, symbol, name, exchange_name, currency,
                    show_weekend_data, show_in_overview,
-                   alpaca_symbol, alpaca_supported, alpaca_checked_at, alpaca_error,
-                   asset_class, quantity_step, history_start_date,
+                   alpaca_symbol, alpaca_asset_id, alpaca_supported,
+                   alpaca_checked_at, alpaca_error, asset_class, cusip, isin,
+                   quantity_step, history_start_date,
                    history_start_source, history_start_verified,
                    created_at, updated_at
             FROM symbols
@@ -367,6 +375,7 @@ def set_alpaca_capability(
     *,
     supported: bool,
     alpaca_symbol: str | None = None,
+    alpaca_asset_id: str | None = None,
     error: str | None = None,
 ) -> dict:
     normalized = normalize_symbol_key(symbol)
@@ -377,6 +386,7 @@ def set_alpaca_capability(
             """
             UPDATE symbols
             SET alpaca_symbol = ?,
+                alpaca_asset_id = COALESCE(?, alpaca_asset_id),
                 alpaca_supported = ?,
                 alpaca_checked_at = ?,
                 alpaca_error = ?,
@@ -385,6 +395,7 @@ def set_alpaca_capability(
             """,
             (
                 normalize_symbol_key(alpaca_symbol or normalized),
+                alpaca_asset_id,
                 1 if supported else 0,
                 now,
                 error,
@@ -1153,6 +1164,13 @@ def upsert_daily_prices(
     source_timeframe: str | None = None,
 ) -> int:
     now = utc_now_iso()
+    def price_basis(row: dict) -> str:
+        explicit = str(row.get("price_basis") or "").strip().lower()
+        if explicit in {"raw", "split_adjusted", "total_return_adjusted", "unknown"}:
+            return explicit
+        provider = str(row.get("source_provider") or source_provider or "").lower()
+        return "raw" if provider == "alpaca" else "unknown"
+
     payload = [
         (
             symbol,
@@ -1164,6 +1182,7 @@ def upsert_daily_prices(
             row.get("volume", 0),
             row.get("source_provider", source_provider),
             row.get("source_timeframe", source_timeframe),
+            price_basis(row),
             1 if row.get("is_complete", True) else 0,
             now,
             now,
@@ -1175,9 +1194,9 @@ def upsert_daily_prices(
             """
             INSERT INTO daily_prices
                 (symbol, date, open, high, low, close, volume,
-                 source_provider, source_timeframe, is_complete,
-                 created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 source_provider, source_timeframe, price_basis,
+                 is_complete, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol, date) DO UPDATE SET
                 open = excluded.open,
                 high = excluded.high,
@@ -1186,6 +1205,7 @@ def upsert_daily_prices(
                 volume = excluded.volume,
                 source_provider = excluded.source_provider,
                 source_timeframe = excluded.source_timeframe,
+                price_basis = excluded.price_basis,
                 is_complete = excluded.is_complete,
                 updated_at = excluded.updated_at
             """,
@@ -1242,7 +1262,7 @@ def get_daily_prices(
         params.append(start_date)
     fields = "date, open, high, low, close, volume"
     if include_metadata:
-        fields += ", source_provider, source_timeframe, is_complete, updated_at"
+        fields += ", source_provider, source_timeframe, price_basis, is_complete, updated_at"
 
     with get_connection() as conn:
         rows = conn.execute(

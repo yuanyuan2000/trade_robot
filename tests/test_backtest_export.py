@@ -103,7 +103,10 @@ class BacktestExportTests(unittest.TestCase):
 
         workbook = xlrd.open_workbook(file_contents=build_run_xls(run["id"]))
 
-        self.assertEqual(workbook.sheet_names(), ["买卖操作", "策略自定义日志"])
+        self.assertEqual(
+            workbook.sheet_names(),
+            ["运行摘要", "买卖操作", "策略自定义日志"],
+        )
         trades = workbook.sheet_by_name("买卖操作")
         trade_headers = trades.row_values(0)
         self.assertEqual(trades.cell_value(1, trade_headers.index("操作")), "卖出")

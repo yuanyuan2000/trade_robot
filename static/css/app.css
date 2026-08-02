@@ -1873,7 +1873,15 @@ td {
 
 .backtest-results {
   display: grid;
-  grid-template-rows: auto minmax(340px, 1fr) auto;
+  grid-template-rows: auto auto minmax(340px, 1fr) auto;
+}
+
+.backtest-run-config-summary {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .backtest-metrics {
@@ -1887,7 +1895,7 @@ td {
 .backtest-metric {
   min-width: 0;
   background: var(--surface);
-  padding: 11px 13px;
+  padding: 7px 9px;
 }
 
 .backtest-metric span {
@@ -1898,10 +1906,10 @@ td {
 
 .backtest-metric strong {
   display: block;
-  margin-top: 4px;
+  margin-top: 2px;
   overflow: hidden;
   color: var(--text);
-  font-size: 16px;
+  font-size: 14px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2148,4 +2156,35 @@ td {
   .backtest-settings-grid {
     grid-template-columns: 1fr;
   }
+}
+.corporate-action-events {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.backtest-result-compact {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.backtest-result-symbols {
+  max-width: 190px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.backtest-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.backtest-readonly .backtest-designer input,
+.backtest-readonly .backtest-designer textarea,
+.backtest-readonly .backtest-designer select {
+  pointer-events: none;
+  opacity: 0.78;
 }

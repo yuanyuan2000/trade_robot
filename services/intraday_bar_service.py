@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from database import intraday_repository, repository
 from services.alpaca_data_client import fetch_asset
+from services.corporate_action_adjustment_service import adjusted_daily_payload
 
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -69,6 +70,7 @@ def refresh_alpaca_capability(symbol: str) -> dict:
         normalized,
         supported=bool(result["supported"]),
         alpaca_symbol=result.get("symbol") or normalized,
+        alpaca_asset_id=result.get("asset_id"),
         error=result.get("reason"),
     )
     return {**result, "symbol_settings": settings}
@@ -152,7 +154,12 @@ def aggregate_daily_rows(rows: list[dict], spec: dict) -> list[dict]:
     ]
 
 
-def get_chart_bars(symbol: str, period: str, limit: int = 1500) -> dict:
+def get_chart_bars(
+    symbol: str,
+    period: str,
+    limit: int = 1500,
+    adjustment: str = "all",
+) -> dict:
     normalized = symbol.strip().upper()
     if not normalized:
         raise ValueError("Symbol is required")
@@ -163,8 +170,19 @@ def get_chart_bars(symbol: str, period: str, limit: int = 1500) -> dict:
         settings = refresh_alpaca_capability(normalized)["symbol_settings"]
 
     if not spec["intraday"]:
-        rows = repository.get_daily_prices(normalized)
-        bars = aggregate_daily_rows(rows, spec)[-requested_limit:]
+        rows = repository.get_daily_prices(normalized, include_metadata=True)
+        try:
+            adjusted = adjusted_daily_payload(
+                normalized, rows, settings, mode=adjustment
+            )
+        except Exception as exc:
+            adjusted = {
+                "rows": rows,
+                "actions": [],
+                "adjustment": "raw",
+                "warning": f"公司行动复权失败，当前显示原始行情：{exc}",
+            }
+        bars = aggregate_daily_rows(adjusted["rows"], spec)[-requested_limit:]
         return {
             "ok": True,
             "symbol": normalized,
@@ -173,7 +191,9 @@ def get_chart_bars(symbol: str, period: str, limit: int = 1500) -> dict:
             "source": "database",
             "symbol_settings": settings,
             "data": bars,
-            "warning": None,
+            "warning": adjusted["warning"],
+            "adjustment": adjusted["adjustment"],
+            "corporate_actions": adjusted["actions"],
         }
 
     if settings.get("alpaca_supported") is False:
@@ -220,6 +240,21 @@ def get_chart_bars(symbol: str, period: str, limit: int = 1500) -> dict:
                 int(len(raw_rows) * 1.5),
             )
 
+    if bars:
+        raw_bars = [{**row, "price_basis": "raw"} for row in bars]
+        try:
+            adjusted = adjusted_daily_payload(
+                normalized, raw_bars, settings, mode=adjustment
+            )
+            bars = adjusted["rows"]
+        except Exception as exc:
+            adjusted = {
+                "actions": [],
+                "adjustment": "raw",
+                "warning": f"公司行动复权失败，当前显示原始行情：{exc}",
+            }
+    else:
+        adjusted = {"actions": [], "adjustment": "raw", "warning": None}
     sync_state = intraday_repository.get_sync_state(normalized)
     warning = None
     if not bars:
@@ -230,6 +265,8 @@ def get_chart_bars(symbol: str, period: str, limit: int = 1500) -> dict:
         )
     elif sync_state.get("status") not in {"success"}:
         warning = "分钟历史仍在导入或上次导入未完成，当前展示已落库部分。"
+    if adjusted["warning"]:
+        warning = adjusted["warning"]
     return {
         "ok": True,
         "symbol": normalized,
@@ -240,6 +277,8 @@ def get_chart_bars(symbol: str, period: str, limit: int = 1500) -> dict:
         "sync_state": sync_state,
         "data": bars[-requested_limit:],
         "warning": warning,
+        "adjustment": adjusted["adjustment"],
+        "corporate_actions": adjusted["actions"],
     }
 
 

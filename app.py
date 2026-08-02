@@ -123,6 +123,7 @@ def market_data_query():
     return market_data_response(
         request.args.get("symbol", ""),
         include_intraday=request.args.get("include_intraday") in {"1", "true", "yes"},
+        adjustment=request.args.get("adjustment"),
     )
 
 
@@ -139,6 +140,7 @@ def market_bars_query():
                 request.args.get("symbol", ""),
                 request.args.get("period", "1D"),
                 int(request.args.get("limit", "1500")),
+                request.args.get("adjustment", "all"),
             )
         )
     except ValueError as exc:
@@ -235,6 +237,7 @@ def trendline_analysis_response(symbol: str):
             period=period,
             limit=limit,
             show_weekend_data=request.args.get("show_weekend_data"),
+            adjustment=request.args.get("adjustment", "all"),
         )
         if period.upper() == "1D" and limit == 150:
             save_analysis_overview_snapshot(symbol, payload)
@@ -272,14 +275,16 @@ def trendline_analysis_response(symbol: str):
         )
 
 
-def market_data_response(symbol: str, include_intraday: bool = False):
+def market_data_response(
+    symbol: str,
+    include_intraday: bool = False,
+    adjustment: str | None = None,
+):
     try:
-        return jsonify(
-            get_market_data(
-                symbol,
-                include_intraday=include_intraday,
-            )
-        )
+        kwargs = {"include_intraday": include_intraday}
+        if adjustment is not None:
+            kwargs["adjustment"] = adjustment
+        return jsonify(get_market_data(symbol, **kwargs))
     except ValueError as exc:
         return (
             jsonify(
@@ -1295,6 +1300,49 @@ def get_backtest_run(run_id: int):
         return backtest_error_response(exc)
 
 
+@app.route("/api/backtest/runs")
+def list_all_backtest_runs():
+    try:
+        strategy_id = request.args.get("strategy_id")
+        return jsonify({
+            "ok": True,
+            **backtest_repository.list_runs_overview(
+                page=int(request.args.get("page", "1")),
+                page_size=int(request.args.get("page_size", "25")),
+                strategy_id=int(strategy_id) if strategy_id else None,
+                status=request.args.get("status") or None,
+            ),
+        })
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/runs/<int:run_id>/detail")
+def get_backtest_run_detail(run_id: int):
+    try:
+        return jsonify({
+            "ok": True,
+            "run": backtest_repository.get_run_detail(run_id),
+            "equity_points": backtest_repository.get_equity_points(run_id),
+            "trades": backtest_repository.get_trades(run_id),
+        })
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/runs/deletions", methods=["POST"])
+def delete_backtest_runs():
+    payload = request.get_json(silent=True) or {}
+    try:
+        if payload.get("confirm") is not True:
+            raise ValueError("必须明确确认不可逆删除。")
+        result = backtest_repository.delete_runs(payload.get("run_ids") or [])
+        backtest_run_manager.purge_deleted_runs(result["run_ids"])
+        return jsonify({"ok": True, **result})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
 @app.route("/api/backtest/runs/<int:run_id>/cancel", methods=["POST"])
 def cancel_backtest_run(run_id: int):
     try:
@@ -1314,6 +1362,7 @@ def backtest_run_results(run_id: int):
 @app.route("/api/backtest/runs/<int:run_id>/logs")
 def backtest_run_logs(run_id: int):
     try:
+        backtest_repository.get_run(run_id, include_snapshot=False)
         logs = backtest_repository.get_logs(
             run_id,
             level=request.args.get("level", "DEBUG"),

@@ -123,10 +123,20 @@ class CodeStrategy:
     def on_event(self, context) -> list[OrderIntent]:
         raise NotImplementedError
 
+    def describe_run(self, definition: dict) -> str:
+        """Return the immutable one-line strategy description stored with a run."""
+        values = []
+        for name, value in self.params.items():
+            label = self.parameter_schema.get(name, {}).get("label", name)
+            if isinstance(value, bool):
+                value = "开启" if value else "关闭"
+            values.append(f"{label}={value}")
+        return f"{self.name}：{'，'.join(values)}"
+
 
 class RapidDropAtrRotationStrategy(CodeStrategy):
     key = "rapid_drop_atr_rotation"
-    version = "1.2.0"
+    version = "1.3.0"
     name = "急跌回避与 ATR 动量轮动"
     description = (
         "风险检查时按可独立启用的百分比/ATR 单日急跌规则过滤标的，"
@@ -280,6 +290,23 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
             drop_requirement,
             values["momentum_lookback_sessions"],
             values["atr_period"] + 1,
+        )
+
+    def describe_run(self, definition: dict) -> str:
+        filters = []
+        if self.params["enable_percent_drop_filter"]:
+            filters.append(f"{self.params['drop_threshold_percent']:g}%急跌")
+        if self.params["enable_atr_drop_filter"]:
+            filters.append(
+                f"{self.params['drop_threshold_atr']:g}倍ATR急跌"
+            )
+        return (
+            f"{self.params['risk_check_time']}检查"
+            f"{self.params['drop_lookback_sessions']}日{'/'.join(filters) or '无急跌过滤'}，"
+            f"{self.params['selection_time']}按"
+            f"{self.params['momentum_lookback_sessions']}日ATR动量选择前"
+            f"{self.params['holdings_num']}只，总目标仓位"
+            f"{self.params['target_weight']:g}%（目标不变时不重复再平衡）"
         )
 
     def on_event(self, context) -> list[OrderIntent]:
@@ -488,12 +515,12 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
             if symbol not in target_set and context.portfolio.quantity(symbol) > 0
         ]
         for symbol in targets:
-            current_percent = float(context.portfolio.weight(symbol, context.marks)) * 100
-            action = "BUY" if current_percent < target_percent else "SELL"
+            if context.portfolio.quantity(symbol) > 0:
+                continue
             intents.append(
                 OrderIntent(
                     symbol=symbol,
-                    action=action,
+                    action="BUY",
                     sizing_mode="TARGET",
                     value_percent=target_percent,
                     reason=(
@@ -735,6 +762,15 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
             for item in definition.get("symbols", [])
         ):
             raise BacktestValidationError("七星策略候选池的单标的最大仓位固定为 100%。")
+
+    def describe_run(self, definition: dict) -> str:
+        return (
+            f"七星使用{self.params['lookback_days']}日长期趋势、"
+            f"{self.params['short_lookback_days']}日短动量，"
+            f"{self.params['sell_time']}排名卖出、{self.params['buy_time']}买入，"
+            f"持有前{self.params['holdings_num']}只，无候选时转入"
+            f"{self.params['defensive_symbol']}"
+        )
 
     def on_event(self, context) -> list[OrderIntent]:
         if (
@@ -1001,7 +1037,11 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
         target_percent = 100.0 / len(targets)
         tolerance = self.params["rebalance_tolerance_percent"] / 100
         equity = float(context.portfolio.equity(context.marks))
-        target_value = equity / len(targets)
+        target_value = (
+            equity
+            * float(context.portfolio.leverage_multiplier)
+            / len(targets)
+        )
         intents = []
         for symbol in targets:
             current_value = float(context.portfolio.quantity(symbol)) * context.marks[symbol]

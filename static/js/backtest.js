@@ -11,10 +11,15 @@ const bt = {
   displayInitialCapital: 100000,
   chartHoverIndex: null,
   symbolDefaults: [],
+  readOnly: false,
+  returnToResults: false,
+  resultsPage: 1,
+  resultsTotalPages: 1,
 };
 
 const btListPage = document.getElementById("backtest-list-page");
 const btWorkspace = document.getElementById("backtest-workspace");
+const btResultsPage = document.getElementById("backtest-results-page");
 const btStatus = document.getElementById("backtest-status");
 const btWorkspaceStatus = document.getElementById("backtest-workspace-status");
 const btStrategyTable = document.getElementById("backtest-strategy-table");
@@ -35,6 +40,9 @@ const btChartEmpty = document.getElementById("backtest-chart-empty");
 const btLogOutput = document.getElementById("backtest-log-output");
 const btLogCount = document.getElementById("backtest-log-count");
 const btRunHistory = document.getElementById("backtest-run-history");
+const btRunConfigSummary = document.getElementById("backtest-run-config-summary");
+const btResultsStatus = document.getElementById("backtest-results-status");
+const btResultsTable = document.getElementById("backtest-results-table");
 
 function btEscape(value) {
   return String(value ?? "")
@@ -102,7 +110,7 @@ function renderBacktestStrategyList() {
     const symbols = (strategy.definition?.symbols || []).map((item) => item.symbol).join(", ");
     const run = strategy.latest_run;
     const runText = run
-      ? `${btRunStatusLabel(run.status)}${run.metrics?.total_return != null ? ` · ${btPercent(run.metrics.total_return)}` : ""}`
+      ? `${btRunOutcomeLabel(run)}${run.metrics?.total_return != null ? ` · ${btPercent(run.metrics.total_return)}` : ""}`
       : "尚未运行";
     return `
       <tr class="backtest-strategy-row" data-strategy-id="${strategy.id}">
@@ -126,6 +134,8 @@ function renderBacktestStrategyList() {
 async function openBacktestStrategy(strategyId) {
   btSetStatus("正在读取策略...", "neutral");
   try {
+    bt.readOnly = false;
+    bt.returnToResults = false;
     if (!bt.codeCatalog.length) await loadBacktestCodeCatalog();
     const payload = await btJson(await fetch(`/api/backtest/strategies/${strategyId}`));
     bt.current = payload.strategy;
@@ -134,6 +144,7 @@ async function openBacktestStrategy(strategyId) {
     btListPage.hidden = true;
     btWorkspace.hidden = false;
     renderBacktestEditor();
+    setBacktestReadOnly(false);
     if (bt.runs.length) {
       await loadBacktestRunResult(bt.runs[0].id, bt.runs[0].status);
     } else {
@@ -142,6 +153,106 @@ async function openBacktestStrategy(strategyId) {
     btSetStatus("策略已加载。", "success", true);
   } catch (error) {
     btSetStatus(btErrorText(error), "error");
+  }
+}
+
+function setBacktestReadOnly(readOnly) {
+  bt.readOnly = Boolean(readOnly);
+  btWorkspace.classList.toggle("backtest-readonly", bt.readOnly);
+  ["backtest-save", "backtest-validate", "backtest-run"].forEach((id) => {
+    document.getElementById(id).hidden = bt.readOnly;
+  });
+  const settingsButton = document.getElementById("backtest-settings");
+  settingsButton.hidden = false;
+  settingsButton.textContent = bt.readOnly ? "查看设置" : "设置";
+  btSettingsDialog.querySelectorAll("input, select").forEach((element) => {
+    element.disabled = bt.readOnly;
+  });
+  document.getElementById("backtest-settings-submit").hidden = bt.readOnly;
+  document.getElementById("backtest-cancel").hidden = true;
+  ["backtest-add-symbol", "backtest-reset-symbols", "backtest-add-rule"].forEach((id) => {
+    const element = document.getElementById(id);
+    if (element) element.hidden = bt.readOnly;
+  });
+  btWorkspace.querySelectorAll("input, textarea, select").forEach((element) => {
+    element.disabled = bt.readOnly;
+  });
+  const historySection = btRunHistory.closest("section");
+  if (historySection) historySection.hidden = bt.readOnly;
+  document.getElementById("backtest-mode-badge").textContent = bt.readOnly
+    ? "历史只读"
+    : document.getElementById("backtest-mode-badge").textContent;
+}
+
+async function loadBacktestResultsOverview(page = 1) {
+  btResultsStatus.textContent = "正在加载回测结果...";
+  btResultsStatus.className = "status neutral";
+  try {
+    const payload = await btJson(await fetch(`/api/backtest/runs?page=${page}&page_size=25`));
+    bt.resultsPage = payload.page;
+    bt.resultsTotalPages = payload.total_pages;
+    document.getElementById("backtest-results-count").textContent = `共 ${payload.total_rows} 条`;
+    document.getElementById("backtest-results-page-text").textContent = `第 ${payload.page} 页 / 共 ${payload.total_pages} 页`;
+    document.getElementById("backtest-results-prev").disabled = payload.page <= 1;
+    document.getElementById("backtest-results-next").disabled = payload.page >= payload.total_pages;
+    const headers = ["", "编号", "回测时间", "策略名称", "回测区间", "标的", "杠杆", "状态", "收益率", "最大回撤", "成交"];
+    const rows = (payload.items || []).map((run) => `
+      <tr data-result-run-id="${run.id}">
+        <td><input class="bt-result-select" type="checkbox" value="${run.id}" ${["queued", "validating", "running", "cancelling"].includes(run.status) ? "disabled" : ""}></td>
+        <td>#${run.id}</td>
+        <td>${btEscape(btDateTime(run.created_at))}</td>
+        <td>${btEscape(run.strategy_name)}</td>
+        <td class="backtest-result-compact">${btCompactDate(run.settings?.start_date)}<br>${btCompactDate(run.settings?.end_date)}</td>
+        <td class="backtest-result-compact backtest-result-symbols">${btEscape((run.symbols || []).join(" / ") || "—")}</td>
+        <td>${btEscape(run.settings?.leverage_multiplier == null ? "—" : `${run.settings.leverage_multiplier}×`)}</td>
+        <td>${btEscape(btRunOutcomeLabel(run))}</td>
+        <td>${btPercent(run.metrics?.total_return)}</td>
+        <td>${btPercent(run.metrics?.max_drawdown)}</td>
+        <td>${btEscape(run.metrics?.trade_count ?? "—")}</td>
+      </tr>`).join("");
+    btResultsTable.innerHTML = `<thead><tr>${headers.map((item) => `<th>${item}</th>`).join("")}</tr></thead><tbody>${rows || '<tr><td colspan="11">暂无回测结果</td></tr>'}</tbody>`;
+    document.getElementById("backtest-delete-runs").disabled = true;
+    btResultsStatus.textContent = "回测结果已加载。";
+    btResultsStatus.className = "status success";
+  } catch (error) {
+    btResultsStatus.textContent = btErrorText(error);
+    btResultsStatus.className = "status error";
+  }
+}
+
+async function openBacktestRunDetail(runId) {
+  try {
+    if (!bt.codeCatalog.length) await loadBacktestCodeCatalog();
+    const payload = await btJson(await fetch(`/api/backtest/runs/${runId}/detail`));
+    const run = payload.run;
+    bt.current = structuredClone(run.strategy_snapshot || {});
+    bt.current.default_settings = structuredClone(run.settings || {});
+    bt.currentRunId = run.id;
+    bt.runs = [];
+    bt.equityPoints = payload.equity_points || [];
+    bt.trades = payload.trades || [];
+    bt.logs = run.logs_deleted_at ? [] : await loadAllBacktestLogs(run.id);
+    bt.displayInitialCapital = Number(run.settings?.initial_capital || 100000);
+    bt.returnToResults = true;
+    btListPage.hidden = true;
+    btResultsPage.hidden = true;
+    btWorkspace.hidden = false;
+    renderBacktestEditor();
+    setBacktestReadOnly(true);
+    renderBacktestConfigurationSummary(run);
+    renderBacktestMetrics(run.metrics);
+    btChartEmpty.hidden = Boolean(bt.equityPoints.length);
+    renderBacktestChart();
+    renderBacktestLogs();
+    renderBacktestTradeSummary(run);
+    btSetStatus(
+      run.logs_deleted_at ? `历史回测 #${run.id}；详细日志已清理。` : `历史回测 #${run.id}（只读）。`,
+      run.logs_deleted_at ? "warning" : "neutral",
+      true,
+    );
+  } catch (error) {
+    btResultsStatus.textContent = btErrorText(error);
+    btResultsStatus.className = "status error";
   }
 }
 
@@ -368,6 +479,8 @@ function resetBacktestResult() {
   bt.chartHoverIndex = null;
   bt.displayInitialCapital = Number(bt.current?.default_settings?.initial_capital || 100000);
   btMetrics.innerHTML = '<div class="backtest-empty">运行后显示关键指标</div>';
+  btRunConfigSummary.hidden = true;
+  btRunConfigSummary.textContent = "";
   btChartEmpty.hidden = false;
   document.getElementById("backtest-trade-summary").textContent = "";
   renderBacktestChart();
@@ -379,6 +492,7 @@ function settingsToForm() {
   document.getElementById("backtest-start-date").value = value.start_date;
   document.getElementById("backtest-end-date").value = value.end_date;
   document.getElementById("backtest-initial-capital").value = value.initial_capital;
+  document.getElementById("backtest-leverage").value = value.leverage_multiplier ?? 1;
   document.getElementById("backtest-commission-share").value = value.commission_per_share;
   document.getElementById("backtest-minimum-commission").value = value.minimum_commission;
   document.getElementById("backtest-slippage").value = value.slippage_bps;
@@ -393,6 +507,7 @@ function settingsFromForm() {
     start_date: document.getElementById("backtest-start-date").value,
     end_date: document.getElementById("backtest-end-date").value,
     initial_capital: Number(document.getElementById("backtest-initial-capital").value),
+    leverage_multiplier: Number(document.getElementById("backtest-leverage").value),
     commission_per_share: Number(document.getElementById("backtest-commission-share").value),
     minimum_commission: Number(document.getElementById("backtest-minimum-commission").value),
     slippage_bps: Number(document.getElementById("backtest-slippage").value),
@@ -439,9 +554,13 @@ function connectBacktestEvents(runId) {
       bt.eventSource = null;
       btSetRunning(false);
       await loadBacktestRunResult(runId, status);
-      const type = status === "completed" ? "success" : status === "cancelled" ? "warning" : "error";
+      const type = status === "completed"
+        ? payload.run.termination_reason === "LIQUIDATED" ? "warning" : "success"
+        : status === "cancelled" ? "warning" : "error";
       btSetStatus(
-        status === "completed" ? "回测完成。" : payload.run.error_message || btRunStatusLabel(status),
+        status === "completed"
+          ? payload.run.termination_reason === "LIQUIDATED" ? "回测已爆仓并生成结果。" : "回测完成。"
+          : payload.run.error_message || btRunStatusLabel(status),
         type,
         true,
       );
@@ -502,6 +621,7 @@ async function loadBacktestRunResult(runId, knownStatus = "") {
     bt.equityPoints = payload.equity_points || [];
     bt.trades = payload.trades || [];
     bt.logs = await loadAllBacktestLogs(runId);
+    renderBacktestConfigurationSummary(payload.run);
     renderBacktestMetrics(payload.run.metrics);
     btChartEmpty.hidden = Boolean(bt.equityPoints.length);
     renderBacktestChart();
@@ -514,6 +634,12 @@ async function loadBacktestRunResult(runId, knownStatus = "") {
   } catch (error) {
     btSetStatus(btErrorText(error), "error", true);
   }
+}
+
+function renderBacktestConfigurationSummary(run) {
+  const summary = String(run?.configuration_summary || "").trim();
+  btRunConfigSummary.textContent = summary;
+  btRunConfigSummary.hidden = !summary;
 }
 
 async function loadAllBacktestLogs(runId) {
@@ -541,6 +667,8 @@ function renderBacktestMetrics(metrics) {
     return;
   }
   const fields = [
+    ["运行结果", metrics.liquidated ? "已爆仓" : "正常完成", metrics.liquidated ? "账户权益不大于零后已强制平仓并提前结束。" : "回测运行至设置的结束日期。"],
+    ["杠杆倍率", `${btNumber(metrics.leverage_multiplier ?? 1)}×`, "策略仓位对应的账户级固定杠杆倍率。"],
     ["期末权益", btMoney(metrics.ending_equity), "回测结束时的现金、应收款与持仓市值之和。"],
     ["总收益率", btPercent(metrics.total_return), "期末权益相对初始资金的累计变化。"],
     ["年化收益率", btPercent(metrics.annualized_return), "将区间总收益按交易日折算为一年。短区间结果可能不稳定。"],
@@ -554,6 +682,9 @@ function renderBacktestMetrics(metrics) {
     ["换手率", btPercent(metrics.turnover), "成交总额除以平均权益，反映资金周转频率和交易成本敏感度。"],
     ["超额收益", btPercent(metrics.excess_return), "策略总收益率减去比较基准总收益率。"],
   ];
+  if (metrics.liquidated && metrics.liquidation?.liquidation_time) {
+    fields.splice(2, 0, ["爆仓时间", metrics.liquidation.liquidation_time, "分钟级风险时钟首次检测到账户权益不大于零的时间。"]);
+  }
   btMetrics.innerHTML = fields.map(([label, value, title]) => `
     <div class="backtest-metric" title="${btEscape(title)}"><span>${label}</span><strong>${value}</strong></div>
   `).join("");
@@ -758,7 +889,7 @@ function renderBacktestRunHistory() {
   btRunHistory.innerHTML = bt.runs.map((run) => `
     <div class="backtest-run-item">
       <span>#${run.id} · ${btEscape(btDateTime(run.created_at))}</span>
-      <span>${btEscape(btRunStatusLabel(run.status))}${run.metrics?.total_return != null ? ` · ${btPercent(run.metrics.total_return)}` : ""}</span>
+      <span>${btEscape(btRunOutcomeLabel(run))}${run.metrics?.total_return != null ? ` · ${btPercent(run.metrics.total_return)}` : ""}</span>
       <button type="button" data-run-id="${run.id}">查看</button>
     </div>
   `).join("");
@@ -789,6 +920,12 @@ function btRunStatusLabel(status) {
   })[status] || status || "未知";
 }
 
+function btRunOutcomeLabel(run) {
+  return run?.termination_reason === "LIQUIDATED" || run?.metrics?.liquidated
+    ? "已爆仓"
+    : btRunStatusLabel(run?.status);
+}
+
 function btTradeKey(trade) {
   return [trade.event_time, trade.symbol, trade.side, trade.quantity, trade.fill_price].join("|");
 }
@@ -797,6 +934,10 @@ function btDateTime(value) {
   if (!value) return "-";
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("zh-CN", { hour12: false });
+}
+
+function btCompactDate(value) {
+  return String(value || "—").replaceAll("-", "");
 }
 
 function btMoney(value) {
@@ -833,6 +974,50 @@ function initBacktest() {
     if (btWorkspace.hidden) loadBacktestStrategies();
   });
   document.getElementById("backtest-new-strategy").addEventListener("click", () => showBtDialog(btCreateDialog));
+  document.getElementById("backtest-results-button").addEventListener("click", () => {
+    btListPage.hidden = true;
+    btWorkspace.hidden = true;
+    btResultsPage.hidden = false;
+    loadBacktestResultsOverview(1);
+  });
+  document.getElementById("backtest-results-back").addEventListener("click", () => {
+    btResultsPage.hidden = true;
+    btListPage.hidden = false;
+    loadBacktestStrategies();
+  });
+  document.getElementById("backtest-results-prev").addEventListener("click", () => {
+    if (bt.resultsPage > 1) loadBacktestResultsOverview(bt.resultsPage - 1);
+  });
+  document.getElementById("backtest-results-next").addEventListener("click", () => {
+    if (bt.resultsPage < bt.resultsTotalPages) loadBacktestResultsOverview(bt.resultsPage + 1);
+  });
+  btResultsTable.addEventListener("change", () => {
+    document.getElementById("backtest-delete-runs").disabled = !btResultsTable.querySelector(".bt-result-select:checked");
+  });
+  btResultsTable.addEventListener("click", (event) => {
+    if (event.target.closest("input")) return;
+    const row = event.target.closest("[data-result-run-id]");
+    if (row) openBacktestRunDetail(Number(row.dataset.resultRunId));
+  });
+  document.getElementById("backtest-delete-runs").addEventListener("click", async () => {
+    const runIds = Array.from(btResultsTable.querySelectorAll(".bt-result-select:checked"))
+      .map((item) => Number(item.value));
+    if (!runIds.length) return;
+    if (!window.confirm(`将不可撤销地从回测结果中删除 ${runIds.length} 条记录，并清除详细日志和每日权益/持仓节点。确认继续？`)) return;
+    try {
+      const result = await btJson(await fetch("/api/backtest/runs/deletions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_ids: runIds, confirm: true }),
+      }));
+      btResultsStatus.textContent = `已删除 ${result.run_ids.length} 条回测记录的重数据（${result.deleted_log_rows.toLocaleString()} 条日志、${result.deleted_equity_rows.toLocaleString()} 个每日节点）。`;
+      btResultsStatus.className = "status success";
+      await loadBacktestResultsOverview(bt.resultsPage);
+    } catch (error) {
+      btResultsStatus.textContent = btErrorText(error);
+      btResultsStatus.className = "status error";
+    }
+  });
   document.querySelectorAll("[data-close-dialog]").forEach((button) => {
     button.addEventListener("click", () => closeBtDialog(document.getElementById(button.dataset.closeDialog)));
   });
@@ -891,8 +1076,15 @@ function initBacktest() {
     }
     btSetRunning(false);
     btWorkspace.hidden = true;
-    btListPage.hidden = false;
-    loadBacktestStrategies();
+    setBacktestReadOnly(false);
+    if (bt.returnToResults) {
+      bt.returnToResults = false;
+      btResultsPage.hidden = false;
+      loadBacktestResultsOverview(bt.resultsPage);
+    } else {
+      btListPage.hidden = false;
+      loadBacktestStrategies();
+    }
   });
   document.getElementById("backtest-save").addEventListener("click", async () => {
     try {
@@ -916,6 +1108,7 @@ function initBacktest() {
   });
   document.getElementById("backtest-settings-form").addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (bt.readOnly) return;
     bt.current.default_settings = settingsFromForm();
     try {
       await saveBacktestStrategy({ announce: false });

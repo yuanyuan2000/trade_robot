@@ -363,7 +363,12 @@ def delete_strategy(strategy_id: int) -> dict:
     return current
 
 
-def create_run(strategy: dict, settings: dict) -> dict:
+def create_run(
+    strategy: dict,
+    settings: dict,
+    *,
+    configuration_summary: str | None = None,
+) -> dict:
     snapshot = {
         key: value
         for key, value in strategy.items()
@@ -376,9 +381,9 @@ def create_run(strategy: dict, settings: dict) -> dict:
             INSERT INTO backtest_runs (
                 strategy_id, strategy_name, strategy_revision,
                 strategy_snapshot_json, settings_json, status, progress,
-                created_at
+                configuration_summary, created_at
             )
-            VALUES (?, ?, ?, ?, ?, 'queued', 0, ?)
+            VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?)
             """,
             (
                 int(strategy["id"]),
@@ -386,6 +391,7 @@ def create_run(strategy: dict, settings: dict) -> dict:
                 int(strategy["revision"]),
                 _json(snapshot),
                 _json(settings),
+                configuration_summary,
                 now,
             ),
         )
@@ -393,10 +399,16 @@ def create_run(strategy: dict, settings: dict) -> dict:
     return get_run(run_id)
 
 
-def get_run(run_id: int, *, include_snapshot: bool = True) -> dict:
+def get_run(
+    run_id: int,
+    *,
+    include_snapshot: bool = True,
+    include_deleted: bool = False,
+) -> dict:
+    deleted_clause = "" if include_deleted else "AND deleted_at IS NULL"
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT * FROM backtest_runs WHERE id = ?",
+            f"SELECT * FROM backtest_runs WHERE id = ? {deleted_clause}",
             (int(run_id),),
         ).fetchone()
     if not row:
@@ -406,10 +418,11 @@ def get_run(run_id: int, *, include_snapshot: bool = True) -> dict:
 
 def list_runs(strategy_id: int | None = None, *, limit: int = 50) -> list[dict]:
     params: list[int] = []
-    where = ""
+    clauses = ["deleted_at IS NULL"]
     if strategy_id is not None:
-        where = "WHERE strategy_id = ?"
+        clauses.append("strategy_id = ?")
         params.append(int(strategy_id))
+    where = f"WHERE {' AND '.join(clauses)}"
     params.append(max(1, min(int(limit), 200)))
     with get_connection() as conn:
         rows = conn.execute(
@@ -423,6 +436,143 @@ def list_runs(strategy_id: int | None = None, *, limit: int = 50) -> list[dict]:
             params,
         ).fetchall()
     return [_run_row(row, include_snapshot=False) for row in rows]
+
+
+def list_runs_overview(
+    *,
+    page: int = 1,
+    page_size: int = 25,
+    strategy_id: int | None = None,
+    status: str | None = None,
+) -> dict:
+    clean_page = max(1, int(page))
+    clean_size = max(1, min(int(page_size), 100))
+    clauses: list[str] = ["deleted_at IS NULL"]
+    params: list[Any] = []
+    if strategy_id is not None:
+        clauses.append("strategy_id = ?")
+        params.append(int(strategy_id))
+    if status:
+        clauses.append("status = ?")
+        params.append(str(status))
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_connection() as conn:
+        total = int(conn.execute(
+            f"SELECT COUNT(*) FROM backtest_runs {where}", params
+        ).fetchone()[0])
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM backtest_runs
+            {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, clean_size, (clean_page - 1) * clean_size),
+        ).fetchall()
+    items = []
+    for row in rows:
+        item = _run_row(row, include_snapshot=True)
+        snapshot = item.pop("strategy_snapshot", {})
+        item["symbols"] = [
+            value.get("symbol")
+            for value in snapshot.get("definition", {}).get("symbols", [])
+            if value.get("symbol")
+        ]
+        items.append(item)
+    return {
+        "items": items,
+        "page": clean_page,
+        "page_size": clean_size,
+        "total_rows": total,
+        "total_pages": max(1, (total + clean_size - 1) // clean_size),
+    }
+
+
+def get_run_detail(run_id: int) -> dict:
+    run = get_run(run_id, include_snapshot=True)
+    with get_connection() as conn:
+        counts = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM backtest_equity_points WHERE run_id = ?) AS equity_count,
+                (SELECT COUNT(*) FROM backtest_trades WHERE run_id = ?) AS trade_count,
+                (SELECT COUNT(*) FROM backtest_logs WHERE run_id = ?) AS available_log_count
+            """,
+            (int(run_id), int(run_id), int(run_id)),
+        ).fetchone()
+    return {**run, **dict(counts)}
+
+
+def delete_runs(run_ids: list[int]) -> dict:
+    normalized = sorted({int(value) for value in run_ids if int(value) > 0})
+    if not normalized:
+        raise ValueError("请至少选择一条回测记录。")
+    if len(normalized) > 200:
+        raise ValueError("一次最多清理 200 条回测记录。")
+    placeholders = ",".join("?" for _ in normalized)
+    now = utc_now_iso()
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, status FROM backtest_runs
+            WHERE id IN ({placeholders}) AND deleted_at IS NULL
+            """,
+            normalized,
+        ).fetchall()
+        found = {int(row["id"]): row["status"] for row in rows}
+        missing = [run_id for run_id in normalized if run_id not in found]
+        if missing:
+            raise ValueError(f"回测运行不存在：{missing[0]}。")
+        active = [
+            run_id for run_id, run_status in found.items()
+            if run_status not in {"completed", "failed", "cancelled"}
+        ]
+        if active:
+            raise ValueError(f"运行中的回测不能删除：{active[0]}。")
+        log_stats = conn.execute(
+            f"""
+            SELECT COUNT(*) AS rows,
+                   COALESCE(SUM(LENGTH(message) + LENGTH(COALESCE(context_json, ''))), 0) AS bytes
+            FROM backtest_logs
+            WHERE run_id IN ({placeholders})
+            """,
+            normalized,
+        ).fetchone()
+        equity_stats = conn.execute(
+            f"""
+            SELECT COUNT(*) AS rows,
+                   COALESCE(SUM(LENGTH(positions_json)), 0) AS bytes
+            FROM backtest_equity_points
+            WHERE run_id IN ({placeholders})
+            """,
+            normalized,
+        ).fetchone()
+        conn.execute(
+            f"DELETE FROM backtest_logs WHERE run_id IN ({placeholders})",
+            normalized,
+        )
+        conn.execute(
+            f"DELETE FROM backtest_equity_points WHERE run_id IN ({placeholders})",
+            normalized,
+        )
+        conn.execute(
+            f"""
+            UPDATE backtest_runs
+            SET logs_deleted_at = COALESCE(logs_deleted_at, ?),
+                deleted_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (now, now, *normalized),
+        )
+    return {
+        "run_ids": normalized,
+        "deleted_log_rows": int(log_stats["rows"]),
+        "deleted_log_bytes": int(log_stats["bytes"]),
+        "deleted_equity_rows": int(equity_stats["rows"]),
+        "deleted_equity_bytes": int(equity_stats["bytes"]),
+        "deleted_at": now,
+    }
 
 
 def list_nonterminal_runs() -> list[dict]:
@@ -448,6 +598,7 @@ def latest_runs_by_strategy() -> dict[int, dict]:
                 SELECT strategy_id, MAX(id) AS latest_id
                 FROM backtest_runs
                 WHERE strategy_id IS NOT NULL
+                  AND deleted_at IS NULL
                 GROUP BY strategy_id
             ) AS latest
               ON latest.latest_id = run.id
@@ -470,6 +621,7 @@ def update_run(run_id: int, **fields: Any) -> dict:
         "error_message",
         "started_at",
         "completed_at",
+        "termination_reason",
     }
     invalid = set(fields) - allowed
     if invalid:
@@ -507,11 +659,11 @@ def replace_run_output(
             """
             INSERT INTO backtest_equity_points (
                 run_id, sequence, trading_date, cash, receivables,
-                positions_value, equity,
+                positions_value, equity, borrowed_cash, gross_leverage,
                 return_rate, drawdown_rate, benchmark_equity,
                 benchmark_return_rate, positions_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -522,6 +674,8 @@ def replace_run_output(
                     point.get("receivables", 0),
                     point["positions_value"],
                     point["equity"],
+                    point.get("borrowed_cash", max(0, -float(point["cash"]))),
+                    point.get("gross_leverage", 0),
                     point["return_rate"],
                     point["drawdown_rate"],
                     point.get("benchmark_equity"),
@@ -587,6 +741,21 @@ def replace_run_output(
                 )
                 for index, log in enumerate(logs)
             ],
+        )
+        log_bytes = sum(
+            len(str(log.get("message") or ""))
+            + len(_json(log.get("context")))
+            if log.get("context") is not None
+            else len(str(log.get("message") or ""))
+            for log in logs
+        )
+        conn.execute(
+            """
+            UPDATE backtest_runs
+            SET log_count = ?, log_bytes = ?, logs_deleted_at = NULL
+            WHERE id = ?
+            """,
+            (len(logs), log_bytes, int(run_id)),
         )
 
 
@@ -675,26 +844,60 @@ def upsert_corporate_actions(
 ) -> None:
     now = utc_now_iso()
     with get_connection() as conn:
-        conn.executemany(
-            """
-            DELETE FROM corporate_actions
-            WHERE symbol = ?
-              AND process_date >= ?
-              AND process_date <= ?
-            """,
-            [
-                (symbol, coverage_start, coverage_end)
-                for symbol in symbols
-            ],
+        placeholders = ",".join("?" for _ in symbols)
+        stale_rows = (
+            conn.execute(
+                f"""
+                SELECT DISTINCT action.provider_id, action.first_seen_at
+                FROM corporate_actions AS action
+                LEFT JOIN corporate_action_legs AS leg
+                  ON leg.provider_id = action.provider_id
+                WHERE (action.symbol IN ({placeholders})
+                       OR leg.symbol IN ({placeholders}))
+                  AND COALESCE(
+                        action.effective_date,
+                        action.ex_date,
+                        action.process_date
+                      ) >= ?
+                  AND COALESCE(
+                        action.effective_date,
+                        action.ex_date,
+                        action.process_date
+                      ) <= ?
+                """,
+                (*symbols, *symbols, coverage_start, coverage_end),
+            ).fetchall()
+            if symbols
+            else []
         )
+        stale_ids = [row["provider_id"] for row in stale_rows]
+        previous_first_seen = {
+            row["provider_id"]: row["first_seen_at"]
+            for row in stale_rows
+            if row["first_seen_at"]
+        }
+        if stale_ids:
+            stale_placeholders = ",".join("?" for _ in stale_ids)
+            conn.execute(
+                f"DELETE FROM corporate_action_legs WHERE provider_id IN ({stale_placeholders})",
+                stale_ids,
+            )
+            conn.execute(
+                f"DELETE FROM corporate_actions WHERE provider_id IN ({stale_placeholders})",
+                stale_ids,
+            )
         conn.executemany(
             """
             INSERT INTO corporate_actions (
                 provider_id, provider, action_type, symbol, process_date,
                 ex_date, record_date, payable_date, old_rate, new_rate,
-                cash_rate, payload_json, synced_at
+                cash_rate, currency, region, sub_type, special, foreign_flag,
+                due_bill_on_date, due_bill_off_date, effective_date,
+                event_status, instrument_key, identity_status,
+                first_seen_at, last_seen_at, payload_json, synced_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider_id) DO UPDATE SET
                 provider = excluded.provider,
                 action_type = excluded.action_type,
@@ -706,6 +909,18 @@ def upsert_corporate_actions(
                 old_rate = excluded.old_rate,
                 new_rate = excluded.new_rate,
                 cash_rate = excluded.cash_rate,
+                currency = excluded.currency,
+                region = excluded.region,
+                sub_type = excluded.sub_type,
+                special = excluded.special,
+                foreign_flag = excluded.foreign_flag,
+                due_bill_on_date = excluded.due_bill_on_date,
+                due_bill_off_date = excluded.due_bill_off_date,
+                effective_date = excluded.effective_date,
+                event_status = excluded.event_status,
+                instrument_key = excluded.instrument_key,
+                identity_status = excluded.identity_status,
+                last_seen_at = excluded.last_seen_at,
                 payload_json = excluded.payload_json,
                 synced_at = excluded.synced_at
             """,
@@ -722,12 +937,167 @@ def upsert_corporate_actions(
                     action.get("old_rate"),
                     action.get("new_rate"),
                     action.get("cash_rate"),
+                    action.get("currency"),
+                    action.get("region"),
+                    action.get("sub_type"),
+                    1 if action.get("special") else 0,
+                    1 if action.get("foreign") else 0,
+                    action.get("due_bill_on_date"),
+                    action.get("due_bill_off_date"),
+                    action.get("effective_date") or action.get("ex_date") or action["process_date"],
+                    action.get("event_status", "active"),
+                    next(
+                        (
+                            f"cusip:{leg['cusip']}"
+                            for leg in action.get("legs", [])
+                            if leg.get("cusip")
+                        ),
+                        None,
+                    ),
+                    "identifier" if any(
+                        leg.get("cusip") or leg.get("isin")
+                        for leg in action.get("legs", [])
+                    ) else "unresolved",
+                    previous_first_seen.get(action["provider_id"], now),
+                    now,
                     _json(action.get("payload", {})),
                     now,
                 )
                 for action in actions
             ],
         )
+        conn.executemany(
+            """
+            INSERT INTO corporate_action_legs (
+                provider_id, role, instrument_key, symbol, cusip, isin,
+                share_rate, cash_rate, currency, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    action["provider_id"],
+                    leg["role"],
+                    (
+                        f"cusip:{leg['cusip']}" if leg.get("cusip")
+                        else f"isin:{leg['isin']}" if leg.get("isin")
+                        else None
+                    ),
+                    leg.get("symbol"),
+                    leg.get("cusip"),
+                    leg.get("isin"),
+                    leg.get("share_rate"),
+                    leg.get("cash_rate"),
+                    leg.get("currency"),
+                    _json(leg),
+                )
+                for action in actions
+                for leg in action.get("legs", [])
+            ],
+        )
+        for action in actions:
+            effective_date = (
+                action.get("effective_date")
+                or action.get("ex_date")
+                or action["process_date"]
+            )
+            for leg in action.get("legs", []):
+                instrument_key = (
+                    f"cusip:{leg['cusip']}" if leg.get("cusip")
+                    else f"isin:{leg['isin']}" if leg.get("isin")
+                    else None
+                )
+                if not instrument_key:
+                    continue
+                role = leg.get("role") or "subject"
+                valid_from = effective_date if role == "target" else None
+                valid_to = (
+                    effective_date
+                    if role in {"source", "acquiree"}
+                    and action["action_type"] == "name_change"
+                    else None
+                )
+                if leg.get("symbol"):
+                    conn.execute(
+                        """
+                        INSERT INTO instrument_symbols (
+                            instrument_key, symbol, valid_from, valid_to,
+                            is_primary, source, confidence, created_at, updated_at
+                        )
+                        SELECT ?, ?, ?, ?, ?, 'alpaca_corporate_actions',
+                               'provider', ?, ?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM instrument_symbols
+                            WHERE instrument_key = ? AND symbol = ?
+                              AND COALESCE(valid_from, '') = COALESCE(?, '')
+                        )
+                        """,
+                        (
+                            instrument_key,
+                            leg["symbol"],
+                            valid_from,
+                            valid_to,
+                            1 if role in {"subject", "target"} else 0,
+                            now,
+                            now,
+                            instrument_key,
+                            leg["symbol"],
+                            valid_from,
+                        ),
+                    )
+                    if valid_to:
+                        conn.execute(
+                            """
+                            UPDATE instrument_symbols
+                            SET valid_to = ?, updated_at = ?
+                            WHERE instrument_key = ? AND symbol = ?
+                              AND COALESCE(valid_from, '') = COALESCE(?, '')
+                            """,
+                            (valid_to, now, instrument_key, leg["symbol"], valid_from),
+                        )
+                    if role in {"subject", "target"}:
+                        conn.execute(
+                            """
+                            UPDATE symbols
+                            SET cusip = COALESCE(?, cusip),
+                                isin = COALESCE(?, isin),
+                                updated_at = ?
+                            WHERE symbol = ?
+                            """,
+                            (leg.get("cusip"), leg.get("isin"), now, leg["symbol"]),
+                        )
+                for identifier_type in ("cusip", "isin"):
+                    identifier_value = leg.get(identifier_type)
+                    if not identifier_value:
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO instrument_identifiers (
+                            instrument_key, identifier_type, identifier_value,
+                            valid_from, valid_to, source, confidence,
+                            created_at, updated_at
+                        )
+                        SELECT ?, ?, ?, ?, ?, 'alpaca_corporate_actions',
+                               'provider', ?, ?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM instrument_identifiers
+                            WHERE identifier_type = ? AND identifier_value = ?
+                              AND COALESCE(valid_from, '') = COALESCE(?, '')
+                        )
+                        """,
+                        (
+                            instrument_key,
+                            identifier_type,
+                            identifier_value,
+                            valid_from,
+                            valid_to,
+                            now,
+                            now,
+                            identifier_type,
+                            identifier_value,
+                            valid_from,
+                        ),
+                    )
         conn.executemany(
             """
             INSERT INTO corporate_action_sync_state (
@@ -811,18 +1181,38 @@ def get_corporate_actions(
     with get_connection() as conn:
         rows = conn.execute(
             f"""
-            SELECT *
-            FROM corporate_actions
-            WHERE symbol IN ({placeholders})
-              AND COALESCE(ex_date, process_date) >= ?
-              AND COALESCE(ex_date, process_date) <= ?
-            ORDER BY COALESCE(ex_date, process_date), provider_id
+            SELECT DISTINCT action.*
+            FROM corporate_actions AS action
+            LEFT JOIN corporate_action_legs AS leg
+              ON leg.provider_id = action.provider_id
+            WHERE (action.symbol IN ({placeholders})
+                   OR leg.symbol IN ({placeholders}))
+              AND COALESCE(action.effective_date, action.ex_date, action.process_date) >= ?
+              AND COALESCE(action.effective_date, action.ex_date, action.process_date) <= ?
+            ORDER BY COALESCE(action.effective_date, action.ex_date, action.process_date),
+                     action.provider_id
             """,
-            (*normalized, start_date, end_date),
+            (*normalized, *normalized, start_date, end_date),
         ).fetchall()
     result = []
     for row in rows:
         item = dict(row)
         item["payload"] = _decode(item.pop("payload_json"), {})
+        with get_connection() as leg_conn:
+            leg_rows = leg_conn.execute(
+                """
+                SELECT role, instrument_key, symbol, cusip, isin,
+                       share_rate, cash_rate, currency, payload_json
+                FROM corporate_action_legs
+                WHERE provider_id = ?
+                ORDER BY id
+                """,
+                (item["provider_id"],),
+            ).fetchall()
+        item["legs"] = []
+        for leg_row in leg_rows:
+            leg = dict(leg_row)
+            payload = _decode(leg.pop("payload_json"), {})
+            item["legs"].append({**payload, **leg})
         result.append(item)
     return result

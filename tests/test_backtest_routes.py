@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import app as app_module
 import database.db as main_db
+from database import backtest_repository
 
 
 class BacktestRouteTests(unittest.TestCase):
@@ -84,11 +85,12 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertEqual(catalog.status_code, 200)
         item = catalog.get_json()["strategies"][0]
         self.assertEqual(item["key"], "rapid_drop_atr_rotation")
-        self.assertEqual(item["version"], "1.2.0")
+        self.assertEqual(item["version"], "1.3.0")
         self.assertEqual(item["parameter_schema"]["holdings_num"]["default"], 1)
         self.assertTrue(
             item["parameter_schema"]["enable_percent_drop_filter"]["default"]
         )
+
         self.assertFalse(
             item["parameter_schema"]["enable_atr_drop_filter"]["default"]
         )
@@ -137,7 +139,7 @@ class BacktestRouteTests(unittest.TestCase):
             if item["code_key"] == "rapid_drop_atr_rotation"
         )
         self.assertEqual(strategy["name"], "急跌回避与ATR动量轮动策略")
-        self.assertEqual(strategy["code_version"], "1.2.0")
+        self.assertEqual(strategy["code_version"], "1.3.0")
         self.assertEqual(len(strategy["definition"]["symbols"]), 5)
         self.assertEqual(
             strategy["definition"]["params"]["selection_time"],
@@ -172,6 +174,52 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertEqual(
             [item["max_weight"] for item in competition["definition"]["symbols"]],
             [100, 100],
+        )
+
+    def test_run_overview_readonly_detail_and_soft_delete_routes(self) -> None:
+        created = self.client.post(
+            "/api/backtest/strategies",
+            json={
+                "name": "结果总览测试",
+                "design_mode": "visual",
+                "selection_mode": "single",
+            },
+        ).get_json()["strategy"]
+        run = backtest_repository.create_run(created, created["default_settings"])
+        backtest_repository.replace_run_output(
+            run["id"],
+            equity_points=[],
+            trades=[],
+            logs=[{"level": "INFO", "event_type": "TEST", "message": "日志"}],
+        )
+        backtest_repository.update_run(
+            run["id"], status="completed", metrics={"total_return": 0.05}
+        )
+
+        overview = self.client.get("/api/backtest/runs?page=1&page_size=10")
+        self.assertEqual(overview.status_code, 200)
+        self.assertGreaterEqual(overview.get_json()["total_rows"], 1)
+        detail = self.client.get(f"/api/backtest/runs/{run['id']}/detail")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(
+            detail.get_json()["run"]["strategy_snapshot"]["name"],
+            "结果总览测试",
+        )
+        refused = self.client.post(
+            "/api/backtest/runs/deletions", json={"run_ids": [run["id"]]}
+        )
+        self.assertEqual(refused.status_code, 400)
+        cleaned = self.client.post(
+            "/api/backtest/runs/deletions",
+            json={"run_ids": [run["id"]], "confirm": True},
+        )
+        self.assertEqual(cleaned.status_code, 200)
+        self.assertEqual(cleaned.get_json()["deleted_log_rows"], 1)
+        after = self.client.get("/api/backtest/runs?page=1&page_size=10")
+        self.assertEqual(after.get_json()["total_rows"], 0)
+        self.assertEqual(
+            self.client.get(f"/api/backtest/runs/{run['id']}/detail").status_code,
+            400,
         )
 
     @patch.object(app_module, "build_run_xls", return_value=b"excel-data")

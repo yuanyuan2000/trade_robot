@@ -300,6 +300,7 @@ def fetch_asset(symbol: str) -> dict:
     )
     return {
         "symbol": str(asset.get("symbol") or normalized).upper(),
+        "asset_id": asset.get("id"),
         "supported": supported,
         "reason": None if supported else "该标的不是 Alpaca 支持的活跃美股或 ETF。",
         "asset_class": asset.get("class"),

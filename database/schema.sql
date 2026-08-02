@@ -8,10 +8,13 @@ CREATE TABLE IF NOT EXISTS symbols (
     show_in_overview INTEGER NOT NULL DEFAULT 0,
     display_order INTEGER NOT NULL DEFAULT 0,
     alpaca_symbol TEXT,
+    alpaca_asset_id TEXT,
     alpaca_supported INTEGER,
     alpaca_checked_at TEXT,
     alpaca_error TEXT,
     asset_class TEXT NOT NULL DEFAULT 'us_equity',
+    cusip TEXT,
+    isin TEXT,
     quantity_step REAL,
     history_start_date TEXT,
     history_start_source TEXT,
@@ -31,6 +34,9 @@ CREATE TABLE IF NOT EXISTS daily_prices (
     volume REAL DEFAULT 0,
     source_provider TEXT,
     source_timeframe TEXT,
+    price_basis TEXT NOT NULL DEFAULT 'unknown' CHECK(price_basis IN (
+        'raw', 'split_adjusted', 'total_return_adjusted', 'unknown'
+    )),
     is_complete INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -39,6 +45,40 @@ CREATE TABLE IF NOT EXISTS daily_prices (
 
 CREATE INDEX IF NOT EXISTS idx_daily_prices_symbol_date
 ON daily_prices(symbol, date);
+
+CREATE TABLE IF NOT EXISTS instrument_symbols (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instrument_key TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    valid_from TEXT,
+    valid_to TEXT,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL,
+    confidence TEXT NOT NULL DEFAULT 'provider',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(instrument_key, symbol, valid_from)
+);
+
+CREATE INDEX IF NOT EXISTS idx_instrument_symbols_lookup
+ON instrument_symbols(symbol, valid_from, valid_to);
+
+CREATE TABLE IF NOT EXISTS instrument_identifiers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instrument_key TEXT NOT NULL,
+    identifier_type TEXT NOT NULL,
+    identifier_value TEXT NOT NULL,
+    valid_from TEXT,
+    valid_to TEXT,
+    source TEXT NOT NULL,
+    confidence TEXT NOT NULL DEFAULT 'provider',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(identifier_type, identifier_value, valid_from)
+);
+
+CREATE INDEX IF NOT EXISTS idx_instrument_identifiers_lookup
+ON instrument_identifiers(identifier_type, identifier_value, valid_from, valid_to);
 
 CREATE TABLE IF NOT EXISTS symbol_aliases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,6 +239,12 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     metrics_json TEXT,
     error_code TEXT,
     error_message TEXT,
+    termination_reason TEXT,
+    configuration_summary TEXT,
+    log_count INTEGER NOT NULL DEFAULT 0,
+    log_bytes INTEGER NOT NULL DEFAULT 0,
+    logs_deleted_at TEXT,
+    deleted_at TEXT,
     created_at TEXT NOT NULL,
     started_at TEXT,
     completed_at TEXT,
@@ -219,6 +265,8 @@ CREATE TABLE IF NOT EXISTS backtest_equity_points (
     receivables REAL NOT NULL DEFAULT 0,
     positions_value REAL NOT NULL,
     equity REAL NOT NULL,
+    borrowed_cash REAL NOT NULL DEFAULT 0,
+    gross_leverage REAL NOT NULL DEFAULT 0,
     return_rate REAL NOT NULL,
     drawdown_rate REAL NOT NULL,
     benchmark_equity REAL,
@@ -286,12 +334,44 @@ CREATE TABLE IF NOT EXISTS corporate_actions (
     old_rate REAL,
     new_rate REAL,
     cash_rate REAL,
+    currency TEXT,
+    region TEXT,
+    sub_type TEXT,
+    special INTEGER NOT NULL DEFAULT 0,
+    foreign_flag INTEGER NOT NULL DEFAULT 0,
+    due_bill_on_date TEXT,
+    due_bill_off_date TEXT,
+    effective_date TEXT,
+    event_status TEXT NOT NULL DEFAULT 'active',
+    instrument_key TEXT,
+    identity_status TEXT NOT NULL DEFAULT 'unresolved',
+    first_seen_at TEXT,
+    last_seen_at TEXT,
     payload_json TEXT NOT NULL,
     synced_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_corporate_actions_symbol_date
 ON corporate_actions(symbol, ex_date, process_date);
+
+CREATE TABLE IF NOT EXISTS corporate_action_legs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    instrument_key TEXT,
+    symbol TEXT,
+    cusip TEXT,
+    isin TEXT,
+    share_rate REAL,
+    cash_rate REAL,
+    currency TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY(provider_id) REFERENCES corporate_actions(provider_id),
+    UNIQUE(provider_id, role, symbol, cusip, isin)
+);
+
+CREATE INDEX IF NOT EXISTS idx_corporate_action_legs_lookup
+ON corporate_action_legs(symbol, cusip, isin, role);
 
 CREATE TABLE IF NOT EXISTS corporate_action_sync_state (
     symbol TEXT PRIMARY KEY,

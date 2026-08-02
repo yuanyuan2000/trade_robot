@@ -194,8 +194,46 @@ class HistoricalDataSet:
         for action in self.corporate_actions:
             effective_date = action.get("ex_date") or action["process_date"]
             self.actions_by_date.setdefault(effective_date, []).append(action)
+        self._dividend_factors = self._build_dividend_factors()
         self.manifest = manifest or {}
         self._session_index = {value: index for index, value in enumerate(self.sessions)}
+
+    def _build_dividend_factors(self) -> dict[tuple[str, str], float]:
+        """Build point-in-time price factors without modifying executable bars.
+
+        Indicators see a continuous history as of each session.  Portfolio
+        valuation and fills continue to use raw bars while dividends are
+        accounted for separately as receivables/cash.
+        """
+        totals: dict[tuple[str, str], float] = {}
+        for action in self.corporate_actions:
+            if (
+                action.get("action_type") != "cash_dividend"
+                or not action.get("affects_position", True)
+            ):
+                continue
+            symbol = action["symbol"]
+            effective_date = action.get("ex_date") or action["process_date"]
+            key = (symbol, effective_date)
+            totals[key] = totals.get(key, 0.0) + float(action["cash_rate"])
+
+        factors: dict[tuple[str, str], float] = {}
+        for (symbol, effective_date), total in totals.items():
+            previous = [
+                row for row in self.daily.get(symbol, [])
+                if row["date"] < effective_date
+            ]
+            if not previous:
+                # No loaded history predates this event, so there is nothing
+                # in the indicator window to adjust.
+                continue
+            previous_close = float(previous[-1]["close"])
+            if total < 0 or previous_close <= 0 or total >= previous_close:
+                raise BacktestDataError(f"{symbol} {effective_date} 分红复权因子无效。")
+            factors[(symbol, effective_date)] = (
+                previous_close - total
+            ) / previous_close
+        return factors
 
     def is_eligible(self, symbol: str, trading_date: str) -> bool:
         start = self.availability_start.get(symbol)
@@ -240,9 +278,12 @@ class HistoricalDataSet:
         return self.daily_before(symbol, trading_date)
 
     def _adjust_row(self, symbol: str, row: dict, as_of_date: str) -> dict:
-        factor = 1.0
+        split_factor = 1.0
+        price_factor = 1.0
         for action in self.corporate_actions:
             if action["symbol"] != symbol:
+                continue
+            if not action.get("affects_position", True):
                 continue
             if action["action_type"] not in {"forward_split", "reverse_split"}:
                 continue
@@ -252,13 +293,20 @@ class HistoricalDataSet:
                 new_rate = float(action["new_rate"])
                 if old_rate <= 0 or new_rate <= 0:
                     raise BacktestDataError(f"{symbol} 拆股比例无效。")
-                factor *= new_rate / old_rate
-        if abs(factor - 1.0) < 1e-15:
+                split_factor *= new_rate / old_rate
+        price_factor /= split_factor
+        for (event_symbol, effective_date), factor in self._dividend_factors.items():
+            if (
+                event_symbol == symbol
+                and row["date"] < effective_date <= as_of_date
+            ):
+                price_factor *= factor
+        if abs(price_factor - 1.0) < 1e-15 and abs(split_factor - 1.0) < 1e-15:
             return dict(row)
         adjusted = dict(row)
         for field in ("open", "high", "low", "close"):
-            adjusted[field] = float(adjusted[field]) / factor
-        adjusted["volume"] = float(adjusted.get("volume") or 0) * factor
+            adjusted[field] = float(adjusted[field]) * price_factor
+        adjusted["volume"] = float(adjusted.get("volume") or 0) * split_factor
         return adjusted
 
     def corporate_actions_on(self, trading_date: str) -> list[dict]:
@@ -281,6 +329,15 @@ class HistoricalDataSet:
         if index is None or index + 1 >= len(self.sessions):
             return None
         return self.sessions[index + 1]
+
+    def session_minutes(self, trading_date: str) -> tuple[int, int]:
+        for item in self.manifest.get("market_sessions", []):
+            if item.get("trading_date") == trading_date:
+                return int(item["open_minute_utc"]), int(item["close_minute_utc"])
+        return (
+            _epoch_minute(trading_date, "09:30"),
+            _epoch_minute(trading_date, "16:00"),
+        )
 
     def event_price(self, symbol: str, trading_date: str, event: str) -> EventPrice:
         day = self.day_bar(symbol, trading_date)
@@ -581,11 +638,6 @@ def load_historical_dataset(
                 },
             )
 
-    corporate_action_start = min(
-        rows[0]["date"]
-        for rows in daily.values()
-        if rows
-    )
     symbol_settings = {}
     for symbol in symbols:
         try:
@@ -601,14 +653,56 @@ def load_historical_dataset(
     corporate_action_symbols = [
         symbol for symbol in symbols
         if daily[symbol]
-        and symbol_settings[symbol].get("asset_class") != "crypto"
+        and symbol_settings[symbol].get("asset_class") == "us_equity"
     ]
+    action_starts: dict[str, str] = {}
+    for symbol in corporate_action_symbols:
+        prior_rows = [
+            row for row in daily[symbol]
+            if row["date"] < sessions[0]
+        ]
+        if minimum_lookback > 0 and prior_rows:
+            relevant_index = max(0, len(prior_rows) - minimum_lookback)
+            relevant_start = prior_rows[relevant_index]["date"]
+        else:
+            relevant_start = sessions[0]
+        # The actual first local bar is also the identity lower bound. This
+        # excludes an earlier issuer that reused the same ticker (MAGS).
+        action_starts[symbol] = max(
+            daily[symbol][0]["date"],
+            relevant_start,
+        )
+    corporate_action_start = min(action_starts.values(), default=sessions[0])
     corporate_actions = ensure_corporate_actions(
         corporate_action_symbols,
         start_date=corporate_action_start,
         end_date=sessions[-1],
+        symbol_starts=action_starts,
     )
     validate_supported_actions(corporate_actions)
+    action_symbols = {
+        action["symbol"]
+        for action in corporate_actions
+        if action.get("affects_position", True)
+    }
+    for symbol in sorted(action_symbols):
+        invalid_basis = sorted(
+            {
+                str(row.get("price_basis") or "raw")
+                for row in daily[symbol]
+                if action_starts[symbol] <= row["date"] <= sessions[-1]
+                if str(row.get("price_basis") or "raw") != "raw"
+            }
+        )
+        if invalid_basis:
+            raise BacktestDataError(
+                f"{symbol} 的历史行情不是可核验的原始价格，不能安全应用公司行动。",
+                detail={
+                    "symbol": symbol,
+                    "type": "price_basis_not_raw",
+                    "price_basis": invalid_basis,
+                },
+            )
 
     exact_events = sorted(
         {
@@ -857,6 +951,9 @@ def load_historical_dataset(
             "old_rate": action.get("old_rate"),
             "new_rate": action.get("new_rate"),
             "cash_rate": action.get("cash_rate"),
+            "event_symbol": action.get("event_symbol"),
+            "matched_role": action.get("matched_role"),
+            "affects_position": action.get("affects_position", True),
         }
         for action in corporate_actions
     ]
@@ -890,6 +987,7 @@ def load_historical_dataset(
             if item.get("is_early_close")
         ],
         "market_calendar_sha256": _sha256(normalized_sessions),
+        "market_sessions": normalized_sessions,
         "corporate_actions": normalized_actions,
         "corporate_actions_sha256": _sha256(normalized_actions),
     }

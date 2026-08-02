@@ -209,6 +209,13 @@ def ensure_shipped_strategy_presets() -> None:
                 "rapid-drop-atr-weighting-v1.2.0",
                 code_key="rapid_drop_atr_rotation",
                 from_versions=("1.0.0", "1.1.0"),
+                to_version="1.2.0",
+            )
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "rapid-drop-hold-unchanged-target-v1.3.0",
+                code_key="rapid_drop_atr_rotation",
+                from_versions=("1.0.0", "1.1.0", "1.2.0"),
                 to_version=payload["code_version"],
             )
         backtest_repository.upgrade_seeded_strategy_settings_once(

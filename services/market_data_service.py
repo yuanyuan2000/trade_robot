@@ -6,6 +6,7 @@ from typing import Callable
 from config import FULL_HISTORY_START_DATE
 from database import repository
 from services.api_errors import MarketDataError
+from services.corporate_action_adjustment_service import adjusted_daily_payload
 from services.alpaca_data_client import fetch_stock_bars
 from services.intraday_bar_service import (
     derive_daily_prices_from_minutes,
@@ -197,6 +198,7 @@ def get_market_data(
     *,
     include_intraday: bool = False,
     progress_callback: Callable[[dict], None] | None = None,
+    adjustment: str = "all",
 ) -> dict:
     if not normalize_symbol(symbol):
         raise ValueError("Symbol is required")
@@ -205,6 +207,8 @@ def get_market_data(
     normalized = alias["common_symbol"]
     if include_intraday:
         update_kwargs = {"initialize_intraday": True}
+        if adjustment != "all":
+            update_kwargs["adjustment"] = adjustment
         if progress_callback:
             update_kwargs["progress_callback"] = progress_callback
         return update_full_market_data(normalized, **update_kwargs)
@@ -214,6 +218,8 @@ def get_market_data(
 
     if not _has_cached_prices(normalized):
         update_kwargs = {"initialize_intraday": False}
+        if adjustment != "all":
+            update_kwargs["adjustment"] = adjustment
         if progress_callback:
             update_kwargs["progress_callback"] = progress_callback
         return update_full_market_data(normalized, **update_kwargs)
@@ -228,7 +234,9 @@ def get_market_data(
             }
         )
 
-    rows = repository.get_daily_prices(normalized, start_date.isoformat())
+    rows = repository.get_daily_prices(
+        normalized, start_date.isoformat(), include_metadata=True
+    )
     if not rows:
         return {
             "ok": True,
@@ -242,15 +250,29 @@ def get_market_data(
             "start_date": start_date.isoformat(),
         }
 
+    settings = repository.get_symbol(normalized)
+    try:
+        adjusted = adjusted_daily_payload(
+            normalized, rows, settings, mode=adjustment
+        )
+    except Exception as exc:
+        adjusted = {
+            "rows": rows,
+            "actions": [],
+            "adjustment": "raw",
+            "warning": f"公司行动复权失败，当前显示原始行情：{exc}",
+        }
     return {
         "ok": True,
         "symbol": display_symbol,
         "canonical_symbol": normalized,
         "source": source,
-        "warning": None,
-        "symbol_settings": repository.get_symbol(normalized),
+        "warning": adjusted["warning"],
+        "symbol_settings": settings,
         "intraday_sync": intraday_repository.get_sync_state(normalized),
-        "data": rows,
+        "data": adjusted["rows"],
+        "adjustment": adjusted["adjustment"],
+        "corporate_actions": adjusted["actions"],
         "start_date": start_date.isoformat(),
     }
 
@@ -260,6 +282,7 @@ def update_full_market_data(
     *,
     initialize_intraday: bool = False,
     progress_callback: Callable[[dict], None] | None = None,
+    adjustment: str = "all",
 ) -> dict:
     if not normalize_symbol(symbol):
         raise ValueError("Symbol is required")
@@ -351,7 +374,21 @@ def update_full_market_data(
             normalized,
             start_at=derive_start,
         )
-        rows = repository.get_daily_prices(normalized, start_date.isoformat())
+        rows = repository.get_daily_prices(
+            normalized, start_date.isoformat(), include_metadata=True
+        )
+        settings = repository.get_symbol(normalized)
+        try:
+            adjusted = adjusted_daily_payload(
+                normalized, rows, settings, mode=adjustment
+            )
+        except Exception as exc:
+            adjusted = {
+                "rows": rows,
+                "actions": [],
+                "adjustment": "raw",
+                "warning": f"公司行动复权失败，当前显示原始行情：{exc}",
+            }
         emit(
             stage="completed",
             progress=1.0,
@@ -363,11 +400,13 @@ def update_full_market_data(
             "symbol": display_symbol,
             "canonical_symbol": normalized,
             "source": "alpaca",
-            "warning": None,
-            "symbol_settings": repository.get_symbol(normalized),
+            "warning": adjusted["warning"],
+            "symbol_settings": settings,
             "intraday_sync": import_result["sync_state"],
             "derived_daily": derived,
-            "data": rows,
+            "data": adjusted["rows"],
+            "adjustment": adjusted["adjustment"],
+            "corporate_actions": adjusted["actions"],
             "start_date": start_date.isoformat(),
         }
 
@@ -416,8 +455,19 @@ def update_full_market_data(
         )
         source = provider
 
-    rows = repository.get_daily_prices(normalized, start_date.isoformat())
+    rows = repository.get_daily_prices(
+        normalized, start_date.isoformat(), include_metadata=True
+    )
     settings = repository.get_symbol(normalized)
+    try:
+        adjusted = adjusted_daily_payload(normalized, rows, settings, mode=adjustment)
+    except Exception as exc:
+        adjusted = {
+            "rows": rows,
+            "actions": [],
+            "adjustment": "raw",
+            "warning": f"公司行动复权失败，当前显示原始行情：{exc}",
+        }
     emit(
         stage="completed",
         progress=1.0,
@@ -429,14 +479,16 @@ def update_full_market_data(
         "symbol": display_symbol,
         "canonical_symbol": normalized,
         "source": source,
-        "warning": (
+        "warning": adjusted["warning"] or (
             settings.get("alpaca_error")
             if settings.get("alpaca_supported") is False
             else None
         ),
         "symbol_settings": settings,
         "intraday_sync": intraday_repository.get_sync_state(normalized),
-        "data": rows,
+        "data": adjusted["rows"],
+        "adjustment": adjusted["adjustment"],
+        "corporate_actions": adjusted["actions"],
         "start_date": start_date.isoformat(),
     }
 

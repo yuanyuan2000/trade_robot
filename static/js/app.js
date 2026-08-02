@@ -34,6 +34,7 @@ const customIndicatorType = document.getElementById("custom-indicator-type");
 const customIndicatorPeriod = document.getElementById("custom-indicator-period");
 const updateDataButton = document.getElementById("update-data-button");
 const marketUpdateProgress = document.getElementById("market-update-progress");
+const marketUpdateProgressContent = document.getElementById("market-update-progress-content");
 const marketUpdateProgressText = document.getElementById("market-update-progress-text");
 const marketUpdateProgressPercent = document.getElementById("market-update-progress-percent");
 const marketUpdateProgressBar = document.getElementById("market-update-progress-bar");
@@ -42,6 +43,8 @@ const symbolSettingsToggle = document.getElementById("symbol-settings-toggle");
 const symbolSettingsPanel = document.getElementById("symbol-settings-panel");
 const symbolSettingsClose = document.getElementById("symbol-settings-close");
 const showWeekendData = document.getElementById("show-weekend-data");
+const priceAdjustmentMode = document.getElementById("price-adjustment-mode");
+const corporateActionEvents = document.getElementById("corporate-action-events");
 const analysisControls = document.getElementById("analysis-controls");
 const analysisAlgorithm = document.getElementById("analysis-algorithm");
 const runAnalysisButton = document.getElementById("run-analysis-button");
@@ -56,6 +59,7 @@ let indicatorCatalog = [];
 let currentRawMarketData = [];
 let currentSymbolSettings = { show_weekend_data: true };
 let currentIntradaySync = { status: "not_initialized", row_count: 0 };
+let currentCorporateActions = [];
 let overviewPage = 1;
 let overviewTotalPages = 1;
 let overviewItems = [];
@@ -184,6 +188,7 @@ async function loadPeriodMarketData(period, { silent = false } = {}) {
     symbol: currentSymbol,
     period,
     limit: intradayPeriod ? "300" : "2000",
+    adjustment: priceAdjustmentMode.value,
   });
   const response = await fetch(`/api/market-bars?${params}`);
   const payload = await parseJsonResponse(response);
@@ -193,6 +198,8 @@ async function loadPeriodMarketData(period, { silent = false } = {}) {
   currentRawMarketData = payload.data || [];
   currentSymbolSettings = payload.symbol_settings || currentSymbolSettings;
   currentIntradaySync = payload.sync_state || currentIntradaySync;
+  currentCorporateActions = payload.corporate_actions || [];
+  renderCorporateActionEvents();
   updateDetailActions();
   renderCurrentMarketData();
   chartSource.textContent = sourceText(payload.source);
@@ -264,6 +271,8 @@ async function loadMarketData(symbol, { includeIntraday = false } = {}) {
       status: "not_initialized",
       row_count: 0,
     };
+    currentCorporateActions = payload.corporate_actions || [];
+    renderCorporateActionEvents();
     includeIntradayData.checked = Number(currentIntradaySync.row_count || 0) > 0;
     currentSymbol = payload.canonical_symbol || payload.symbol || normalized;
     symbolInput.value = payload.symbol || normalized;
@@ -1171,6 +1180,8 @@ async function updateCurrentMarketData() {
     if (currentSymbol !== updatingSymbol) return;
 
     currentRawMarketData = payload.data;
+    currentCorporateActions = payload.corporate_actions || [];
+    renderCorporateActionEvents();
     currentSymbolSettings = payload.symbol_settings || currentSymbolSettings;
     currentIntradaySync = payload.intraday_sync || currentIntradaySync;
     showWeekendData.checked = Boolean(currentSymbolSettings.show_weekend_data);
@@ -1192,10 +1203,14 @@ async function updateCurrentMarketData() {
       : payload.source === "api"
         ? "已从 API 更新"
         : "数据库已完整";
-    setStatus(
-      `${actionText}：${payload.symbol} 共 ${payload.data.length} 条数据，范围 ${firstDate} 至 ${lastDate}。`,
-      "success",
-    );
+    if (payload.warning) {
+      setStatus(payload.warning, "warning");
+    } else {
+      setStatus(
+        `${actionText}：${payload.symbol} 共 ${payload.data.length} 条数据，范围 ${firstDate} 至 ${lastDate}。`,
+        "success",
+      );
+    }
   } catch (error) {
     if (currentSymbol === updatingSymbol) {
       setStatus(error.message || "行情数据更新失败。", "error");
@@ -1226,6 +1241,8 @@ function renderMarketUpdateProgress(job) {
     message = `更新完成，最新数据为 ${dateText}`;
   }
   marketUpdateProgress.hidden = false;
+  marketUpdateProgressContent.hidden = false;
+  corporateActionEvents.hidden = true;
   marketUpdateProgress.classList.toggle("is-error", Boolean(job.error));
   marketUpdateProgressText.textContent = job.error?.message || message;
   marketUpdateProgressPercent.textContent = `${percent}%`;
@@ -1310,6 +1327,38 @@ function renderCurrentMarketData() {
   clearTrendlineAnalysis();
 }
 
+function renderCorporateActionEvents() {
+  const labels = {
+    forward_split: "正向拆股",
+    reverse_split: "反向拆股",
+    cash_dividend: "现金分红",
+    name_change: "代码变更",
+    spin_off: "分拆上市",
+    cash_merger: "现金并购",
+  };
+  if (!currentCorporateActions.length) {
+    corporateActionEvents.hidden = true;
+    corporateActionEvents.textContent = "";
+    marketUpdateProgressContent.hidden = true;
+    marketUpdateProgress.hidden = true;
+    return;
+  }
+  const items = currentCorporateActions.slice(-8).map((action) => {
+    let detail = "";
+    if (["forward_split", "reverse_split"].includes(action.action_type)) {
+      detail = ` ${action.old_rate || 1}:${action.new_rate || 1}`;
+    } else if (action.action_type === "cash_dividend") {
+      detail = ` 每股 ${action.cash_rate}`;
+    }
+    return `${action.effective_date} ${labels[action.action_type] || action.action_type}${detail}`;
+  });
+  const omitted = currentCorporateActions.length - items.length;
+  corporateActionEvents.textContent = `${omitted > 0 ? `另有 ${omitted} 项 · ` : ""}${items.join(" · ")}`;
+  corporateActionEvents.hidden = false;
+  marketUpdateProgressContent.hidden = true;
+  marketUpdateProgress.hidden = false;
+}
+
 async function runTrendlineAnalysis() {
   if (!currentSymbol) {
     setStatus("请先输入并加载一个标的。", "error");
@@ -1332,6 +1381,7 @@ async function runTrendlineAnalysis() {
       period: getChartPeriod(),
       limit: "150",
       show_weekend_data: currentSymbolSettings.show_weekend_data ? "1" : "0",
+      adjustment: priceAdjustmentMode.value,
     });
     const response = await fetch(`/api/analysis/trendlines?${params}`);
     const payload = await parseJsonResponse(response);
@@ -1944,6 +1994,16 @@ symbolSettingsClose.addEventListener("click", () => {
   symbolSettingsPanel.hidden = true;
 });
 showWeekendData.addEventListener("change", saveSymbolSettings);
+priceAdjustmentMode.addEventListener("change", async () => {
+  if (!currentSymbol) return;
+  clearTrendlineAnalysis();
+  try {
+    await loadPeriodMarketData(getChartPeriod());
+    await loadSymbolIndicators();
+  } catch (error) {
+    setStatus(error.message || "切换复权方式失败。", "error");
+  }
+});
 document.addEventListener("indicator-action", handleIndicatorAction);
 document.addEventListener("chart-period-change", async (event) => {
   updateChartTitle(symbolInput.value.trim().toUpperCase() || "行情");

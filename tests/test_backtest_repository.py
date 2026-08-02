@@ -68,7 +68,11 @@ class BacktestRepositoryTests(unittest.TestCase):
             **strategy["default_settings"],
             "initial_capital": 12345,
         }
-        run = backtest_repository.create_run(strategy, settings)
+        run = backtest_repository.create_run(
+            strategy,
+            settings,
+            configuration_summary="测试运行参数摘要。",
+        )
 
         backtest_repository.update_strategy(
             strategy["id"],
@@ -80,6 +84,7 @@ class BacktestRepositoryTests(unittest.TestCase):
         self.assertEqual(stored["strategy_revision"], 1)
         self.assertEqual(stored["strategy_snapshot"]["name"], "快照测试")
         self.assertEqual(stored["settings"]["initial_capital"], 12345)
+        self.assertEqual(stored["configuration_summary"], "测试运行参数摘要。")
         backtest_repository.delete_strategy(strategy["id"])
         stored_after_delete = backtest_repository.get_run(run["id"])
         self.assertIsNone(stored_after_delete["strategy_id"])
@@ -210,6 +215,8 @@ class BacktestRepositoryTests(unittest.TestCase):
                     "cash": 1,
                     "positions_value": 99,
                     "equity": 100,
+                    "borrowed_cash": 25,
+                    "gross_leverage": 1.5,
                     "return_rate": 0,
                     "drawdown_rate": 0,
                     "benchmark_equity": None,
@@ -252,6 +259,9 @@ class BacktestRepositoryTests(unittest.TestCase):
             backtest_repository.get_equity_points(run["id"])[0]["equity"],
             100,
         )
+        point = backtest_repository.get_equity_points(run["id"])[0]
+        self.assertEqual(point["borrowed_cash"], 25)
+        self.assertEqual(point["gross_leverage"], 1.5)
         self.assertEqual(
             backtest_repository.get_trades(run["id"])[0]["symbol"],
             "SPY",
@@ -260,6 +270,12 @@ class BacktestRepositoryTests(unittest.TestCase):
             backtest_repository.get_logs(run["id"], level="INFO")[0]["message"],
             "买入",
         )
+        updated_run = backtest_repository.update_run(
+            run["id"],
+            status="completed",
+            termination_reason="LIQUIDATED",
+        )
+        self.assertEqual(updated_run["termination_reason"], "LIQUIDATED")
 
     def test_corporate_action_refresh_removes_provider_deletions(self) -> None:
         action = {
@@ -271,6 +287,14 @@ class BacktestRepositoryTests(unittest.TestCase):
             "ex_date": "2024-06-01",
             "old_rate": 1,
             "new_rate": 2,
+            "legs": [
+                {
+                    "role": "subject",
+                    "symbol": "SPY",
+                    "cusip": "78462F103",
+                    "isin": "US78462F1030",
+                }
+            ],
             "payload": {},
         }
         backtest_repository.upsert_corporate_actions(
@@ -289,6 +313,18 @@ class BacktestRepositoryTests(unittest.TestCase):
             ),
             1,
         )
+        with main_db.get_connection() as conn:
+            symbol_mapping = conn.execute(
+                "SELECT instrument_key FROM instrument_symbols WHERE symbol = 'SPY'"
+            ).fetchone()
+            identifier = conn.execute(
+                """
+                SELECT instrument_key FROM instrument_identifiers
+                WHERE identifier_type = 'cusip' AND identifier_value = '78462F103'
+                """
+            ).fetchone()
+        self.assertEqual(symbol_mapping["instrument_key"], "cusip:78462F103")
+        self.assertEqual(identifier["instrument_key"], "cusip:78462F103")
 
         backtest_repository.upsert_corporate_actions(
             [],
@@ -305,6 +341,70 @@ class BacktestRepositoryTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_run_soft_delete_hides_summary_and_removes_heavy_rows(self) -> None:
+        strategy = create_default_strategy(
+            name="日志清理测试",
+            design_mode="visual",
+            selection_mode="single",
+        )
+        run = backtest_repository.create_run(strategy, strategy["default_settings"])
+        backtest_repository.replace_run_output(
+            run["id"],
+            equity_points=[
+                {
+                    "trading_date": "2024-01-02",
+                    "cash": 100,
+                    "receivables": 0,
+                    "positions_value": 0,
+                    "equity": 100,
+                    "return_rate": 0,
+                    "drawdown_rate": 0,
+                    "benchmark_equity": None,
+                    "benchmark_return_rate": None,
+                    "positions": {"SPY": {"quantity": 1}},
+                }
+            ],
+            trades=[],
+            logs=[
+                {
+                    "level": "INFO",
+                    "event_type": "TEST",
+                    "message": "需要清理的日志",
+                    "context": {"value": 1},
+                }
+            ],
+        )
+        backtest_repository.update_run(
+            run["id"], status="completed", metrics={"total_return": 0.1}
+        )
+
+        overview = backtest_repository.list_runs_overview(page=1, page_size=10)
+        self.assertEqual(overview["total_rows"], 1)
+        self.assertEqual(overview["items"][0]["symbols"], ["SPY"])
+        self.assertEqual(
+            overview["items"][0]["settings"]["leverage_multiplier"], 1.0
+        )
+        detail = backtest_repository.get_run_detail(run["id"])
+        self.assertEqual(detail["strategy_snapshot"]["name"], "日志清理测试")
+        self.assertEqual(detail["available_log_count"], 1)
+
+        deleted = backtest_repository.delete_runs([run["id"]])
+
+        self.assertEqual(deleted["deleted_log_rows"], 1)
+        self.assertEqual(deleted["deleted_equity_rows"], 1)
+        self.assertEqual(backtest_repository.get_logs(run["id"]), [])
+        self.assertEqual(backtest_repository.get_equity_points(run["id"]), [])
+        self.assertEqual(
+            backtest_repository.list_runs_overview(page=1, page_size=10)["total_rows"],
+            0,
+        )
+        with self.assertRaises(ValueError):
+            backtest_repository.get_run_detail(run["id"])
+        retained = backtest_repository.get_run(run["id"], include_deleted=True)
+        self.assertIsNotNone(retained["deleted_at"])
+        self.assertEqual(retained["metrics"]["total_return"], 0.1)
+        self.assertEqual(retained["strategy_snapshot"]["name"], "日志清理测试")
 
 
 if __name__ == "__main__":

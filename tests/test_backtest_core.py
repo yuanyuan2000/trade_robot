@@ -140,6 +140,17 @@ class DslSafetyTests(unittest.TestCase):
         )
         self.assertIn("NaN", issue["reason"])
 
+    def test_leverage_setting_defaults_and_bounds(self) -> None:
+        self.assertEqual(validate_settings({})["leverage_multiplier"], 1.0)
+        self.assertEqual(
+            validate_settings({"leverage_multiplier": 3})["leverage_multiplier"],
+            3.0,
+        )
+        with self.assertRaises(BacktestValidationError):
+            validate_settings({"leverage_multiplier": 0.99})
+        with self.assertRaises(BacktestValidationError):
+            validate_settings({"leverage_multiplier": 10.01})
+
     def test_code_strategy_times_must_be_valid_and_ordered(self) -> None:
         with self.assertRaises(BacktestValidationError):
             RapidDropAtrRotationStrategy.validate_params(
@@ -267,6 +278,21 @@ class DataPreflightTests(unittest.TestCase):
 
 
 class PortfolioAccountingTests(unittest.TestCase):
+    def test_leverage_scales_exposure_and_uses_negative_cash(self) -> None:
+        portfolio = Portfolio(1000, leverage_multiplier=3)
+        trade = portfolio.execute(
+            OrderIntent("SPY", "BUY", "TARGET", 100, "leveraged buy"),
+            reference_price=10,
+            marks={"SPY": 10},
+            event_time="2024-01-02 OPEN",
+        )
+
+        self.assertEqual(trade["quantity"], 300)
+        self.assertEqual(float(portfolio.cash), -2000)
+        self.assertEqual(float(portfolio.borrowed_cash), 2000)
+        self.assertAlmostEqual(float(portfolio.weight("SPY", {"SPY": 10})), 1)
+        self.assertAlmostEqual(float(portfolio.gross_leverage({"SPY": 10})), 3)
+
     def test_round_trip_cash_and_fifo_pnl_include_both_commissions(self) -> None:
         portfolio = Portfolio(
             1000,
@@ -447,6 +473,50 @@ class EngineTimingTests(unittest.TestCase):
         self.assertEqual(result.trades[0]["event_time"], f"{self.run_dates[1]} 09:30 America/New_York")
         self.assertEqual(result.trades[0]["reference_price"], 21.0)
         self.assertNotEqual(result.trades[0]["reference_price"], 13.0)
+
+    def test_leveraged_intraday_liquidation_stops_and_returns_results(self) -> None:
+        trading_date = self.run_dates[0]
+        daily = daily_rows(self.dates, [100.0] * len(self.dates))
+        daily[-3].update({"open": 100, "high": 101, "low": 20, "close": 20})
+        minute = _epoch_minute(trading_date, "09:31")
+        dataset = HistoricalDataSet(
+            daily={"SPY": daily},
+            sessions=[trading_date],
+            minute={
+                "SPY": {
+                    minute: {
+                        "minute_utc": minute,
+                        "open": 100,
+                        "high": 100,
+                        "low": 20,
+                        "close": 20,
+                    }
+                }
+            },
+        )
+        strategy = visual_strategy(rule={"condition": "true", "when": "OPEN"})
+
+        result = BacktestEngine(
+            strategy,
+            settings(
+                trading_date,
+                trading_date,
+                leverage_multiplier=3,
+            ),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(result.termination_reason, "LIQUIDATED")
+        self.assertTrue(result.metrics["liquidated"])
+        self.assertEqual(len(result.trades), 2)
+        self.assertEqual(result.trades[-1]["reason"], "账户爆仓强制平仓")
+        self.assertLess(result.metrics["ending_equity"], 0)
+        self.assertIsNone(result.metrics["annualized_return"])
+        self.assertIsNone(result.metrics["sharpe_ratio"])
+        self.assertIsNone(result.metrics["sortino_ratio"])
+        self.assertAlmostEqual(result.metrics["max_gross_leverage"], 3)
+        self.assertEqual(result.equity_points[-1]["positions"], {})
+        self.assertTrue(any(log["event_type"] == "LIQUIDATION" for log in result.logs))
 
     def test_intraday_signal_uses_previous_minute_and_current_open(self) -> None:
         first = self.run_dates[0]
@@ -832,7 +902,7 @@ class StrategyModeTests(unittest.TestCase):
             "design_mode": "code",
             "selection_mode": "competition",
             "code_key": "rapid_drop_atr_rotation",
-            "code_version": "1.2.0",
+            "code_version": "1.3.0",
             "definition": {
                 "symbols": [
                     {"symbol": symbol, "max_weight": 100}
@@ -938,7 +1008,7 @@ class StrategyModeTests(unittest.TestCase):
             "design_mode": "code",
             "selection_mode": "competition",
             "code_key": "rapid_drop_atr_rotation",
-            "code_version": "1.2.0",
+            "code_version": "1.3.0",
             "definition": {
                 "symbols": [
                     {"symbol": symbol, "max_weight": 100}
@@ -967,6 +1037,67 @@ class StrategyModeTests(unittest.TestCase):
         self.assertEqual(set(positions), {"SOXX", "GLD"})
         self.assertAlmostEqual(positions["SOXX"]["weight"], 0.5, places=7)
         self.assertAlmostEqual(positions["GLD"]["weight"], 0.5, places=7)
+
+    def test_rapid_drop_leverage_does_not_rebalance_unchanged_winner_daily(self) -> None:
+        symbols = ["SPY", "GLD"]
+        first, second = self.run_dates[:2]
+        daily = {
+            symbol: daily_rows(self.dates, [100.0] * len(self.dates))
+            for symbol in symbols
+        }
+        minute: dict[str, dict[int, dict]] = {symbol: {} for symbol in symbols}
+        for trading_date in (first, second):
+            for symbol in symbols:
+                for event, signal in (
+                    ("09:40", 100.0),
+                    ("10:00", 110.0 if symbol == "SPY" else 100.0),
+                ):
+                    current = _epoch_minute(trading_date, event)
+                    for minute_key in (current - 1, current):
+                        minute[symbol][minute_key] = {
+                            "open": signal,
+                            "high": signal,
+                            "low": signal,
+                            "close": signal,
+                        }
+        dataset = HistoricalDataSet(
+            daily=daily,
+            sessions=[first, second],
+            minute=minute,
+            required_intraday_events=["09:40", "10:00"],
+        )
+        strategy = {
+            "name": "杠杆轮动不重复交易测试",
+            "design_mode": "code",
+            "selection_mode": "competition",
+            "code_key": "rapid_drop_atr_rotation",
+            "code_version": "1.3.0",
+            "definition": {
+                "symbols": [
+                    {"symbol": symbol, "max_weight": 100}
+                    for symbol in symbols
+                ],
+                "params": {
+                    "enable_percent_drop_filter": False,
+                    "enable_atr_drop_filter": False,
+                },
+            },
+            "default_settings": {},
+        }
+
+        result = BacktestEngine(
+            strategy,
+            settings(
+                first,
+                second,
+                leverage_multiplier=2,
+                allow_fractional_shares=True,
+            ),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0]["symbol"], "SPY")
 
 
 if __name__ == "__main__":

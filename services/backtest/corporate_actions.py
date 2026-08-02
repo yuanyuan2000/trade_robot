@@ -19,7 +19,12 @@ from services.backtest.errors import BacktestDataError
 CORPORATE_ACTIONS_URL = (
     ALPACA_DATA_BASE_URL.rsplit("/v2", 1)[0] + "/v1/corporate-actions"
 )
-SUPPORTED_ACTIONS = {"forward_split", "reverse_split", "cash_dividend"}
+SUPPORTED_ACTIONS = {
+    "forward_split",
+    "reverse_split",
+    "cash_dividend",
+    "name_change",
+}
 MAX_CACHE_AGE = timedelta(hours=24)
 
 
@@ -45,6 +50,72 @@ def _event_symbol(group: str, event: dict) -> str | None:
         if event.get(key):
             return str(event[key]).upper()
     return None
+
+
+def _leg(
+    role: str,
+    event: dict,
+    *,
+    symbol_key: str,
+    cusip_key: str | None = None,
+    isin_key: str | None = None,
+    share_rate_key: str | None = None,
+    cash_rate_key: str | None = None,
+) -> dict | None:
+    symbol = event.get(symbol_key)
+    cusip = event.get(cusip_key) if cusip_key else None
+    isin = event.get(isin_key) if isin_key else None
+    if not symbol and not cusip and not isin:
+        return None
+    return {
+        "role": role,
+        "symbol": str(symbol).upper() if symbol else None,
+        "cusip": str(cusip) if cusip else None,
+        "isin": str(isin) if isin else None,
+        "share_rate": (
+            float(event[share_rate_key])
+            if share_rate_key and event.get(share_rate_key) is not None
+            else None
+        ),
+        "cash_rate": (
+            float(event[cash_rate_key])
+            if cash_rate_key and event.get(cash_rate_key) is not None
+            else None
+        ),
+        "currency": event.get("currency"),
+    }
+
+
+def _event_legs(group: str, event: dict) -> list[dict]:
+    candidates: list[dict | None]
+    if group == "name_changes":
+        candidates = [
+            _leg("source", event, symbol_key="old_symbol", cusip_key="old_cusip", isin_key="old_isin"),
+            _leg("target", event, symbol_key="new_symbol", cusip_key="new_cusip", isin_key="new_isin"),
+        ]
+    elif group == "spin_offs":
+        candidates = [
+            _leg("source", event, symbol_key="source_symbol", cusip_key="source_cusip", isin_key="source_isin", share_rate_key="source_rate"),
+            _leg("target", event, symbol_key="new_symbol", cusip_key="new_cusip", isin_key="new_isin", share_rate_key="new_rate"),
+        ]
+    elif group in {"cash_mergers", "stock_mergers", "stock_and_cash_mergers"}:
+        candidates = [
+            _leg("acquiree", event, symbol_key="acquiree_symbol", cusip_key="acquiree_cusip", isin_key="acquiree_isin", share_rate_key="acquiree_rate"),
+            _leg("acquirer", event, symbol_key="acquirer_symbol", cusip_key="acquirer_cusip", isin_key="acquirer_isin", share_rate_key="acquirer_rate", cash_rate_key="rate"),
+        ]
+    else:
+        candidates = [
+            _leg(
+                "subject",
+                event,
+                symbol_key="symbol",
+                cusip_key="cusip",
+                isin_key="isin",
+                share_rate_key="new_rate",
+                cash_rate_key="rate",
+            )
+        ]
+    return [item for item in candidates if item is not None]
 
 
 def _singular_action_type(group: str) -> str:
@@ -116,6 +187,19 @@ def _normalize_payload(payload: dict) -> tuple[list[dict], str | None]:
                         if action_type == "cash_dividend" and event.get("rate") is not None
                         else None
                     ),
+                    "currency": event.get("currency"),
+                    "region": event.get("region") or "us",
+                    "sub_type": event.get("sub_type"),
+                    "special": bool(event.get("special")),
+                    "foreign": bool(event.get("foreign")),
+                    "due_bill_on_date": event.get("due_bill_on_date"),
+                    "due_bill_off_date": event.get("due_bill_off_date"),
+                    "effective_date": str(
+                        event.get("effective_date")
+                        or event.get("ex_date")
+                        or process_date
+                    ),
+                    "legs": _event_legs(group, event),
                     "payload": {"group": group, **event},
                 }
             )
@@ -174,13 +258,66 @@ def fetch_corporate_actions(
     return actions
 
 
+def _role_affects_position(action_type: str, role: str) -> bool:
+    if action_type == "name_change":
+        return False
+    if action_type == "spin_off":
+        return role == "source"
+    if action_type in {"cash_merger", "stock_merger", "stock_and_cash_merger"}:
+        return role == "acquiree"
+    return role in {"subject", "source", "acquiree"}
+
+
+def _actions_for_symbols(
+    actions: list[dict],
+    symbols: list[str],
+    required_starts: dict[str, str],
+) -> list[dict]:
+    requested = set(symbols)
+    matched: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for action in actions:
+        effective_date = str(
+            action.get("effective_date")
+            or action.get("ex_date")
+            or action["process_date"]
+        )
+        legs = action.get("legs") or [
+            {"role": "subject", "symbol": action.get("symbol")}
+        ]
+        for leg in legs:
+            symbol = str(leg.get("symbol") or "").upper()
+            if symbol not in requested or effective_date < required_starts[symbol]:
+                continue
+            role = str(leg.get("role") or "subject")
+            key = (str(action["provider_id"]), symbol, role)
+            if key in seen:
+                continue
+            seen.add(key)
+            item = dict(action)
+            item["event_symbol"] = action.get("symbol")
+            item["symbol"] = symbol
+            item["matched_role"] = role
+            item["matched_leg"] = dict(leg)
+            item["affects_position"] = _role_affects_position(
+                item["action_type"], role
+            )
+            matched.append(item)
+    return matched
+
+
 def ensure_corporate_actions(
     symbols: list[str],
     *,
     start_date: str,
     end_date: str,
+    symbol_starts: dict[str, str] | None = None,
 ) -> list[dict]:
     normalized = list(dict.fromkeys(str(symbol).upper() for symbol in symbols))
+    required_starts = {
+        symbol: max(start_date, (symbol_starts or {}).get(symbol, start_date))
+        for symbol in normalized
+    }
     states = {
         symbol: backtest_repository.corporate_action_coverage(symbol)
         for symbol in normalized
@@ -189,9 +326,9 @@ def ensure_corporate_actions(
         state
         and state["status"] == "success"
         and _coverage_is_fresh(state)
-        and state["coverage_start"] <= start_date
+        and state["coverage_start"] <= required_starts[symbol]
         and state["coverage_end"] >= end_date
-        for state in states.values()
+        for symbol, state in states.items()
     )
     if not covered:
         # The sync-state table stores one continuous interval.  When a request
@@ -207,7 +344,7 @@ def ensure_corporate_actions(
             for state in states.values()
             if state and state["status"] == "success"
         ]
-        fetch_start = min([start_date, *successful_starts])
+        fetch_start = min([min(required_starts.values()), *successful_starts])
         fetch_end = max([end_date, *successful_ends])
         try:
             actions = fetch_corporate_actions(
@@ -229,11 +366,12 @@ def ensure_corporate_actions(
                 error=str(exc),
             )
             raise
-    return backtest_repository.get_corporate_actions(
+    stored = backtest_repository.get_corporate_actions(
         normalized,
-        start_date=start_date,
+        start_date=min(required_starts.values()),
         end_date=end_date,
     )
+    return _actions_for_symbols(stored, normalized, required_starts)
 
 
 def validate_supported_actions(actions: list[dict]) -> None:
@@ -245,9 +383,41 @@ def validate_supported_actions(actions: list[dict]) -> None:
         }
         for action in actions
         if action["action_type"] not in SUPPORTED_ACTIONS
+        and action.get("affects_position", True)
     ]
     if unsupported:
         raise BacktestDataError(
             "回测区间包含暂不支持的公司行动，不能保证账户结果正确。",
             detail=unsupported,
+        )
+    incomplete = []
+    for action in actions:
+        if not action.get("affects_position", True):
+            continue
+        action_type = action["action_type"]
+        missing: list[str] = []
+        if action_type in {"forward_split", "reverse_split"}:
+            if action.get("old_rate") is None:
+                missing.append("old_rate")
+            if action.get("new_rate") is None:
+                missing.append("new_rate")
+        elif action_type == "cash_dividend":
+            if action.get("cash_rate") is None:
+                missing.append("cash_rate")
+            if not action.get("payable_date"):
+                missing.append("payable_date")
+        if missing:
+            incomplete.append(
+                {
+                    "provider_id": action.get("provider_id"),
+                    "symbol": action["symbol"],
+                    "action_type": action_type,
+                    "date": action.get("ex_date") or action["process_date"],
+                    "missing_fields": missing,
+                }
+            )
+    if incomplete:
+        raise BacktestDataError(
+            "回测区间的公司行动缺少关键字段，不能安全推断现金或持仓变化。",
+            detail=incomplete,
         )

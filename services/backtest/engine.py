@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
+from database import intraday_repository
+
 from services.backtest.code_strategies import get_code_strategy
 from services.backtest.data import HistoricalDataSet, load_historical_dataset
 from services.backtest.dsl import CompiledExpression, compile_expression
@@ -33,6 +35,8 @@ class BacktestResult:
     trades: list[dict]
     logs: list[dict]
     data_manifest: dict
+    termination_reason: str | None = None
+    liquidation: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -41,6 +45,8 @@ class BacktestResult:
             "trades": self.trades,
             "logs": self.logs,
             "data_manifest": self.data_manifest,
+            "termination_reason": self.termination_reason,
+            "liquidation": self.liquidation,
         }
 
 
@@ -160,9 +166,13 @@ class BacktestEngine:
         if self.code_strategy is not None:
             minimum_trade = float(self.code_strategy.params.get("minimum_trade_value_usd", 0))
             holdings = int(self.code_strategy.params.get("holdings_num", 1))
-            if minimum_trade >= self.settings["initial_capital"] / holdings:
+            if minimum_trade >= (
+                self.settings["initial_capital"]
+                * self.settings["leverage_multiplier"]
+                / holdings
+            ):
                 raise BacktestValidationError(
-                    "最小非清仓交易额必须小于初始资金除以目标持仓数量。"
+                    "最小非清仓交易额必须小于杠杆后可用敞口除以目标持仓数量。"
                 )
         self.tradable_symbols = list(
             dict.fromkeys([*self.universe, *self.auxiliary_symbols])
@@ -202,6 +212,7 @@ class BacktestEngine:
         }
         self.portfolio = Portfolio(
             self.settings["initial_capital"],
+            leverage_multiplier=self.settings["leverage_multiplier"],
             **portfolio_kwargs,
         )
         self.benchmark = (
@@ -209,6 +220,10 @@ class BacktestEngine:
             if self.benchmark_weights
             else None
         )
+        self.termination_reason: str | None = None
+        self.liquidation: dict | None = None
+        self._liquidation_minute_audit: dict[str, dict[int, dict]] = {}
+        self.max_observed_gross_leverage = 0.0
 
     def _build_requirements(self) -> dict:
         events: set[str] = set()
@@ -328,6 +343,19 @@ class BacktestEngine:
             self._apply_corporate_actions(trading_date)
             self._update_benchmark(trading_date)
 
+            active_tradable = self.dataset.active_symbols(
+                self.tradable_symbols, trading_date
+            )
+            open_marks = self.dataset.open_prices(trading_date, active_tradable)
+            if self._check_and_liquidate(
+                marks=open_marks,
+                event_time=f"{trading_date} 09:30 America/New_York",
+                trading_date=trading_date,
+                trigger="OPEN",
+            ):
+                peak = self._finish_liquidated_day(day_index, trading_date, peak)
+                break
+
             if pending_close:
                 open_event = {
                     symbol: self.dataset.event_price(symbol, trading_date, "OPEN")
@@ -344,7 +372,34 @@ class BacktestEngine:
                 )
                 pending_close = []
 
+            if self._check_and_liquidate(
+                marks=open_marks,
+                event_time=f"{trading_date} 09:30 America/New_York",
+                trading_date=trading_date,
+                trigger="POST_TRADE",
+            ):
+                peak = self._finish_liquidated_day(day_index, trading_date, peak)
+                break
+
+            open_minute, close_minute = self.dataset.session_minutes(trading_date)
+            risk_cursor = open_minute
+            risk_marks = dict(open_marks)
+
             for event in self.events:
+                event_minute = (
+                    open_minute
+                    if event == "OPEN"
+                    else close_minute
+                    if event == "CLOSE"
+                    else self._event_fill_minute(trading_date, event)
+                )
+                if self._scan_liquidation_interval(
+                    trading_date=trading_date,
+                    start_minute=risk_cursor,
+                    end_minute=event_minute,
+                    initial_marks=risk_marks,
+                ):
+                    break
                 active_tradable = self.dataset.active_symbols(
                     self.tradable_symbols, trading_date
                 )
@@ -377,6 +432,45 @@ class BacktestEngine:
                         event_prices=event_prices,
                     )
 
+                event_marks = {
+                    symbol: float(
+                        value.fill_price
+                        if value.fill_price is not None
+                        else value.signal_price
+                    )
+                    for symbol, value in event_prices.items()
+                }
+                risk_marks.update(event_marks)
+                risk_cursor = max(risk_cursor, event_minute)
+                if self._check_and_liquidate(
+                    marks=event_marks,
+                    event_time=(
+                        next(
+                            (
+                                value.fill_time
+                                for value in event_prices.values()
+                                if value.fill_time
+                            ),
+                            f"{trading_date} {event}",
+                        )
+                    ),
+                    trading_date=trading_date,
+                    trigger="POST_TRADE",
+                ):
+                    break
+
+            if not self.termination_reason:
+                self._scan_liquidation_interval(
+                    trading_date=trading_date,
+                    start_minute=risk_cursor,
+                    end_minute=close_minute,
+                    initial_marks=risk_marks,
+                )
+
+            if self.termination_reason:
+                peak = self._finish_liquidated_day(day_index, trading_date, peak)
+                break
+
             held_symbols = [
                 symbol for symbol in self.tradable_symbols
                 if self.portfolio.quantity(symbol) > 0
@@ -394,6 +488,8 @@ class BacktestEngine:
                 "receivables": float(self.portfolio.receivable_value),
                 "positions_value": positions_value,
                 "equity": equity,
+                "borrowed_cash": float(self.portfolio.borrowed_cash),
+                "gross_leverage": float(self.portfolio.gross_leverage(close_marks)),
                 "return_rate": equity / self.settings["initial_capital"] - 1,
                 "drawdown_rate": drawdown,
                 "benchmark_equity": benchmark_equity,
@@ -440,23 +536,266 @@ class BacktestEngine:
             risk_free_rate=self.settings["risk_free_rate"],
             total_commission=float(self.portfolio.total_commission),
             total_slippage=float(self.portfolio.total_slippage),
+            termination_reason=self.termination_reason,
+            liquidation=self.liquidation,
+            leverage_multiplier=self.settings["leverage_multiplier"],
+            max_observed_gross_leverage=self.max_observed_gross_leverage,
         )
-        self._log(
-            "INFO",
-            "RUN_COMPLETE",
-            (
-                f"回测完成，期末权益 {metrics['ending_equity']:.2f}，"
-                f"总收益率 {metrics['total_return']:.2%}。"
-            ),
-            context=metrics,
-        )
+        self._finalize_liquidation_manifest()
+        if self.termination_reason == "LIQUIDATED":
+            self._log(
+                "WARN",
+                "RUN_LIQUIDATED",
+                (
+                    f"回测因爆仓提前结束，期末权益 {metrics['ending_equity']:.2f}，"
+                    f"总收益率 {metrics['total_return']:.2%}。"
+                ),
+                event_time=(
+                    self.liquidation.get("liquidation_time")
+                    if self.liquidation
+                    else None
+                ),
+                context=metrics,
+            )
+        else:
+            self._log(
+                "INFO",
+                "RUN_COMPLETE",
+                (
+                    f"回测完成，期末权益 {metrics['ending_equity']:.2f}，"
+                    f"总收益率 {metrics['total_return']:.2%}。"
+                ),
+                context=metrics,
+            )
         return BacktestResult(
             metrics=metrics,
             equity_points=self.equity_points,
             trades=self.trades,
             logs=self.logs,
             data_manifest=self.dataset.manifest,
+            termination_reason=self.termination_reason,
+            liquidation=self.liquidation,
         )
+
+    def _event_fill_minute(self, trading_date: str, event: str) -> int:
+        resolutions = self.dataset.intraday_event_minutes
+        for symbol in self.dataset.active_symbols(self.tradable_symbols, trading_date):
+            value = resolutions.get(symbol, {}).get(f"{trading_date}|{event}")
+            if value and value.get("fill_minute") is not None:
+                return int(value["fill_minute"])
+        from services.backtest.data import _epoch_minute
+
+        return _epoch_minute(trading_date, event)
+
+    def _scan_liquidation_interval(
+        self,
+        *,
+        trading_date: str,
+        start_minute: int,
+        end_minute: int,
+        initial_marks: dict[str, float],
+    ) -> bool:
+        if (
+            self.settings["leverage_multiplier"] <= 1
+            or self.termination_reason
+            or end_minute <= start_minute
+        ):
+            return False
+        held = [
+            symbol for symbol in self.tradable_symbols
+            if self.portfolio.quantity(symbol) > 0
+        ]
+        if not held:
+            return False
+        low_marks = {
+            symbol: float(self.dataset.day_bar(symbol, trading_date)["low"])
+            for symbol in held
+        }
+        if self.portfolio.equity(low_marks) > 0:
+            return False
+
+        bars_by_symbol: dict[str, dict[int, dict]] = {}
+        for symbol in held:
+            bars = {}
+            for row in intraday_repository.get_minute_bars(
+                symbol,
+                start_minute=start_minute,
+                end_minute=end_minute - 1,
+                limit=20_000,
+            ):
+                bars[int(row["minute_utc"])] = row
+            bars.update(
+                {
+                    int(minute): row
+                    for minute, row in self.dataset.minute.get(symbol, {}).items()
+                    if start_minute <= int(minute) < end_minute
+                }
+            )
+            if not bars:
+                raise BacktestDataError(
+                    f"{symbol} 在 {trading_date} 缺少爆仓检查所需的分钟行情。",
+                    detail={
+                        "symbol": symbol,
+                        "type": "liquidation_minute_missing",
+                        "start_minute": start_minute,
+                        "end_minute": end_minute,
+                    },
+                )
+            bars_by_symbol[symbol] = bars
+            self._liquidation_minute_audit.setdefault(symbol, {}).update(bars)
+
+        marks = {
+            symbol: float(
+                initial_marks.get(
+                    symbol,
+                    self.dataset.day_bar(symbol, trading_date)["open"],
+                )
+            )
+            for symbol in held
+        }
+        minute_values = sorted(
+            {
+                minute
+                for bars in bars_by_symbol.values()
+                for minute in bars
+            }
+        )
+        for minute in minute_values:
+            for symbol, bars in bars_by_symbol.items():
+                if minute in bars:
+                    marks[symbol] = float(bars[minute]["low"])
+            if self._check_and_liquidate(
+                marks=marks,
+                event_time=self._minute_event_time(minute),
+                trading_date=trading_date,
+                trigger="MINUTE_LOW",
+            ):
+                return True
+            for symbol, bars in bars_by_symbol.items():
+                if minute in bars:
+                    marks[symbol] = float(bars[minute]["close"])
+        return False
+
+    def _finalize_liquidation_manifest(self) -> None:
+        from services.backtest.data import _sha256
+
+        records = [
+            {
+                "symbol": symbol,
+                "minute_utc": minute,
+                "open": row.get("open"),
+                "high": row.get("high"),
+                "low": row.get("low"),
+                "close": row.get("close"),
+            }
+            for symbol, bars in sorted(self._liquidation_minute_audit.items())
+            for minute, row in sorted(bars.items())
+        ]
+        self.dataset.manifest["liquidation_monitor"] = {
+            "granularity": "minute_low",
+            "points_checked": len(records),
+            "sha256": _sha256(records),
+        }
+
+    @staticmethod
+    def _minute_event_time(minute: int) -> str:
+        from services.backtest.data import _minute_label
+
+        return _minute_label(minute)
+
+    def _check_and_liquidate(
+        self,
+        *,
+        marks: dict[str, float],
+        event_time: str,
+        trading_date: str,
+        trigger: str,
+    ) -> bool:
+        if self.settings["leverage_multiplier"] <= 1 or self.termination_reason:
+            return bool(self.termination_reason)
+        held = [
+            symbol for symbol in self.tradable_symbols
+            if self.portfolio.quantity(symbol) > 0
+        ]
+        if not held:
+            return False
+        held_marks = {symbol: marks[symbol] for symbol in held if symbol in marks}
+        if len(held_marks) != len(held):
+            missing = sorted(set(held) - set(held_marks))
+            raise BacktestDataError(f"爆仓检查缺少持仓盯市价格：{missing}。")
+        equity_before = float(self.portfolio.equity(held_marks))
+        gross_before = float(self.portfolio.market_value(held_marks))
+        if equity_before > 0:
+            self.max_observed_gross_leverage = max(
+                self.max_observed_gross_leverage,
+                gross_before / equity_before,
+            )
+            return False
+        forced_trades = self.portfolio.liquidate_all(
+            marks=held_marks,
+            event_time=event_time,
+        )
+        for trade in forced_trades:
+            self.trades.append(trade)
+            self._log_trade(trade)
+        equity_after = float(self.portfolio.equity({}))
+        self.termination_reason = "LIQUIDATED"
+        self.liquidation = {
+            "liquidated": True,
+            "liquidation_time": event_time,
+            "trading_date": trading_date,
+            "trigger": trigger,
+            "equity_before_liquidation": equity_before,
+            "equity_after_liquidation": equity_after,
+            "gross_exposure_before_liquidation": gross_before,
+            "forced_trade_count": len(forced_trades),
+            "leverage_multiplier": self.settings["leverage_multiplier"],
+        }
+        self._log(
+            "ERROR",
+            "LIQUIDATION",
+            f"账户权益 {equity_before:.2f} 不大于 0，已强制平仓并提前结束回测。",
+            event_time=event_time,
+            context=self.liquidation,
+        )
+        return True
+
+    def _finish_liquidated_day(
+        self,
+        day_index: int,
+        trading_date: str,
+        peak: float,
+    ) -> float:
+        equity = float(self.portfolio.equity({}))
+        peak = max(peak, equity)
+        drawdown = equity / peak - 1 if peak > 0 else 0
+        point = {
+            "sequence": len(self.equity_points) + 1,
+            "trading_date": trading_date,
+            "cash": float(self.portfolio.cash),
+            "receivables": float(self.portfolio.receivable_value),
+            "positions_value": 0.0,
+            "equity": equity,
+            "borrowed_cash": float(self.portfolio.borrowed_cash),
+            "gross_leverage": 0.0,
+            "return_rate": equity / self.settings["initial_capital"] - 1,
+            "drawdown_rate": drawdown,
+            "benchmark_equity": None,
+            "benchmark_return_rate": None,
+            "positions": {},
+        }
+        self.equity_points.append(point)
+        if self.progress_callback:
+            self.progress_callback(
+                {
+                    "progress": (day_index + 1) / len(self.dataset.sessions),
+                    "current_time": self.liquidation["liquidation_time"],
+                    "equity_point": point,
+                    "trade_count": len(self.trades),
+                    "log_count": len(self.logs),
+                }
+            )
+        return peak
 
     def _marks_for_event(self, event_prices: dict) -> dict[str, float]:
         return {
@@ -696,24 +1035,27 @@ class BacktestEngine:
             if not trade:
                 continue
             self.trades.append(trade)
-            realized = (
-                f"，已实现PnL {trade['realized_pnl']:.2f}"
-                if trade["realized_pnl"] is not None
-                else ""
-            )
-            self._log(
-                "INFO",
-                "TRADE",
-                (
-                    f"{trade['side']} {trade['symbol']} {trade['quantity']:g} 股 "
-                    f"@ {trade['fill_price']:.6f}，手续费 "
-                    f"{trade['commission']:.4f}，滑点成本 "
-                    f"{trade['slippage_amount']:.4f}{realized}。"
-                ),
-                event_time=trade["event_time"],
-                symbol=trade["symbol"],
-                context=trade,
-            )
+            self._log_trade(trade)
+
+    def _log_trade(self, trade: dict) -> None:
+        realized = (
+            f"，已实现PnL {trade['realized_pnl']:.2f}"
+            if trade["realized_pnl"] is not None
+            else ""
+        )
+        self._log(
+            "INFO",
+            "TRADE",
+            (
+                f"{trade['side']} {trade['symbol']} {trade['quantity']:g} 股 "
+                f"@ {trade['fill_price']:.6f}，手续费 "
+                f"{trade['commission']:.4f}，滑点成本 "
+                f"{trade['slippage_amount']:.4f}{realized}。"
+            ),
+            event_time=trade["event_time"],
+            symbol=trade["symbol"],
+            context=trade,
+        )
 
     def _update_benchmark(self, trading_date: str) -> None:
         if self.benchmark is None:

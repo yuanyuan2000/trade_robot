@@ -22,6 +22,7 @@ DEFAULT_BACKTEST_SETTINGS = {
     "start_date": "2020-02-03",
     "end_date": (date.today() - timedelta(days=1)).isoformat(),
     "initial_capital": 100_000.0,
+    "leverage_multiplier": 1.0,
     "commission_per_share": 0.01,
     "minimum_commission": 1.0,
     "slippage_bps": 0.0,
@@ -73,6 +74,7 @@ def validate_settings(settings: dict | None) -> dict:
 
     numeric_rules = (
         ("initial_capital", 0, None, False),
+        ("leverage_multiplier", 1, 10, True),
         ("commission_per_share", 0, None, True),
         ("minimum_commission", 0, None, True),
         ("slippage_bps", 0, 1000, True),

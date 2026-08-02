@@ -1654,7 +1654,8 @@ def _prepare_trendline_analysis(
         symbol: str,
         period: str,
         limit: int,
-        show_weekend_data: str | bool | None,
+    show_weekend_data: str | bool | None,
+    adjustment: str = "all",
 ) -> dict:
     clean_period = (period or "1D").upper()
     if clean_period not in SUPPORTED_PERIODS:
@@ -1664,7 +1665,7 @@ def _prepare_trendline_analysis(
     if window_size < 30 or window_size > 300:
         raise ValueError("Analysis window must be between 30 and 300 candles")
 
-    payload = get_market_data(symbol)
+    payload = get_market_data(symbol, adjustment=adjustment)
     raw_rows = payload.get("data") or []
     include_weekends = resolve_show_weekend_data(
         show_weekend_data,
@@ -1691,13 +1692,15 @@ def get_trendline_analysis_signature(
         symbol: str,
         period: str = "1D",
         limit: int = 150,
-        show_weekend_data: str | bool | None = None,
+    show_weekend_data: str | bool | None = None,
+    adjustment: str = "all",
 ) -> dict:
     prepared = _prepare_trendline_analysis(
         symbol,
         period,
         limit,
         show_weekend_data,
+        adjustment,
     )
     payload = prepared["market_payload"]
     candles = prepared["candles"]
@@ -1719,13 +1722,15 @@ def get_trendline_analysis_signature(
 
 def analyze_symbol_trendlines(symbol: str, period: str = "1D",
                               limit: int = 150,
-                              show_weekend_data: str | bool | None = None) -> dict:
+                              show_weekend_data: str | bool | None = None,
+                              adjustment: str = "all") -> dict:
     """Analyze the latest candles for one symbol and return drawable lines."""
     prepared = _prepare_trendline_analysis(
         symbol,
         period,
         limit,
         show_weekend_data,
+        adjustment,
     )
     payload = prepared["market_payload"]
     clean_period = prepared["period"]

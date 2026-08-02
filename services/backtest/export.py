@@ -378,6 +378,24 @@ def build_run_xls(run_id: int) -> bytes:
     workbook = xlwt.Workbook(encoding="utf-8")
     styles = _styles()
 
+    settings = run.get("settings") or {}
+    metrics = run.get("metrics") or {}
+    liquidation = metrics.get("liquidation") or {}
+    summary_sheet = workbook.add_sheet("运行摘要")
+    _write_table(
+        summary_sheet,
+        ["运行ID", "运行状态", "终止原因", "杠杆倍率", "爆仓时间", "初始资金", "期末权益", "总收益率", "运行参数摘要"],
+        [[
+            run.get("id"), run.get("status"), run.get("termination_reason"),
+            settings.get("leverage_multiplier", 1), liquidation.get("liquidation_time"),
+            settings.get("initial_capital"), metrics.get("ending_equity"),
+            metrics.get("total_return"), run.get("configuration_summary"),
+        ]],
+        styles=styles,
+        money_columns={"初始资金", "期末权益"},
+        percent_columns={"总收益率"},
+    )
+
     trade_headers, trade_rows = _trade_rows(trades, logs)
     trade_sheet = workbook.add_sheet("买卖操作")
     _write_table(

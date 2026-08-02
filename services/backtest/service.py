@@ -138,6 +138,52 @@ def validate_saved_strategy(strategy_id: int) -> dict:
     }
 
 
+def _compact_number(value: object) -> str:
+    number = float(value)
+    return f"{number:g}"
+
+
+def build_run_configuration_summary(strategy: dict, settings: dict) -> str:
+    common = (
+        f"{settings['start_date']}至{settings['end_date']}，初始资金"
+        f"${settings['initial_capital']:,.2f}，{settings['leverage_multiplier']:g}倍杠杆，"
+        f"每股手续费${settings['commission_per_share']:g}/最低${settings['minimum_commission']:g}，"
+        f"滑点{settings['slippage_bps']:g}bps，"
+        f"{'允许' if settings['allow_fractional_shares'] else '不允许'}碎股，"
+        f"基准{settings['benchmark']}"
+    )
+    if strategy["design_mode"] == "code":
+        strategy_type = get_code_strategy(strategy["code_key"])
+        code_strategy = strategy_type(strategy["definition"].get("params", {}))
+        detail = code_strategy.describe_run(strategy["definition"])
+    else:
+        symbols = "、".join(
+            item["symbol"] for item in strategy["definition"]["symbols"]
+        )
+        rules = []
+        for rule in strategy["definition"].get("rules", []):
+            if not rule.get("enabled", True):
+                continue
+            if rule["action"] == "HOLD":
+                result = "持有"
+            else:
+                result = (
+                    f"{rule['action']} {rule['sizing_mode']} "
+                    f"{_compact_number(rule['value'])}%"
+                )
+            rules.append(
+                f"{rule['when']}若“{rule['condition']}”则{result}"
+            )
+        competition = strategy["definition"].get("competition")
+        if competition:
+            rules.append(
+                f"{competition['when']}按“{competition['score']}”竞争选标，"
+                f"目标{_compact_number(competition['target_weight'])}%"
+            )
+        detail = f"{strategy['selection_mode']}模式，标的{symbols}；{'；'.join(rules)}"
+    return f"{common}；{detail}。"
+
+
 class BacktestRunManager:
     def __init__(self):
         self._lock = threading.RLock()
@@ -171,7 +217,13 @@ class BacktestRunManager:
             **(settings or {}),
         }
         validated_settings = validate_settings(merged_settings)
-        run = backtest_repository.create_run(strategy, validated_settings)
+        run = backtest_repository.create_run(
+            strategy,
+            validated_settings,
+            configuration_summary=build_run_configuration_summary(
+                strategy, validated_settings
+            ),
+        )
         state = {
             "run_id": run["id"],
             "cancel": threading.Event(),
@@ -241,9 +293,14 @@ class BacktestRunManager:
                 run_id,
                 status="completed",
                 progress=1.0,
-                current_time=engine.dataset.sessions[-1],
+                current_time=(
+                    result.liquidation.get("liquidation_time")
+                    if result.liquidation
+                    else engine.dataset.sessions[-1]
+                ),
                 data_manifest=result.data_manifest,
                 metrics=result.metrics,
+                termination_reason=result.termination_reason,
                 completed_at=datetime.now(timezone.utc).replace(
                     microsecond=0
                 ).isoformat(),
@@ -450,6 +507,11 @@ class BacktestRunManager:
                 continue
         return False
 
+    def purge_deleted_runs(self, run_ids: list[int]) -> None:
+        with self._lock:
+            for run_id in run_ids:
+                self._states.pop(int(run_id), None)
+
     def shutdown(self) -> None:
         with self._lock:
             for state in self._states.values():
@@ -457,7 +519,11 @@ class BacktestRunManager:
             executor = self._executor
             self._executor = None
         if executor:
-            executor.shutdown(wait=False, cancel_futures=True)
+            # Wait until the worker has left its final repository call.  A
+            # terminal status can become visible just before the thread exits;
+            # returning earlier leaves SQLite handles briefly alive on Windows
+            # and makes application/test shutdown nondeterministic.
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 run_manager = BacktestRunManager()

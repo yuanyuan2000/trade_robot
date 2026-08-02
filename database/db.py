@@ -43,6 +43,42 @@ def init_database() -> None:
 
 
 def migrate_database(conn: sqlite3.Connection) -> None:
+    ensure_column(conn, "backtest_runs", "termination_reason", "TEXT")
+    ensure_column(conn, "backtest_runs", "configuration_summary", "TEXT")
+    ensure_column(conn, "backtest_runs", "log_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "backtest_runs", "log_bytes", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "backtest_runs", "logs_deleted_at", "TEXT")
+    ensure_column(conn, "backtest_runs", "deleted_at", "TEXT")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_backtest_runs_deleted
+        ON backtest_runs(deleted_at, created_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        UPDATE backtest_runs
+        SET log_count = (
+                SELECT COUNT(*) FROM backtest_logs
+                WHERE backtest_logs.run_id = backtest_runs.id
+            ),
+            log_bytes = (
+                SELECT COALESCE(SUM(
+                    LENGTH(message) + LENGTH(COALESCE(context_json, ''))
+                ), 0)
+                FROM backtest_logs
+                WHERE backtest_logs.run_id = backtest_runs.id
+            )
+        WHERE logs_deleted_at IS NULL
+          AND log_count = 0
+        """
+    )
+    ensure_column(
+        conn, "backtest_equity_points", "borrowed_cash", "REAL NOT NULL DEFAULT 0"
+    )
+    ensure_column(
+        conn, "backtest_equity_points", "gross_leverage", "REAL NOT NULL DEFAULT 0"
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS symbol_aliases (
@@ -88,6 +124,7 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         definition="INTEGER NOT NULL DEFAULT 0",
     )
     ensure_column(conn, "symbols", "alpaca_symbol", "TEXT")
+    ensure_column(conn, "symbols", "alpaca_asset_id", "TEXT")
     ensure_column(conn, "symbols", "alpaca_supported", "INTEGER")
     ensure_column(conn, "symbols", "alpaca_checked_at", "TEXT")
     ensure_column(conn, "symbols", "alpaca_error", "TEXT")
@@ -98,6 +135,8 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         "TEXT NOT NULL DEFAULT 'us_equity'",
     )
     ensure_column(conn, "symbols", "quantity_step", "REAL")
+    ensure_column(conn, "symbols", "cusip", "TEXT")
+    ensure_column(conn, "symbols", "isin", "TEXT")
     ensure_column(conn, "symbols", "history_start_date", "TEXT")
     ensure_column(conn, "symbols", "history_start_source", "TEXT")
     ensure_column(
@@ -124,6 +163,12 @@ def migrate_database(conn: sqlite3.Connection) -> None:
     ensure_column(
         conn,
         "daily_prices",
+        "price_basis",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )
+    ensure_column(
+        conn,
+        "daily_prices",
         "is_complete",
         "INTEGER NOT NULL DEFAULT 1",
     )
@@ -134,6 +179,117 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         WHERE updated_at IS NULL OR updated_at = ''
         """
     )
+    conn.execute(
+        """
+        UPDATE daily_prices
+        SET price_basis = 'raw'
+        WHERE source_provider = 'alpaca'
+          AND (price_basis IS NULL OR price_basis = 'unknown')
+        """
+    )
+    conn.executemany(
+        "UPDATE symbols SET asset_class = ? WHERE symbol = ?",
+        [
+            ("index", "USDINDEX"),
+            ("index", "SPX"),
+            ("forex", "XAU/USD"),
+            ("fixed_income", "US10Y"),
+        ],
+    )
+    conn.execute(
+        """
+        UPDATE symbols
+        SET history_start_date = (
+                SELECT MIN(daily_prices.date)
+                FROM daily_prices
+                WHERE daily_prices.symbol = symbols.symbol
+            ),
+            history_start_source = CASE
+                WHEN history_start_source IS NULL THEN 'daily_prices'
+                ELSE history_start_source
+            END,
+            history_start_verified = 1
+        WHERE EXISTS (
+            SELECT 1 FROM daily_prices
+            WHERE daily_prices.symbol = symbols.symbol
+        )
+          AND (
+              history_start_date IS NULL
+              OR history_start_date > (
+                  SELECT MIN(daily_prices.date)
+                  FROM daily_prices
+                  WHERE daily_prices.symbol = symbols.symbol
+              )
+          )
+        """
+    )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS instrument_symbols (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instrument_key TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            valid_from TEXT,
+            valid_to TEXT,
+            is_primary INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL,
+            confidence TEXT NOT NULL DEFAULT 'provider',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(instrument_key, symbol, valid_from)
+        );
+        CREATE INDEX IF NOT EXISTS idx_instrument_symbols_lookup
+        ON instrument_symbols(symbol, valid_from, valid_to);
+        CREATE TABLE IF NOT EXISTS instrument_identifiers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            instrument_key TEXT NOT NULL,
+            identifier_type TEXT NOT NULL,
+            identifier_value TEXT NOT NULL,
+            valid_from TEXT,
+            valid_to TEXT,
+            source TEXT NOT NULL,
+            confidence TEXT NOT NULL DEFAULT 'provider',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(identifier_type, identifier_value, valid_from)
+        );
+        CREATE INDEX IF NOT EXISTS idx_instrument_identifiers_lookup
+        ON instrument_identifiers(identifier_type, identifier_value, valid_from, valid_to);
+        CREATE TABLE IF NOT EXISTS corporate_action_legs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            instrument_key TEXT,
+            symbol TEXT,
+            cusip TEXT,
+            isin TEXT,
+            share_rate REAL,
+            cash_rate REAL,
+            currency TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY(provider_id) REFERENCES corporate_actions(provider_id),
+            UNIQUE(provider_id, role, symbol, cusip, isin)
+        );
+        CREATE INDEX IF NOT EXISTS idx_corporate_action_legs_lookup
+        ON corporate_action_legs(symbol, cusip, isin, role);
+        """
+    )
+    for column_name, definition in (
+        ("currency", "TEXT"),
+        ("region", "TEXT"),
+        ("sub_type", "TEXT"),
+        ("special", "INTEGER NOT NULL DEFAULT 0"),
+        ("foreign_flag", "INTEGER NOT NULL DEFAULT 0"),
+        ("due_bill_on_date", "TEXT"),
+        ("due_bill_off_date", "TEXT"),
+        ("effective_date", "TEXT"),
+        ("event_status", "TEXT NOT NULL DEFAULT 'active'"),
+        ("instrument_key", "TEXT"),
+        ("identity_status", "TEXT NOT NULL DEFAULT 'unresolved'"),
+        ("first_seen_at", "TEXT"),
+        ("last_seen_at", "TEXT"),
+    ):
+        ensure_column(conn, "corporate_actions", column_name, definition)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS trendline_analysis_snapshots (
