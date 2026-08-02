@@ -38,6 +38,7 @@ def _validate_code_configuration(strategy: dict) -> dict:
     strategy["definition"]["params"] = strategy_type.validate_params(
         strategy["definition"].get("params", {})
     )
+    strategy_type.validate_definition(strategy["definition"])
     strategy["code_version"] = strategy_type.version
     return strategy
 

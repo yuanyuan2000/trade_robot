@@ -179,6 +179,15 @@
               <span id="chart-source">等待查询</span>
             </div>
           </div>
+          <div id="market-update-progress" class="market-update-progress" hidden>
+            <div class="market-update-progress-head">
+              <span id="market-update-progress-text">准备更新行情数据</span>
+              <span id="market-update-progress-percent">0%</span>
+            </div>
+            <div class="market-update-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+              <div id="market-update-progress-bar" class="market-update-progress-bar"></div>
+            </div>
+          </div>
           <div id="chart" class="chart">
             <canvas id="kline-canvas" class="kline-canvas"></canvas>
             <div id="indicator-legend" class="indicator-legend"></div>
@@ -277,7 +286,10 @@
                 <section class="backtest-editor-section">
                   <div class="backtest-section-title">
                     <h4>标的与仓位上限</h4>
-                    <button id="backtest-add-symbol" type="button">添加标的</button>
+                    <div class="backtest-section-actions">
+                      <button id="backtest-reset-symbols" type="button">恢复当前预置池</button>
+                      <button id="backtest-add-symbol" type="button">添加标的</button>
+                    </div>
                   </div>
                   <p id="backtest-selection-help" class="backtest-help"></p>
                   <div id="backtest-symbols" class="backtest-stack"></div>
@@ -354,7 +366,8 @@
                     <option value="INFO" selected>INFO</option>
                     <option value="ERROR">ERROR</option>
                   </select>
-                  <button id="backtest-download-log" type="button">下载日志</button>
+                  <button id="backtest-download-log" type="button">下载 LOG</button>
+                  <button id="backtest-download-xls" type="button">下载 XLS</button>
                 </div>
               </div>
               <div id="backtest-log-output" class="backtest-log-output">
@@ -499,7 +512,7 @@
 
     <script src="{{ url_for('static', filename='js/chart.js', v='20260730-04') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260730-02') }}"></script>
-    <script src="{{ url_for('static', filename='js/backtest.js', v='20260731-03') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260731-03') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest.js', v='20260801-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260801-01') }}"></script>
   </body>
 </html>

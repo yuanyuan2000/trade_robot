@@ -91,6 +91,21 @@ def migrate_database(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "symbols", "alpaca_supported", "INTEGER")
     ensure_column(conn, "symbols", "alpaca_checked_at", "TEXT")
     ensure_column(conn, "symbols", "alpaca_error", "TEXT")
+    ensure_column(
+        conn,
+        "symbols",
+        "asset_class",
+        "TEXT NOT NULL DEFAULT 'us_equity'",
+    )
+    ensure_column(conn, "symbols", "quantity_step", "REAL")
+    ensure_column(conn, "symbols", "history_start_date", "TEXT")
+    ensure_column(conn, "symbols", "history_start_source", "TEXT")
+    ensure_column(
+        conn,
+        "symbols",
+        "history_start_verified",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
     conn.execute(
         """
         UPDATE symbols

@@ -167,14 +167,18 @@ def _raise_for_alpaca_error(response: requests.Response) -> None:
         raise NetworkError(detail=detail or str(exc)) from exc
 
 
-def _request_bars_page(params: dict) -> tuple[dict, dict[str, int | None]]:
+def _request_bars_page(
+    params: dict,
+    *,
+    url: str | None = None,
+) -> tuple[dict, dict[str, int | None]]:
     response = None
     last_error = None
     for attempt in range(4):
         _wait_for_request_slot()
         try:
             response = _http_session().get(
-                f"{ALPACA_DATA_BASE_URL}/stocks/bars",
+                url or f"{ALPACA_DATA_BASE_URL}/stocks/bars",
                 params=params,
                 headers={
                     "APCA-API-KEY-ID": ALPACA_API_KEY,
@@ -203,6 +207,57 @@ def _request_bars_page(params: dict) -> tuple[dict, dict[str, int | None]]:
     if not isinstance(payload, dict):
         raise InvalidResponseError(detail="Alpaca response payload is not an object.")
     return payload, rate_limit
+
+
+def fetch_crypto_bars_page(
+    symbol: str,
+    *,
+    timeframe: str = "1Min",
+    start: str = "2021-01-01",
+    end: str | None = None,
+    location: str = "us",
+    limit: int = ALPACA_MAX_PAGE_SIZE,
+    page_token: str | None = None,
+) -> dict:
+    """Fetch one resumable page from Alpaca's crypto bars endpoint."""
+    normalized_symbol = symbol.strip().upper()
+    if normalized_symbol != "BTC/USD":
+        raise ValueError("当前仅支持 BTC/USD 加密行情。")
+    normalized_timeframe = _normalize_timeframe(timeframe)
+    start_value = _validate_datetime(start, "start")
+    end_value = _validate_datetime(end, "end") if end else None
+    normalized_location = location.strip().lower()
+    if normalized_location not in {"us", "us-1"}:
+        raise ValueError("crypto location must be us or us-1")
+    if not 1 <= limit <= ALPACA_MAX_PAGE_SIZE:
+        raise ValueError(f"limit must be between 1 and {ALPACA_MAX_PAGE_SIZE}")
+    params = {
+        "symbols": normalized_symbol,
+        "timeframe": normalized_timeframe,
+        "start": start_value,
+        "sort": "asc",
+        "limit": limit,
+    }
+    if end_value:
+        params["end"] = end_value
+    if page_token:
+        params["page_token"] = page_token
+    crypto_base = ALPACA_DATA_BASE_URL.rsplit("/v2", 1)[0]
+    payload, rate_limit = _request_bars_page(
+        params,
+        url=f"{crypto_base}/v1beta3/crypto/{normalized_location}/bars",
+    )
+    return {
+        "source": "alpaca_crypto",
+        "symbol": normalized_symbol,
+        "timeframe": normalized_timeframe,
+        "feed": normalized_location,
+        "start": start_value,
+        "end": end_value,
+        "data": _parse_bars(payload, normalized_symbol),
+        "next_page_token": payload.get("next_page_token"),
+        "rate_limit": rate_limit,
+    }
 
 
 def fetch_asset(symbol: str) -> dict:

@@ -1068,6 +1068,46 @@ button:disabled {
   animation: analysis-progress-spin 0.8s linear infinite;
 }
 
+.market-update-progress {
+  margin: 0 16px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--panel-hover);
+}
+
+.market-update-progress[hidden] {
+  display: none;
+}
+
+.market-update-progress-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.market-update-progress-track {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-muted);
+}
+
+.market-update-progress-bar {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-strong);
+  transition: width 0.35s ease;
+}
+
+.market-update-progress.is-error .market-update-progress-bar {
+  background: var(--danger);
+}
+
 @keyframes analysis-progress-spin {
   to {
     transform: rotate(360deg);
@@ -1697,14 +1737,40 @@ td {
 
 .backtest-symbol-row {
   display: grid;
-  grid-template-columns: minmax(100px, 1fr) 130px 34px;
+  grid-template-columns: minmax(100px, 1fr) 130px 58px 34px;
   gap: 7px;
+}
+
+.backtest-section-actions,
+.backtest-symbol-order {
+  display: flex;
+  gap: 5px;
+}
+
+.backtest-symbol-order button {
+  width: 26px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.backtest-symbol-order button:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+
+.backtest-symbol-row input:disabled {
+  opacity: 0.72;
+  cursor: not-allowed;
 }
 
 .backtest-symbol-row input,
 .backtest-rule input,
 .backtest-rule select,
-.backtest-code-param input {
+.backtest-code-param input,
+.backtest-code-param select {
   min-width: 0;
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -1774,6 +1840,21 @@ td {
   gap: 12px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.backtest-code-param small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  line-height: 1.45;
+  opacity: 0.88;
+}
+
+.backtest-code-param-boolean {
+  grid-template-columns: minmax(150px, 1fr) auto;
+}
+
+.backtest-code-param-boolean input {
+  width: auto;
 }
 
 .backtest-run-history {

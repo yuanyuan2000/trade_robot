@@ -33,6 +33,10 @@ const customIndicatorForm = document.getElementById("custom-indicator-form");
 const customIndicatorType = document.getElementById("custom-indicator-type");
 const customIndicatorPeriod = document.getElementById("custom-indicator-period");
 const updateDataButton = document.getElementById("update-data-button");
+const marketUpdateProgress = document.getElementById("market-update-progress");
+const marketUpdateProgressText = document.getElementById("market-update-progress-text");
+const marketUpdateProgressPercent = document.getElementById("market-update-progress-percent");
+const marketUpdateProgressBar = document.getElementById("market-update-progress-bar");
 const overviewSymbolToggle = document.getElementById("overview-symbol-toggle");
 const symbolSettingsToggle = document.getElementById("symbol-settings-toggle");
 const symbolSettingsPanel = document.getElementById("symbol-settings-panel");
@@ -64,6 +68,7 @@ let overviewDailySyncDone = false;
 let overviewLiveTimer;
 let overviewLiveRefreshInFlight = false;
 let marketOverviewAutoUpdate = false;
+let marketLoadRequestId = 0;
 let analysisOverviewStatusTimer;
 let analysisOverviewLoadInFlight;
 let lastAnalysisRefreshState = {};
@@ -210,8 +215,10 @@ async function loadMarketData(symbol, { includeIntraday = false } = {}) {
     return;
   }
 
+  const requestId = ++marketLoadRequestId;
   symbolInput.value = normalized;
   currentSymbol = normalized;
+  marketUpdateProgress.hidden = true;
   resetChartPeriod("1D");
   currentViewCode = "1D";
   showMarketDetail();
@@ -226,20 +233,30 @@ async function loadMarketData(symbol, { includeIntraday = false } = {}) {
   );
 
   try {
-    const params = new URLSearchParams({ symbol: normalized });
-    if (includeIntraday) {
-      params.set("include_intraday", "1");
-    }
-    const response = await fetch(`/api/market-data?${params}`);
-    const payload = await parseJsonResponse(response);
-
-    if (!payload.ok) {
-      const error = payload.error || {};
+    const response = await fetch("/api/market-data/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: normalized,
+        include_intraday: includeIntraday,
+        background: true,
+        query_only: true,
+      }),
+    });
+    const started = await parseJsonResponse(response);
+    if (requestId !== marketLoadRequestId) return;
+    if (!started.ok) {
+      const error = started.error || {};
       setStatus(error.message || "行情数据加载失败。", "error");
       chartSource.textContent = error.code || "加载失败";
       renderCandles([]);
       return;
     }
+    renderMarketUpdateProgress(started.job);
+    const payload = await waitForMarketDataUpdate(started.job.id, {
+      shouldRender: () => requestId === marketLoadRequestId,
+    });
+    if (requestId !== marketLoadRequestId) return;
 
     currentRawMarketData = payload.data;
     currentSymbolSettings = payload.symbol_settings || { show_weekend_data: true };
@@ -276,6 +293,7 @@ async function loadMarketData(symbol, { includeIntraday = false } = {}) {
       await loadPeriodMarketData(getChartPeriod(), { silent: true });
     }
   } catch (error) {
+    if (requestId !== marketLoadRequestId) return;
     setStatus(error.message || "前端无法连接本地服务，请确认后端仍在运行。", "error");
     chartSource.textContent = "连接失败";
   }
@@ -1119,6 +1137,7 @@ async function updateCurrentMarketData() {
   }
 
   updateDataButton.disabled = true;
+  const updatingSymbol = currentSymbol;
   chartSource.textContent = "更新中";
   const includeIntraday = includeIntradayData.checked;
   setStatus(
@@ -1135,15 +1154,21 @@ async function updateCurrentMarketData() {
       body: JSON.stringify({
         symbol: currentSymbol,
         include_intraday: includeIntraday,
+        background: true,
       }),
     });
-    const payload = await parseJsonResponse(response);
-    if (!payload.ok) {
-      const error = payload.error || {};
+    const started = await parseJsonResponse(response);
+    if (!started.ok) {
+      const error = started.error || {};
       setStatus(error.message || "行情数据更新失败。", "error");
       chartSource.textContent = error.code || "更新失败";
       return;
     }
+    renderMarketUpdateProgress(started.job);
+    const payload = await waitForMarketDataUpdate(started.job.id, {
+      shouldRender: () => currentSymbol === updatingSymbol,
+    });
+    if (currentSymbol !== updatingSymbol) return;
 
     currentRawMarketData = payload.data;
     currentSymbolSettings = payload.symbol_settings || currentSymbolSettings;
@@ -1172,10 +1197,63 @@ async function updateCurrentMarketData() {
       "success",
     );
   } catch (error) {
-    setStatus(error.message || "行情数据更新失败。", "error");
-    chartSource.textContent = "更新失败";
+    if (currentSymbol === updatingSymbol) {
+      setStatus(error.message || "行情数据更新失败。", "error");
+      chartSource.textContent = "更新失败";
+    }
   } finally {
     updateDataButton.disabled = false;
+  }
+}
+
+function formatMarketUpdateDate(value) {
+  const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return match ? `${match[1]}年${match[2]}月${match[3]}日` : "";
+}
+
+function renderMarketUpdateProgress(job) {
+  if (!job) return;
+  const progress = Math.max(0, Math.min(1, Number(job.progress || 0)));
+  const percent = Math.round(progress * 100);
+  const dateText = formatMarketUpdateDate(job.current_date);
+  let message = job.message || "正在更新行情数据";
+  if (job.running && dateText) {
+    message = `已更新至 ${dateText}`;
+    if (Number(job.pages || 0) > 0) {
+      message += ` · ${Number(job.pages)} 页 / ${Number(job.rows || 0).toLocaleString()} 条分钟线`;
+    }
+  } else if (!job.running && !job.error && dateText) {
+    message = `更新完成，最新数据为 ${dateText}`;
+  }
+  marketUpdateProgress.hidden = false;
+  marketUpdateProgress.classList.toggle("is-error", Boolean(job.error));
+  marketUpdateProgressText.textContent = job.error?.message || message;
+  marketUpdateProgressPercent.textContent = `${percent}%`;
+  marketUpdateProgressBar.style.width = `${percent}%`;
+  const track = marketUpdateProgress.querySelector("[role='progressbar']");
+  track.setAttribute("aria-valuenow", String(percent));
+  track.setAttribute("aria-valuetext", marketUpdateProgressText.textContent);
+}
+
+async function waitForMarketDataUpdate(jobId, options = {}) {
+  while (true) {
+    const response = await fetch(`/api/market-data/update-status/${encodeURIComponent(jobId)}`);
+    const payload = await parseJsonResponse(response);
+    if (!payload.ok) {
+      throw new Error(payload.error?.message || "行情更新进度读取失败。");
+    }
+    const job = payload.job;
+    if (!options.shouldRender || options.shouldRender()) {
+      renderMarketUpdateProgress(job);
+    }
+    if (job.running) {
+      await sleep(3000);
+      continue;
+    }
+    if (job.error) {
+      throw new Error(job.error.message || "行情数据更新失败。");
+    }
+    return job.result;
   }
 }
 
@@ -1693,6 +1771,7 @@ symbolForm.addEventListener("submit", async (event) => {
   });
 });
 backToOverview.addEventListener("click", () => {
+  marketLoadRequestId += 1;
   currentSymbol = "";
   symbolInput.value = "";
   renderCandles([]);

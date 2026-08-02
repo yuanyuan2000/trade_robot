@@ -55,6 +55,8 @@ class CodeEventContext:
         event: str,
         event_prices: dict,
         marks: dict[str, float],
+        all_candidate_symbols: list[str],
+        log_callback: Callable[..., None],
     ):
         self.dataset = dataset
         self.portfolio = portfolio
@@ -63,6 +65,8 @@ class CodeEventContext:
         self.event = event
         self.event_prices = event_prices
         self.marks = marks
+        self.all_candidate_symbols = all_candidate_symbols
+        self._log_callback = log_callback
 
     def expression_context(self, symbol: str):
         return self.dataset.expression_context(
@@ -72,6 +76,52 @@ class CodeEventContext:
             price=self.event_prices[symbol].signal_price,
             position=float(self.portfolio.weight(symbol, self.marks)),
         )
+
+    def log_custom(
+        self,
+        event_type: str,
+        message: str,
+        *,
+        symbol: str | None = None,
+        context: dict | None = None,
+        level: str = "DEBUG",
+    ) -> None:
+        """Write a structured code-strategy log that can become XLS columns."""
+        self._log_callback(
+            level,
+            event_type,
+            message,
+            event_time=f"{self.trading_date} {self.event}",
+            symbol=symbol,
+            context=context,
+        )
+
+    def log_strategy_evaluations(self, evaluations: list[dict]) -> None:
+        for item in evaluations:
+            formula_mode = item.get("trend_formula_mode")
+            formula_label = {
+                "consistent_w2": "一致加权 R²",
+                "legacy_v1": "历史 v1.0.0 不一致权重",
+            }.get(formula_mode, formula_mode)
+            formula_text = (
+                f"，公式 {formula_label}"
+                if formula_label
+                else ""
+            )
+            reasons = item.get("filter_reasons") or []
+            filter_text = f"，硬性过滤：{'；'.join(reasons)}" if reasons else "，通过硬性过滤"
+            rank_text = (
+                f"，合格排名第 {item['rank']}"
+                if item.get("rank") is not None
+                else ""
+            )
+            self.log_custom(
+                "SEVENSTAR_DAILY_SCORE",
+                f"{item['etf']} 趋势评分 {item['score']:.8f}{formula_text}"
+                f"{rank_text}{filter_text}。",
+                symbol=item["etf"],
+                context=item,
+            )
 
 
 class BacktestEngine:
@@ -101,22 +151,40 @@ class BacktestEngine:
         self._competition_eligibility: CompiledExpression | None = None
         self._competition_score: CompiledExpression | None = None
         self.code_strategy = None
+        self.auxiliary_symbols: list[str] = []
+        self.early_close_offsets: dict[str, int] = {}
+        self.cumulative_volume_events: tuple[str, ...] = ()
         requirements = self._build_requirements()
         self.events = requirements["events"]
         self.minimum_lookback = requirements["minimum_lookback"]
+        if self.code_strategy is not None:
+            minimum_trade = float(self.code_strategy.params.get("minimum_trade_value_usd", 0))
+            holdings = int(self.code_strategy.params.get("holdings_num", 1))
+            if minimum_trade >= self.settings["initial_capital"] / holdings:
+                raise BacktestValidationError(
+                    "最小非清仓交易额必须小于初始资金除以目标持仓数量。"
+                )
+        self.tradable_symbols = list(
+            dict.fromkeys([*self.universe, *self.auxiliary_symbols])
+        )
+        for symbol in self.auxiliary_symbols:
+            self.max_weights[symbol] = 100.0
         self.benchmark_weights = self._benchmark_weights()
         additional = [
             symbol
             for symbol in self.benchmark_weights
-            if symbol not in self.universe
+            if symbol not in self.tradable_symbols
         ]
         self.dataset = dataset or load_historical_dataset(
-            universe=self.universe,
+            universe=self.tradable_symbols,
             additional_symbols=additional,
             start_date=self.settings["start_date"],
             end_date=self.settings["end_date"],
             intraday_events=self.events,
             minimum_lookback=self.minimum_lookback,
+            early_close_offsets=self.early_close_offsets,
+            cumulative_volume_events=self.cumulative_volume_events,
+            optional_symbols=self.auxiliary_symbols,
         )
         self._validate_supplied_dataset(additional)
         portfolio_kwargs = {
@@ -124,6 +192,13 @@ class BacktestEngine:
             "minimum_commission": self.settings["minimum_commission"],
             "slippage_bps": self.settings["slippage_bps"],
             "allow_fractional_shares": self.settings["allow_fractional_shares"],
+            "quantity_steps": {
+                symbol: details.get("quantity_step") or (
+                    0.0001 if symbol == "BTC/USD" else None
+                )
+                for symbol, details in self.dataset.manifest.get("symbols", {}).items()
+                if details.get("quantity_step") or symbol == "BTC/USD"
+            },
         }
         self.portfolio = Portfolio(
             self.settings["initial_capital"],
@@ -169,9 +244,13 @@ class BacktestEngine:
                     f"{strategy_type.version} 不一致，请保存升级后的策略后再运行。"
                 )
             params = strategy_type.validate_params(self.definition.get("params", {}))
+            strategy_type.validate_definition(self.definition)
             self.code_strategy = strategy_type(params)
             events.update(strategy_type.required_events(params))
             lookback = max(lookback, strategy_type.minimum_lookback(params))
+            self.auxiliary_symbols = list(strategy_type.additional_symbols(params))
+            self.early_close_offsets = strategy_type.early_close_offsets(params)
+            self.cumulative_volume_events = strategy_type.cumulative_volume_events(params)
         return {
             "events": sorted(events, key=_event_sort_key),
             "minimum_lookback": lookback,
@@ -187,20 +266,8 @@ class BacktestEngine:
             raise BacktestDataError(f"数据集缺少标的：{missing_symbols}。")
         if not self.dataset.sessions:
             raise BacktestDataError("数据集没有可执行交易日。")
-        warmup_errors = []
-        first = self.dataset.sessions[0]
-        for symbol in [*self.universe, *additional]:
-            available = len(self.dataset.daily_before(symbol, first))
-            if available < self.minimum_lookback:
-                warmup_errors.append(
-                    {
-                        "symbol": symbol,
-                        "required": self.minimum_lookback,
-                        "available": available,
-                    }
-                )
-        if warmup_errors:
-            raise BacktestDataError("指标预热数据不足。", detail=warmup_errors)
+        # Per-symbol warmup is represented by dataset.availability_start. Late
+        # inception symbols become eligible only after their own warmup completes.
 
     def _benchmark_weights(self) -> dict[str, float]:
         benchmark = self.settings["benchmark"]
@@ -259,13 +326,14 @@ class BacktestEngine:
                 raise BacktestCancelled("用户取消了回测。")
 
             self._apply_corporate_actions(trading_date)
-            if day_index == 0:
-                self._initialize_benchmark()
+            self._update_benchmark(trading_date)
 
             if pending_close:
                 open_event = {
                     symbol: self.dataset.event_price(symbol, trading_date, "OPEN")
-                    for symbol in self.universe
+                    for symbol in self.dataset.active_symbols(
+                        self.tradable_symbols, trading_date
+                    )
                 }
                 self._execute_intents(
                     pending_close,
@@ -277,9 +345,12 @@ class BacktestEngine:
                 pending_close = []
 
             for event in self.events:
+                active_tradable = self.dataset.active_symbols(
+                    self.tradable_symbols, trading_date
+                )
                 event_prices = {
                     symbol: self.dataset.event_price(symbol, trading_date, event)
-                    for symbol in self.universe
+                    for symbol in active_tradable
                 }
                 intents = self._strategy_intents(
                     trading_date=trading_date,
@@ -306,7 +377,11 @@ class BacktestEngine:
                         event_prices=event_prices,
                     )
 
-            close_marks = self.dataset.close_prices(trading_date, self.universe)
+            held_symbols = [
+                symbol for symbol in self.tradable_symbols
+                if self.portfolio.quantity(symbol) > 0
+            ]
+            close_marks = self.dataset.close_prices(trading_date, held_symbols)
             equity = float(self.portfolio.equity(close_marks))
             positions_value = float(self.portfolio.market_value(close_marks))
             peak = max(peak, equity)
@@ -401,11 +476,13 @@ class BacktestEngine:
             context = CodeEventContext(
                 dataset=self.dataset,
                 portfolio=self.portfolio,
-                universe=self.universe,
+                universe=self.dataset.active_symbols(self.universe, trading_date),
                 trading_date=trading_date,
                 event=event,
                 event_prices=event_prices,
                 marks=marks,
+                all_candidate_symbols=self.universe,
+                log_callback=self._log,
             )
             return list(self.code_strategy.on_event(context))
         if self.strategy["selection_mode"] == "competition":
@@ -416,7 +493,9 @@ class BacktestEngine:
                 marks=marks,
             )
         intents = []
-        for symbol in self.universe:
+        for symbol in event_prices:
+            if symbol not in self.universe:
+                continue
             intent, _ = self._first_matching_rule(
                 symbol=symbol,
                 trading_date=trading_date,
@@ -489,7 +568,8 @@ class BacktestEngine:
         risk_intents: list[OrderIntent] = []
         blocked: set[str] = set()
         held_rule_matched = False
-        for symbol in self.universe:
+        active_candidates = [symbol for symbol in self.universe if symbol in event_prices]
+        for symbol in active_candidates:
             intent, matched = self._first_matching_rule(
                 symbol=symbol,
                 trading_date=trading_date,
@@ -513,7 +593,7 @@ class BacktestEngine:
             return risk_intents
 
         scores: list[tuple[float, str]] = []
-        for symbol in self.universe:
+        for symbol in active_candidates:
             if symbol in blocked:
                 continue
             context = self.dataset.expression_context(
@@ -590,6 +670,7 @@ class BacktestEngine:
                     sizing_mode=intent.sizing_mode,
                     value_percent=intent.value_percent,
                     reason=f"{reason_prefix}；{intent.reason}",
+                    minimum_trade_value=intent.minimum_trade_value,
                 )
                 if reason_prefix
                 else intent
@@ -634,12 +715,15 @@ class BacktestEngine:
                 context=trade,
             )
 
-    def _initialize_benchmark(self) -> None:
+    def _update_benchmark(self, trading_date: str) -> None:
         if self.benchmark is None:
             return
-        first_date = self.dataset.sessions[0]
-        marks = self.dataset.open_prices(first_date, self.benchmark_weights)
-        for symbol, weight in self.benchmark_weights.items():
+        active = self.dataset.active_symbols(self.benchmark_weights, trading_date)
+        marks = self.dataset.open_prices(trading_date, active)
+        for symbol in active:
+            weight = self.benchmark_weights[symbol]
+            if self.benchmark.quantity(symbol) > 0:
+                continue
             self.benchmark.execute(
                 OrderIntent(
                     symbol=symbol,
@@ -651,7 +735,7 @@ class BacktestEngine:
                 reference_price=marks[symbol],
                 marks=marks,
                 max_weight_percent=weight,
-                event_time=f"{first_date} OPEN",
+                event_time=f"{trading_date} OPEN",
             )
 
     def _apply_corporate_actions(self, trading_date: str) -> None:
@@ -670,7 +754,7 @@ class BacktestEngine:
         actions = [
             action
             for action in self.dataset.corporate_actions_on(trading_date)
-            if action["symbol"] in self.universe
+            if action["symbol"] in self.tradable_symbols
         ]
         for event in self.portfolio.apply_corporate_actions(
             actions,
@@ -713,5 +797,9 @@ class BacktestEngine:
     def _benchmark_equity(self, trading_date: str) -> float | None:
         if self.benchmark is None:
             return None
-        marks = self.dataset.close_prices(trading_date, self.benchmark_weights)
+        held = [
+            symbol for symbol in self.benchmark_weights
+            if self.benchmark.quantity(symbol) > 0
+        ]
+        marks = self.dataset.close_prices(trading_date, held)
         return float(self.benchmark.equity(marks))

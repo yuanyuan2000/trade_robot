@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS intraday_instruments (
     id INTEGER PRIMARY KEY,
     symbol TEXT NOT NULL UNIQUE,
     exchange_timezone TEXT NOT NULL DEFAULT 'America/New_York',
+    asset_class TEXT NOT NULL DEFAULT 'us_equity',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -13,7 +14,7 @@ CREATE TABLE IF NOT EXISTS minute_bars (
     high_scaled INTEGER NOT NULL,
     low_scaled INTEGER NOT NULL,
     close_scaled INTEGER NOT NULL,
-    volume INTEGER NOT NULL DEFAULT 0,
+    volume REAL NOT NULL DEFAULT 0,
     trade_count INTEGER,
     vwap_scaled INTEGER,
     PRIMARY KEY (instrument_id, minute_utc),

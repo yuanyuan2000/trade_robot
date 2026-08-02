@@ -64,7 +64,7 @@ class BacktestRouteTests(unittest.TestCase):
         )
         self.assertEqual(deleted.status_code, 200)
         listed = self.client.get("/api/backtest/strategies").get_json()
-        self.assertEqual(len(listed["strategies"]), 5)
+        self.assertEqual(len(listed["strategies"]), 7)
         self.assertNotIn(
             "API测试策略已改名",
             [item["name"] for item in listed["strategies"]],
@@ -84,15 +84,60 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertEqual(catalog.status_code, 200)
         item = catalog.get_json()["strategies"][0]
         self.assertEqual(item["key"], "rapid_drop_atr_rotation")
+        self.assertEqual(item["version"], "1.2.0")
+        self.assertEqual(item["parameter_schema"]["holdings_num"]["default"], 1)
+        self.assertTrue(
+            item["parameter_schema"]["enable_percent_drop_filter"]["default"]
+        )
+        self.assertFalse(
+            item["parameter_schema"]["enable_atr_drop_filter"]["default"]
+        )
+        self.assertEqual(
+            item["parameter_schema"]["atr_weighting"]["default"], "wilder"
+        )
+        self.assertEqual(
+            [
+                option["value"]
+                for option in item["parameter_schema"]["atr_weighting"]["options"]
+            ],
+            ["wilder", "ema", "linear", "simple"],
+        )
+        sevenstar = next(
+            item for item in catalog.get_json()["strategies"]
+            if item["key"] == "sevenstar_etf_rotation"
+        )
+        self.assertEqual(sevenstar["version"], "1.1.0")
+        self.assertEqual(
+            sevenstar["parameter_schema"]["trend_formula_mode"]["default"],
+            "consistent_w2",
+        )
+        self.assertEqual(
+            [
+                option["value"]
+                for option in sevenstar["parameter_schema"]["trend_formula_mode"][
+                    "options"
+                ]
+            ],
+            ["consistent_w2", "legacy_v1"],
+        )
+        self.assertEqual(sevenstar["parameter_schema"]["lookback_days"]["default"], 25)
 
         listed = self.client.get("/api/backtest/strategies").get_json()["strategies"]
+        sevenstar_presets = [
+            item for item in listed
+            if item["code_key"] == "sevenstar_etf_rotation"
+        ]
+        self.assertEqual(len(sevenstar_presets), 2)
+        self.assertTrue(
+            all(item["code_version"] == "1.1.0" for item in sevenstar_presets)
+        )
         strategy = next(
             item
             for item in listed
             if item["code_key"] == "rapid_drop_atr_rotation"
         )
         self.assertEqual(strategy["name"], "急跌回避与ATR动量轮动策略")
-        self.assertEqual(strategy["code_version"], "1.0.0")
+        self.assertEqual(strategy["code_version"], "1.2.0")
         self.assertEqual(len(strategy["definition"]["symbols"]), 5)
         self.assertEqual(
             strategy["definition"]["params"]["selection_time"],
@@ -128,6 +173,16 @@ class BacktestRouteTests(unittest.TestCase):
             [item["max_weight"] for item in competition["definition"]["symbols"]],
             [100, 100],
         )
+
+    @patch.object(app_module, "build_run_xls", return_value=b"excel-data")
+    def test_xls_log_download_uses_excel_attachment(self, build_xls) -> None:
+        response = self.client.get("/api/backtest/runs/42/logs.xls")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"excel-data")
+        self.assertEqual(response.mimetype, "application/vnd.ms-excel")
+        self.assertIn("backtest-42.xls", response.headers["Content-Disposition"])
+        build_xls.assert_called_once_with(42)
 
 
 if __name__ == "__main__":

@@ -204,12 +204,32 @@ def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
         conn.execute(
             """
             INSERT INTO symbols
-                (symbol, name, exchange_name, currency, show_weekend_data, show_in_overview, display_order, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?)
+                (symbol, name, exchange_name, currency, show_weekend_data,
+                 show_in_overview, display_order, asset_class, quantity_step,
+                 history_start_date, history_start_source,
+                 history_start_verified, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 name = COALESCE(excluded.name, symbols.name),
                 exchange_name = COALESCE(excluded.exchange_name, symbols.exchange_name),
                 currency = COALESCE(excluded.currency, symbols.currency),
+                asset_class = CASE
+                    WHEN ? = 1 THEN excluded.asset_class
+                    ELSE symbols.asset_class
+                END,
+                quantity_step = COALESCE(excluded.quantity_step, symbols.quantity_step),
+                history_start_date = COALESCE(
+                    excluded.history_start_date,
+                    symbols.history_start_date
+                ),
+                history_start_source = COALESCE(
+                    excluded.history_start_source,
+                    symbols.history_start_source
+                ),
+                history_start_verified = MAX(
+                    excluded.history_start_verified,
+                    symbols.history_start_verified
+                ),
                 updated_at = excluded.updated_at
             """,
             (
@@ -218,8 +238,14 @@ def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
                 metadata.get("exchange"),
                 metadata.get("currency"),
                 next_order,
+                metadata.get("asset_class") or "us_equity",
+                metadata.get("quantity_step"),
+                metadata.get("history_start_date"),
+                metadata.get("history_start_source"),
+                1 if metadata.get("history_start_verified") else 0,
                 now,
                 now,
+                1 if metadata.get("asset_class") else 0,
             ),
         )
         row = conn.execute("SELECT id FROM symbols WHERE symbol = ?", (symbol,)).fetchone()
@@ -265,6 +291,8 @@ def get_symbol(symbol: str) -> dict:
             SELECT id, symbol, name, exchange_name, currency,
                    show_weekend_data, show_in_overview,
                    alpaca_symbol, alpaca_supported, alpaca_checked_at, alpaca_error,
+                   asset_class, quantity_step, history_start_date,
+                   history_start_source, history_start_verified,
                    created_at, updated_at
             FROM symbols
             WHERE id = ?
@@ -279,8 +307,59 @@ def get_symbol(symbol: str) -> dict:
         if data["alpaca_supported"] is not None
         else None
     )
+    data["history_start_verified"] = bool(data["history_start_verified"])
     data["display_symbol"] = get_symbol_display_name(data["symbol"])
     return data
+
+
+def mark_symbol_history_start(
+    symbol: str,
+    history_start_date: str,
+    *,
+    source: str,
+    verified: bool = True,
+    asset_class: str | None = None,
+    quantity_step: float | None = None,
+) -> dict:
+    normalized = normalize_symbol_key(symbol)
+    upsert_symbol(normalized)
+    date.fromisoformat(str(history_start_date))
+    now = utc_now_iso()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE symbols
+            SET history_start_date = CASE
+                    WHEN history_start_date IS NULL
+                      OR ? < history_start_date
+                    THEN ?
+                    ELSE history_start_date
+                END,
+                history_start_source = CASE
+                    WHEN history_start_date IS NULL
+                      OR ? <= history_start_date
+                    THEN ?
+                    ELSE history_start_source
+                END,
+                history_start_verified = ?,
+                asset_class = COALESCE(?, asset_class),
+                quantity_step = COALESCE(?, quantity_step),
+                updated_at = ?
+            WHERE symbol = ?
+            """,
+            (
+                history_start_date,
+                history_start_date,
+                history_start_date,
+                source,
+                1 if verified else 0,
+                asset_class,
+                quantity_step,
+                now,
+                normalized,
+            ),
+        )
+    return get_symbol(normalized)
 
 
 def set_alpaca_capability(
@@ -1112,7 +1191,42 @@ def upsert_daily_prices(
             """,
             payload,
         )
+    if payload:
+        mark_symbol_history_start(
+            symbol,
+            min(str(row[1]) for row in payload),
+            source=source_provider or str(rows[0].get("source_provider") or "database"),
+            verified=True,
+        )
     return len(payload)
+
+
+def delete_daily_prices(
+    symbol: str,
+    dates: list[str],
+    *,
+    source_timeframe: str | None = None,
+) -> int:
+    """Remove explicitly identified derived rows; raw minute data is untouched."""
+    normalized_dates = sorted({date.fromisoformat(value).isoformat() for value in dates})
+    if not normalized_dates:
+        return 0
+    with get_connection() as conn:
+        before = conn.total_changes
+        if source_timeframe is None:
+            conn.executemany(
+                "DELETE FROM daily_prices WHERE symbol = ? AND date = ?",
+                [(symbol, value) for value in normalized_dates],
+            )
+        else:
+            conn.executemany(
+                """
+                DELETE FROM daily_prices
+                WHERE symbol = ? AND date = ? AND source_timeframe = ?
+                """,
+                [(symbol, value, source_timeframe) for value in normalized_dates],
+            )
+        return conn.total_changes - before
 
 
 def get_daily_prices(

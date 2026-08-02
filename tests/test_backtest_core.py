@@ -152,6 +152,42 @@ class DslSafetyTests(unittest.TestCase):
                     "selection_time": "09:40",
                 }
             )
+        with self.assertRaisesRegex(BacktestValidationError, "取值不支持"):
+            RapidDropAtrRotationStrategy.validate_params(
+                {"atr_weighting": "unknown"}
+            )
+
+    def test_rapid_drop_atr_weighting_methods(self) -> None:
+        rows = [
+            {
+                "date": "2024-01-01", "open": 100, "high": 100,
+                "low": 100, "close": 100, "volume": 1,
+            }
+        ]
+        for day, true_range in enumerate((1.0, 2.0, 3.0, 10.0), start=2):
+            rows.append(
+                {
+                    "date": f"2024-01-0{day}", "open": 100,
+                    "high": 100 + true_range / 2,
+                    "low": 100 - true_range / 2,
+                    "close": 100, "volume": 1,
+                }
+            )
+
+        values = {
+            weighting: RapidDropAtrRotationStrategy._atr_series(
+                rows, 3, weighting
+            )[-1]
+            for weighting in ("wilder", "ema", "linear", "simple")
+        }
+
+        self.assertAlmostEqual(values["wilder"], 14 / 3, places=8)
+        self.assertAlmostEqual(values["ema"], 6.0, places=8)
+        self.assertAlmostEqual(values["linear"], 38 / 6, places=8)
+        self.assertAlmostEqual(values["simple"], 5.0, places=8)
+        self.assertGreater(values["linear"], values["ema"])
+        self.assertGreater(values["ema"], values["simple"])
+        self.assertGreater(values["simple"], values["wilder"])
 
 
 class DataPreflightTests(unittest.TestCase):
@@ -796,7 +832,7 @@ class StrategyModeTests(unittest.TestCase):
             "design_mode": "code",
             "selection_mode": "competition",
             "code_key": "rapid_drop_atr_rotation",
-            "code_version": "1.0.0",
+            "code_version": "1.2.0",
             "definition": {
                 "symbols": [
                     {"symbol": symbol, "max_weight": 100}
@@ -823,6 +859,114 @@ class StrategyModeTests(unittest.TestCase):
         )
         self.assertIn("09:40", result.trades[1]["event_time"])
         self.assertIn("10:00", result.trades[2]["event_time"])
+        nvda_risk_log = next(
+            log
+            for log in result.logs
+            if log["event_type"] == "RAPID_DROP_ATR_DAILY_SCORE"
+            and log["event_time"].startswith(second)
+            and log["symbol"] == "NVDA"
+        )
+        self.assertIn("percent_drop", nvda_risk_log["context"]["filter_codes"])
+        self.assertAlmostEqual(
+            nvda_risk_log["context"]["score"], (95 - 100) / 2, places=8
+        )
+        self.assertAlmostEqual(
+            nvda_risk_log["context"]["percent_changes"][-1], -0.1, places=8
+        )
+        self.assertEqual(nvda_risk_log["context"]["risk_event_price"], 90)
+        self.assertIn("10:00", nvda_risk_log["context"]["score_formula"])
+
+        strategy["definition"]["params"] = {
+            "enable_percent_drop_filter": False,
+            "enable_atr_drop_filter": True,
+            "drop_threshold_atr": 4.0,
+        }
+        atr_result = BacktestEngine(
+            strategy,
+            settings(first, second),
+            dataset=dataset,
+        ).run()
+        atr_nvda_log = next(
+            log
+            for log in atr_result.logs
+            if log["event_type"] == "RAPID_DROP_ATR_DAILY_SCORE"
+            and log["event_time"].startswith(second)
+            and log["symbol"] == "NVDA"
+        )
+        self.assertNotIn("percent_drop", atr_nvda_log["context"]["filter_codes"])
+        self.assertIn("atr_drop", atr_nvda_log["context"]["filter_codes"])
+
+    def test_rapid_drop_strategy_validates_holdings_against_candidate_count(self) -> None:
+        with self.assertRaisesRegex(
+            BacktestValidationError, "目标持仓数量不能超过候选池"
+        ):
+            RapidDropAtrRotationStrategy.validate_definition(
+                {
+                    "symbols": [{"symbol": "SPY", "max_weight": 100}],
+                    "params": {"holdings_num": 2},
+                }
+            )
+
+    def test_rapid_drop_strategy_holds_top_two_at_equal_target_weights(self) -> None:
+        symbols = ["SPY", "GLD", "SOXX"]
+        prices = {"SPY": 101.0, "GLD": 103.0, "SOXX": 110.0}
+        daily = {
+            symbol: daily_rows(
+                self.dates,
+                [100.0] * (len(self.dates) - 2) + [prices[symbol], 100.0],
+            )
+            for symbol in symbols
+        }
+        trading_date = self.run_dates[0]
+        minute: dict[str, dict[int, dict]] = {symbol: {} for symbol in symbols}
+        for symbol in symbols:
+            for event, signal in (("09:40", 100.0), ("10:00", prices[symbol])):
+                current = _epoch_minute(trading_date, event)
+                for minute_key in (current - 1, current):
+                    minute[symbol][minute_key] = {
+                        "open": signal, "high": signal,
+                        "low": signal, "close": signal,
+                    }
+        dataset = HistoricalDataSet(
+            daily=daily,
+            sessions=[trading_date],
+            minute=minute,
+            required_intraday_events=["09:40", "10:00"],
+        )
+        strategy = {
+            "name": "代码多持仓测试",
+            "design_mode": "code",
+            "selection_mode": "competition",
+            "code_key": "rapid_drop_atr_rotation",
+            "code_version": "1.2.0",
+            "definition": {
+                "symbols": [
+                    {"symbol": symbol, "max_weight": 100}
+                    for symbol in symbols
+                ],
+                "params": {
+                    "holdings_num": 2,
+                    "enable_percent_drop_filter": False,
+                    "enable_atr_drop_filter": False,
+                },
+            },
+            "default_settings": {},
+        }
+
+        result = BacktestEngine(
+            strategy,
+            settings(trading_date, trading_date, allow_fractional_shares=True),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(
+            [(trade["side"], trade["symbol"]) for trade in result.trades],
+            [("BUY", "SOXX"), ("BUY", "GLD")],
+        )
+        positions = result.equity_points[0]["positions"]
+        self.assertEqual(set(positions), {"SOXX", "GLD"})
+        self.assertAlmostEqual(positions["SOXX"]["weight"], 0.5, places=7)
+        self.assertAlmostEqual(positions["GLD"]["weight"], 0.5, places=7)
 
 
 if __name__ == "__main__":

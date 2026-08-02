@@ -469,7 +469,7 @@ def main() -> None:
         "design_mode": "code",
         "selection_mode": "competition",
         "code_key": "rapid_drop_atr_rotation",
-        "code_version": "1.0.0",
+        "code_version": "1.2.0",
         "definition": {
             "symbols": [
                 {"symbol": symbol, "max_weight": 100}

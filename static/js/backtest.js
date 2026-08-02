@@ -10,6 +10,7 @@ const bt = {
   logs: [],
   displayInitialCapital: 100000,
   chartHoverIndex: null,
+  symbolDefaults: [],
 };
 
 const btListPage = document.getElementById("backtest-list-page");
@@ -128,6 +129,7 @@ async function openBacktestStrategy(strategyId) {
     if (!bt.codeCatalog.length) await loadBacktestCodeCatalog();
     const payload = await btJson(await fetch(`/api/backtest/strategies/${strategyId}`));
     bt.current = payload.strategy;
+    bt.symbolDefaults = structuredClone(payload.strategy.definition?.symbols || []);
     bt.runs = payload.runs || [];
     btListPage.hidden = true;
     btWorkspace.hidden = false;
@@ -170,13 +172,29 @@ function renderBacktestEditor() {
 }
 
 function renderBacktestSymbols() {
+  const isSevenStar = bt.current.design_mode === "code" && bt.current.code_key === "sevenstar_etf_rotation";
   btSymbols.innerHTML = (bt.current.definition.symbols || []).map((item, index) => `
     <div class="backtest-symbol-row" data-index="${index}">
       <input class="bt-symbol-code" type="text" value="${btEscape(item.symbol)}" placeholder="SPY" aria-label="标的代码">
-      <input class="bt-symbol-weight" type="number" min="0.01" max="100" step="0.01" value="${Number(item.max_weight)}" aria-label="最大仓位">
+      <input class="bt-symbol-weight" type="number" min="0.01" max="100" step="0.01" value="${isSevenStar ? 100 : Number(item.max_weight)}" aria-label="最大仓位" ${isSevenStar ? 'disabled title="七星策略按目标数量等权，候选标的上限固定为 100%"' : ""}>
+      <div class="backtest-symbol-order">
+        <button class="bt-move-symbol" data-direction="up" type="button" aria-label="上移标的" ${index === 0 ? "disabled" : ""}>↑</button>
+        <button class="bt-move-symbol" data-direction="down" type="button" aria-label="下移标的" ${index === bt.current.definition.symbols.length - 1 ? "disabled" : ""}>↓</button>
+      </div>
       <button class="backtest-remove-button bt-remove-symbol" type="button" aria-label="移除标的">×</button>
     </div>
   `).join("");
+}
+
+function syncBacktestSymbolsFromEditor() {
+  bt.current.definition.symbols = Array.from(
+    btSymbols.querySelectorAll(".backtest-symbol-row")
+  ).map((row) => ({
+    symbol: row.querySelector(".bt-symbol-code").value.trim().toUpperCase(),
+    max_weight: bt.current.code_key === "sevenstar_etf_rotation"
+      ? 100
+      : Number(row.querySelector(".bt-symbol-weight").value),
+  }));
 }
 
 function renderBacktestRules() {
@@ -218,29 +236,69 @@ function renderBacktestCodeParameters() {
   const params = bt.current.definition.params || {};
   btCodeParams.innerHTML = Object.entries(spec.parameter_schema).map(([name, field]) => {
     const value = params[name] ?? field.default;
+    const maximum = name === "holdings_num"
+      ? Math.min(field.maximum ?? Infinity, bt.current.definition.symbols?.length || 0)
+      : field.maximum;
+    const range = field.minimum != null || maximum != null
+      ? `范围：${field.minimum ?? "不限"} ～ ${Number.isFinite(maximum) ? maximum : "不限"}${field.unit ? ` ${field.unit}` : ""}`
+      : "";
+    const notes = [
+      `默认：${field.type === "choice"
+        ? (field.options || []).find((option) => option.value === field.default)?.label || field.default
+        : field.default}${field.unit ? ` ${field.unit}` : ""}`,
+      range,
+      field.help,
+      field.suggestion,
+    ].filter(Boolean);
     if (field.type === "boolean") {
-      return `<label class="backtest-check-field backtest-code-param" data-param="${btEscape(name)}"><span>${btEscape(field.label)}</span><input class="bt-code-param" type="checkbox" ${value ? "checked" : ""}></label>`;
+      return `<label class="backtest-code-param backtest-code-param-boolean" data-param="${btEscape(name)}">
+        <span class="backtest-code-param-label">${btEscape(field.label)}</span>
+        <input class="bt-code-param" type="checkbox" ${value ? "checked" : ""}>
+        <small>${notes.map(btEscape).join(" · ")}</small>
+      </label>`;
     }
-    const type = field.type === "time" ? "time" : "number";
+    if (field.type === "choice") {
+      const options = (field.options || []).map((option) => `
+        <option value="${btEscape(option.value)}" ${option.value === value ? "selected" : ""}>
+          ${btEscape(option.label || option.value)}
+        </option>`).join("");
+      return `<label class="backtest-code-param" data-param="${btEscape(name)}">
+        <span class="backtest-code-param-label">${btEscape(field.label)}</span>
+        <select class="bt-code-param" required>${options}</select>
+        <small>${notes.map(btEscape).join(" · ")}</small>
+      </label>`;
+    }
+    const type = field.type === "time" ? "time" : field.type === "symbol" ? "text" : "number";
     return `
       <label class="backtest-code-param" data-param="${btEscape(name)}">
-        <span>${btEscape(field.label)}${field.unit ? `（${btEscape(field.unit)}）` : ""}</span>
+        <span class="backtest-code-param-label">${btEscape(field.label)}${field.unit ? `（${btEscape(field.unit)}）` : ""}</span>
         <input class="bt-code-param" type="${type}" value="${btEscape(value)}"
           ${field.minimum != null ? `min="${field.minimum}"` : ""}
-          ${field.maximum != null ? `max="${field.maximum}"` : ""}
-          ${field.step != null ? `step="${field.step}"` : ""}>
+          ${Number.isFinite(maximum) ? `max="${maximum}"` : ""}
+          ${field.step != null ? `step="${field.step}"` : ""}
+          ${field.type === "symbol" ? 'maxlength="24" pattern="[A-Za-z0-9^./=_-]{1,24}"' : ""} required>
+        <small>${notes.map(btEscape).join(" · ")}</small>
       </label>`;
   }).join("");
 }
 
 function collectBacktestStrategy() {
+  const invalidInput = btWorkspace.querySelector("input:invalid, select:invalid, textarea:invalid");
+  if (invalidInput) {
+    invalidInput.reportValidity();
+    throw new Error("请先修正超出范围或格式不正确的参数。 ");
+  }
   const strategy = structuredClone(bt.current);
   strategy.name = btName.value.trim();
   strategy.description = btDescription.value.trim();
   strategy.definition.symbols = Array.from(btSymbols.querySelectorAll(".backtest-symbol-row")).map((row) => ({
     symbol: row.querySelector(".bt-symbol-code").value.trim().toUpperCase(),
-    max_weight: Number(row.querySelector(".bt-symbol-weight").value),
+    max_weight: strategy.code_key === "sevenstar_etf_rotation"
+      ? 100
+      : Number(row.querySelector(".bt-symbol-weight").value),
   }));
+  const symbols = strategy.definition.symbols.map((item) => item.symbol);
+  if (new Set(symbols).size !== symbols.length) throw new Error("候选池不能包含重复标的。");
   if (strategy.design_mode === "visual") {
     strategy.definition.rules = Array.from(btRules.querySelectorAll(".backtest-rule")).map((row, index) => ({
       id: row.dataset.ruleId || `rule-${Date.now()}-${index}`,
@@ -273,8 +331,18 @@ function collectBacktestStrategy() {
         ? input.checked
         : field.type === "time"
           ? input.value
-          : Number(input.value);
+          : field.type === "choice"
+            ? input.value
+            : field.type === "symbol"
+              ? input.value.trim().toUpperCase()
+              : Number(input.value);
     });
+    if (
+      Number(strategy.definition.params.holdings_num) >
+      strategy.definition.symbols.length
+    ) {
+      throw new Error("目标持仓数量不能超过候选池标的数量。");
+    }
   }
   return strategy;
 }
@@ -868,14 +936,32 @@ function initBacktest() {
     }
   });
   document.getElementById("backtest-add-symbol").addEventListener("click", () => {
+    syncBacktestSymbolsFromEditor();
     bt.current.definition.symbols.push({ symbol: "", max_weight: bt.current.selection_mode === "distribution" ? 10 : 100 });
     renderBacktestSymbols();
   });
   btSymbols.addEventListener("click", (event) => {
+    const move = event.target.closest(".bt-move-symbol");
+    if (move) {
+      syncBacktestSymbolsFromEditor();
+      const index = Number(move.closest(".backtest-symbol-row").dataset.index);
+      const target = move.dataset.direction === "up" ? index - 1 : index + 1;
+      if (target >= 0 && target < bt.current.definition.symbols.length) {
+        [bt.current.definition.symbols[index], bt.current.definition.symbols[target]] =
+          [bt.current.definition.symbols[target], bt.current.definition.symbols[index]];
+        renderBacktestSymbols();
+      }
+      return;
+    }
     const button = event.target.closest(".bt-remove-symbol");
     if (!button) return;
+    syncBacktestSymbolsFromEditor();
     const index = Number(button.closest(".backtest-symbol-row").dataset.index);
     bt.current.definition.symbols.splice(index, 1);
+    renderBacktestSymbols();
+  });
+  document.getElementById("backtest-reset-symbols").addEventListener("click", () => {
+    bt.current.definition.symbols = structuredClone(bt.symbolDefaults);
     renderBacktestSymbols();
   });
   document.getElementById("backtest-add-rule").addEventListener("click", () => {
@@ -928,6 +1014,16 @@ function initBacktest() {
     link.download = `backtest-${bt.currentRunId || "log"}.log`;
     link.click();
     URL.revokeObjectURL(url);
+  });
+  document.getElementById("backtest-download-xls").addEventListener("click", () => {
+    if (!bt.currentRunId) {
+      btSetStatus("请先运行或选择一条历史回测。", "error");
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = `/api/backtest/runs/${bt.currentRunId}/logs.xls`;
+    link.download = `backtest-${bt.currentRunId}.xls`;
+    link.click();
   });
   window.addEventListener("resize", renderBacktestChart);
   loadBacktestCodeCatalog();

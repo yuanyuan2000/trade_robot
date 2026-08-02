@@ -44,6 +44,17 @@ def init_intraday_database() -> None:
     with INTRADAY_WRITE_LOCK:
         with get_intraday_connection() as conn:
             conn.executescript(schema)
+            columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(intraday_instruments)"
+                ).fetchall()
+            }
+            if "asset_class" not in columns:
+                conn.execute(
+                    "ALTER TABLE intraday_instruments "
+                    "ADD COLUMN asset_class TEXT NOT NULL DEFAULT 'us_equity'"
+                )
 
 
 def checkpoint_intraday_database(mode: str = "FULL") -> None:

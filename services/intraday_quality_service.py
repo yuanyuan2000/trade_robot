@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from statistics import median
 from zoneinfo import ZoneInfo
 
@@ -13,6 +13,10 @@ from database.intraday_repository import (
 
 
 VALIDATION_SYMBOLS = ["GLD", "SPY", "NVDA", "MU", "XLE"]
+KNOWN_PROVIDER_HISTORY_STARTS = {
+    "MAGS": "2023-04-11",
+    "BTC/USD": "2021-01-01",
+}
 NEW_YORK = ZoneInfo("America/New_York")
 
 
@@ -53,8 +57,16 @@ def validate_intraday_storage(symbols: list[str] | None = None) -> dict:
             item.update(regular_session_quality(symbol))
         first_at = item.get("first_at")
         last_at = item.get("last_at")
+        expected_start = KNOWN_PROVIDER_HISTORY_STARTS.get(
+            symbol, FULL_HISTORY_START_DATE
+        )
+        start_grace = (
+            datetime.fromisoformat(expected_start).date()
+            + timedelta(days=7)
+        ).isoformat()
+        item["expected_history_start"] = expected_start
         item["coverage_start_ok"] = bool(
-            first_at and first_at[:10] <= "2020-01-05"
+            first_at and first_at[:10] <= start_grace
         )
         item["coverage_end_lag_days"] = (
             (

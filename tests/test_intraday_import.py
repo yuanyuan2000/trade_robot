@@ -59,10 +59,12 @@ class IntradayImportTests(unittest.TestCase):
             },
         ]
 
+        progress_updates = []
         paused = importer.import_symbol_history(
             "GLD",
             end="2020-01-03T00:00:00Z",
             max_pages=1,
+            progress=progress_updates.append,
         )
         completed = importer.import_symbol_history(
             "GLD",
@@ -86,6 +88,10 @@ class IntradayImportTests(unittest.TestCase):
         self.assertEqual(completed["job"]["pages_fetched"], 2)
         self.assertTrue(cached["cached_completed_job"])
         self.assertEqual(fetch_page.call_count, 2)
+        self.assertEqual(
+            progress_updates[0]["page_last_at"],
+            "2020-01-02T14:30:00Z",
+        )
 
 
 if __name__ == "__main__":

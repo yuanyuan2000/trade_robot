@@ -11,6 +11,11 @@ CREATE TABLE IF NOT EXISTS symbols (
     alpaca_supported INTEGER,
     alpaca_checked_at TEXT,
     alpaca_error TEXT,
+    asset_class TEXT NOT NULL DEFAULT 'us_equity',
+    quantity_step REAL,
+    history_start_date TEXT,
+    history_start_source TEXT,
+    history_start_verified INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

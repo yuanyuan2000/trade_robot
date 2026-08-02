@@ -20,6 +20,31 @@ def response(payload: dict, remaining: int) -> Mock:
 
 
 class AlpacaDataClientTests(unittest.TestCase):
+    @patch.object(alpaca, "_request_bars_page")
+    def test_crypto_bars_use_v1beta3_endpoint_and_preserve_fractional_volume(
+        self,
+        request_page,
+    ) -> None:
+        request_page.return_value = (
+            {
+                "bars": {
+                    "BTC/USD": [{
+                        "t": "2021-01-01T06:00:00Z",
+                        "o": 29000, "h": 29100, "l": 28900, "c": 29050,
+                        "v": 0.125, "n": 2, "vw": 29025,
+                    }]
+                },
+                "next_page_token": "crypto-next",
+            },
+            {"remaining": 199},
+        )
+
+        result = alpaca.fetch_crypto_bars_page("btc/usd", start="2021-01-01")
+
+        self.assertEqual(result["data"][0]["volume"], 0.125)
+        self.assertEqual(result["next_page_token"], "crypto-next")
+        self.assertIn("/v1beta3/crypto/us/bars", request_page.call_args.kwargs["url"])
+
     @patch.object(alpaca, "ALPACA_SECRET", "")
     @patch.object(alpaca, "ALPACA_API_KEY", "")
     def test_missing_credentials_are_reported(self) -> None:

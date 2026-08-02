@@ -48,6 +48,7 @@ class OrderIntent:
     sizing_mode: str
     value_percent: float
     reason: str
+    minimum_trade_value: float = 0.0
 
 
 class Portfolio:
@@ -59,6 +60,7 @@ class Portfolio:
         minimum_commission: float = 0,
         slippage_bps: float = 0,
         allow_fractional_shares: bool = False,
+        quantity_steps: dict[str, float] | None = None,
     ):
         if D(initial_cash) <= ZERO:
             raise BacktestOrderError("初始资金必须大于 0。")
@@ -68,6 +70,11 @@ class Portfolio:
         self.minimum_commission = D(minimum_commission)
         self.slippage_bps = D(slippage_bps)
         self.allow_fractional_shares = bool(allow_fractional_shares)
+        self.quantity_steps = {
+            symbol: D(step)
+            for symbol, step in (quantity_steps or {}).items()
+            if D(step) > ZERO
+        }
         self.positions: dict[str, Position] = {}
         self.total_commission = ZERO
         self.total_slippage = ZERO
@@ -301,13 +308,23 @@ class Portfolio:
             target_weight=target_weight,
         )
 
-    def _rounded_quantity(self, raw: Decimal, *, round_up: bool = False) -> Decimal:
-        if self.allow_fractional_shares:
-            rounding = ROUND_CEILING if round_up else ROUND_FLOOR
-            return raw.quantize(Decimal("0.000001"), rounding=rounding)
-        return raw.to_integral_value(
+    def _quantity_step(self, symbol: str) -> Decimal:
+        if symbol in self.quantity_steps:
+            return self.quantity_steps[symbol]
+        return Decimal("0.000001") if self.allow_fractional_shares else ONE
+
+    def _rounded_quantity(
+        self,
+        symbol: str,
+        raw: Decimal,
+        *,
+        round_up: bool = False,
+    ) -> Decimal:
+        step = self._quantity_step(symbol)
+        units = (raw / step).to_integral_value(
             rounding=ROUND_CEILING if round_up else ROUND_FLOOR
         )
+        return units * step
 
     def _buy(
         self,
@@ -339,28 +356,21 @@ class Portfolio:
                 and projected_value / projected_equity <= target_weight + EPSILON
             )
 
-        if self.allow_fractional_shares:
-            low, high = ZERO, max(ZERO, raw_upper)
-            for _ in range(90):
-                midpoint = (low + high) / 2
-                if allowed(midpoint):
-                    low = midpoint
-                else:
-                    high = midpoint
-            quantity = self._rounded_quantity(low)
-        else:
-            low = 0
-            high = max(0, int(raw_upper.to_integral_value(rounding=ROUND_FLOOR)))
-            best = 0
-            while low <= high:
-                midpoint = (low + high) // 2
-                if allowed(D(midpoint)):
-                    best = midpoint
-                    low = midpoint + 1
-                else:
-                    high = midpoint - 1
-            quantity = D(best)
+        step = self._quantity_step(intent.symbol)
+        low = 0
+        high = max(0, int((raw_upper / step).to_integral_value(rounding=ROUND_FLOOR)))
+        best = 0
+        while low <= high:
+            midpoint = (low + high) // 2
+            if allowed(D(midpoint) * step):
+                best = midpoint
+                low = midpoint + 1
+            else:
+                high = midpoint - 1
+        quantity = D(best) * step
         if quantity <= ZERO:
+            return None
+        if quantity * reference_price < D(intent.minimum_trade_value):
             return None
         commission = self.commission(quantity)
         gross = quantity * fill
@@ -425,42 +435,28 @@ class Portfolio:
                     <= target_weight + EPSILON
                 )
 
-            if self.allow_fractional_shares:
-                low, high = ZERO, position.quantity
-                if not allowed(high):
-                    raise BacktestOrderError(
-                        f"{intent.symbol} 无法在支付手续费后达到目标仓位。"
-                    )
-                for _ in range(90):
-                    midpoint = (low + high) / 2
-                    if allowed(midpoint):
-                        high = midpoint
-                    else:
-                        low = midpoint
-                quantity = min(
-                    position.quantity,
-                    self._rounded_quantity(high, round_up=True),
+            step = self._quantity_step(intent.symbol)
+            low = 1
+            high = int((position.quantity / step).to_integral_value(rounding=ROUND_FLOOR))
+            best: int | None = None
+            while low <= high:
+                midpoint = (low + high) // 2
+                if allowed(D(midpoint) * step):
+                    best = midpoint
+                    high = midpoint - 1
+                else:
+                    low = midpoint + 1
+            if best is None:
+                raise BacktestOrderError(
+                    f"{intent.symbol} 无法在支付手续费后达到目标仓位。"
                 )
-            else:
-                low = 1
-                high = int(position.quantity)
-                best: int | None = None
-                while low <= high:
-                    midpoint = (low + high) // 2
-                    if allowed(D(midpoint)):
-                        best = midpoint
-                        high = midpoint - 1
-                    else:
-                        low = midpoint + 1
-                if best is None:
-                    raise BacktestOrderError(
-                        f"{intent.symbol} 无法在支付手续费后达到目标仓位。"
-                    )
-                quantity = D(best)
+            quantity = D(best) * step
             if not allowed(quantity):
                 raise BacktestOrderError(
                     f"{intent.symbol} 舍入后无法达到目标仓位。"
                 )
+            if quantity * reference_price < D(intent.minimum_trade_value):
+                return None
         if quantity <= ZERO:
             return None
         commission = self.commission(quantity)

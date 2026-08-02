@@ -52,6 +52,7 @@ def unscale_price(value: int | None) -> float | None:
 def upsert_instrument(
     symbol: str,
     exchange_timezone: str = "America/New_York",
+    asset_class: str | None = None,
 ) -> int:
     init_intraday_database()
     normalized = normalize_symbol(symbol)
@@ -67,10 +68,12 @@ def upsert_instrument(
                 conn.execute(
                     """
                     UPDATE intraday_instruments
-                    SET exchange_timezone = ?, updated_at = ?
+                    SET exchange_timezone = ?,
+                        asset_class = COALESCE(?, asset_class),
+                        updated_at = ?
                     WHERE id = ?
                     """,
-                    (exchange_timezone, now, instrument_id),
+                    (exchange_timezone, asset_class, now, instrument_id),
                 )
                 return instrument_id
 
@@ -82,10 +85,18 @@ def upsert_instrument(
             conn.execute(
                 """
                 INSERT INTO intraday_instruments
-                    (id, symbol, exchange_timezone, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                    (id, symbol, exchange_timezone, asset_class,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (next_id, normalized, exchange_timezone, now, now),
+                (
+                    next_id,
+                    normalized,
+                    exchange_timezone,
+                    asset_class or "us_equity",
+                    now,
+                    now,
+                ),
             )
             conn.execute(
                 """
@@ -105,7 +116,8 @@ def get_instrument(symbol: str) -> dict | None:
     with get_intraday_connection() as conn:
         row = conn.execute(
             """
-            SELECT id, symbol, exchange_timezone, created_at, updated_at
+            SELECT id, symbol, exchange_timezone, asset_class,
+                   created_at, updated_at
             FROM intraday_instruments
             WHERE symbol = ?
             """,
@@ -114,10 +126,15 @@ def get_instrument(symbol: str) -> dict | None:
     return dict(row) if row else None
 
 
-def upsert_minute_bars(symbol: str, rows: list[dict]) -> int:
+def upsert_minute_bars(
+    symbol: str,
+    rows: list[dict],
+    *,
+    asset_class: str = "us_equity",
+) -> int:
     if not rows:
         return 0
-    instrument_id = upsert_instrument(symbol)
+    instrument_id = upsert_instrument(symbol, asset_class=asset_class)
     payload = []
     for row in rows:
         minute_utc = (
@@ -133,7 +150,7 @@ def upsert_minute_bars(symbol: str, rows: list[dict]) -> int:
                 scale_price(row["high"]),
                 scale_price(row["low"]),
                 scale_price(row["close"]),
-                int(row.get("volume") or 0),
+                float(row.get("volume") or 0),
                 int(row["trade_count"]) if row.get("trade_count") is not None else None,
                 scale_price(row["vwap"]) if row.get("vwap") is not None else None,
             )
@@ -539,7 +556,7 @@ def get_minute_bars(
             "high": unscale_price(row["high_scaled"]),
             "low": unscale_price(row["low_scaled"]),
             "close": unscale_price(row["close_scaled"]),
-            "volume": int(row["volume"]),
+            "volume": float(row["volume"]),
             "trade_count": row["trade_count"],
             "vwap": unscale_price(row["vwap_scaled"]),
         }
@@ -580,7 +597,7 @@ def get_minute_bars_at(
                     "high": unscale_price(row["high_scaled"]),
                     "low": unscale_price(row["low_scaled"]),
                     "close": unscale_price(row["close_scaled"]),
-                    "volume": int(row["volume"]),
+                    "volume": float(row["volume"]),
                     "trade_count": row["trade_count"],
                     "vwap": unscale_price(row["vwap_scaled"]),
                 }
@@ -650,6 +667,50 @@ def resolve_minute_event_gaps(
     return result
 
 
+def get_cumulative_volumes(
+    symbol: str,
+    requests: list[dict],
+) -> dict[str, float]:
+    """Aggregate stored volume for many half-open minute ranges."""
+    instrument = get_instrument(symbol)
+    normalized = [
+        (
+            str(item["key"]),
+            int(item["start_minute"]),
+            int(item["end_minute"]),
+        )
+        for item in requests
+        if int(item["end_minute"]) > int(item["start_minute"])
+    ]
+    if not instrument or not normalized:
+        return {}
+    result: dict[str, float] = {}
+    with get_intraday_connection() as conn:
+        for start in range(0, len(normalized), 200):
+            chunk = normalized[start : start + 200]
+            values = ",".join("(?, ?, ?)" for _ in chunk)
+            params = [value for item in chunk for value in item]
+            rows = conn.execute(
+                f"""
+                WITH requested(request_key, start_minute, end_minute) AS (
+                    VALUES {values}
+                )
+                SELECT requested.request_key,
+                       COALESCE(SUM(minute_bars.volume), 0) AS volume
+                FROM requested
+                LEFT JOIN minute_bars
+                  ON minute_bars.instrument_id = ?
+                 AND minute_bars.minute_utc >= requested.start_minute
+                 AND minute_bars.minute_utc < requested.end_minute
+                GROUP BY requested.request_key
+                """,
+                (*params, int(instrument["id"])),
+            ).fetchall()
+            for row in rows:
+                result[str(row["request_key"])] = float(row["volume"] or 0)
+    return result
+
+
 def iter_minute_bars(
     symbol: str,
     *,
@@ -692,7 +753,7 @@ def iter_minute_bars(
                     "high": unscale_price(row["high_scaled"]),
                     "low": unscale_price(row["low_scaled"]),
                     "close": unscale_price(row["close_scaled"]),
-                    "volume": int(row["volume"]),
+                    "volume": float(row["volume"]),
                     "trade_count": row["trade_count"],
                     "vwap": unscale_price(row["vwap_scaled"]),
                 }
@@ -833,13 +894,19 @@ def recompute_monthly_fingerprint(symbol: str, year_month: str) -> dict | None:
 
     digest = hashlib.blake2b(digest_size=16)
     for row in rows:
+        raw_volume = float(row["volume"])
+        encoded_volume = (
+            int(raw_volume)
+            if raw_volume.is_integer()
+            else int(round(raw_volume * 1_000_000))
+        )
         values = [
             int(row["minute_utc"]),
             int(row["open_scaled"]),
             int(row["high_scaled"]),
             int(row["low_scaled"]),
             int(row["close_scaled"]),
-            int(row["volume"]),
+            encoded_volume,
             int(row["trade_count"] or 0),
             int(row["vwap_scaled"] or 0),
         ]

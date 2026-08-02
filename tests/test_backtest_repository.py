@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 import database.db as main_db
 from database import backtest_repository
+from services.backtest.presets import shipped_strategy_presets
 from services.backtest.service import create_default_strategy
 
 
@@ -84,6 +86,110 @@ class BacktestRepositoryTests(unittest.TestCase):
         self.assertEqual(
             stored_after_delete["strategy_snapshot"]["name"],
             "快照测试",
+        )
+
+    def test_seeded_code_version_upgrade_preserves_customization_and_history(self) -> None:
+        _, shipped = next(
+            item
+            for item in shipped_strategy_presets()
+            if item[0] == "builtin-sevenstar-etf-rotation-small-v1"
+        )
+        legacy = deepcopy(shipped)
+        legacy["name"] = "七星迁移测试"
+        legacy["code_version"] = "1.0.0"
+        legacy["definition"]["symbols"] = [
+            {"symbol": "GLD", "max_weight": 100},
+            {"symbol": "SPY", "max_weight": 100},
+        ]
+        legacy["definition"]["params"]["max_score_threshold"] = 88.0
+        legacy["default_settings"]["initial_capital"] = 123_456
+        seed_key = "test-sevenstar-v1"
+        seeded = backtest_repository.seed_strategy_once(seed_key, legacy)
+        historical_run = backtest_repository.create_run(
+            seeded, seeded["default_settings"]
+        )
+
+        upgraded = backtest_repository.upgrade_seeded_strategy_code_version_once(
+            seed_key,
+            "test-effective-w2-r2-v1.0.1",
+            code_key="sevenstar_etf_rotation",
+            from_versions=("1.0.0",),
+            to_version="1.0.1",
+        )
+
+        self.assertEqual(upgraded["code_version"], "1.0.1")
+        self.assertEqual(upgraded["revision"], 2)
+        self.assertEqual(upgraded["definition"], legacy["definition"])
+        self.assertEqual(upgraded["default_settings"], legacy["default_settings"])
+        self.assertEqual(
+            backtest_repository.get_run(historical_run["id"])["strategy_snapshot"][
+                "code_version"
+            ],
+            "1.0.0",
+        )
+
+        self.assertIsNone(
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "test-effective-w2-r2-v1.0.1",
+                code_key="sevenstar_etf_rotation",
+                from_versions=("1.0.0",),
+                to_version="1.0.1",
+            )
+        )
+        self.assertEqual(
+            backtest_repository.get_strategy(seeded["id"])["revision"], 2
+        )
+
+        upgraded_again = (
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "test-formula-mode-v1.1.0",
+                code_key="sevenstar_etf_rotation",
+                from_versions=("1.0.0", "1.0.1"),
+                to_version="1.1.0",
+                parameter_defaults={"trend_formula_mode": "consistent_w2"},
+            )
+        )
+        expected_definition = deepcopy(legacy["definition"])
+        expected_definition["params"]["trend_formula_mode"] = "consistent_w2"
+        self.assertEqual(upgraded_again["code_version"], "1.1.0")
+        self.assertEqual(upgraded_again["revision"], 3)
+        self.assertEqual(upgraded_again["definition"], expected_definition)
+        self.assertEqual(upgraded_again["default_settings"], legacy["default_settings"])
+        self.assertIsNone(
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "test-formula-mode-v1.1.0",
+                code_key="sevenstar_etf_rotation",
+                from_versions=("1.0.0", "1.0.1"),
+                to_version="1.1.0",
+                parameter_defaults={"trend_formula_mode": "consistent_w2"},
+            )
+        )
+        self.assertEqual(
+            backtest_repository.get_strategy(seeded["id"])["revision"], 3
+        )
+
+        deleted_legacy = deepcopy(legacy)
+        deleted_legacy["name"] = "七星已删除迁移测试"
+        deleted_seed_key = "test-deleted-sevenstar-v1"
+        deleted = backtest_repository.seed_strategy_once(
+            deleted_seed_key, deleted_legacy
+        )
+        backtest_repository.delete_strategy(deleted["id"])
+        self.assertIsNone(
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                deleted_seed_key,
+                "test-effective-w2-r2-v1.0.1",
+                code_key="sevenstar_etf_rotation",
+                from_versions=("1.0.0",),
+                to_version="1.0.1",
+            )
+        )
+        self.assertNotIn(
+            deleted_legacy["name"],
+            [item["name"] for item in backtest_repository.list_strategies()],
         )
 
     def test_output_round_trip_preserves_equity_trade_and_log(self) -> None:

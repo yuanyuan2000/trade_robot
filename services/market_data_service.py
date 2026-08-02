@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from typing import Callable
 
 from config import FULL_HISTORY_START_DATE
 from database import repository
@@ -158,7 +159,7 @@ def _intraday_incremental_start(latest_complete_at: str) -> str:
     ).date().isoformat()
 
 
-def _has_initialized_intraday_history(sync_state: dict) -> bool:
+def _has_initialized_intraday_history(symbol: str, sync_state: dict) -> bool:
     earliest_at = sync_state.get("earliest_minute_at")
     latest_complete_at = sync_state.get("latest_complete_minute_at")
     if (
@@ -170,9 +171,14 @@ def _has_initialized_intraday_history(sync_state: dict) -> bool:
     earliest_date = datetime.fromisoformat(
         earliest_at.replace("Z", "+00:00")
     ).date()
-    required_start = first_required_data_date(
-        date.fromisoformat(FULL_HISTORY_START_DATE)
-    )
+    required_start = first_required_data_date(date.fromisoformat(FULL_HISTORY_START_DATE))
+    try:
+        settings = repository.get_symbol(symbol)
+    except Exception:
+        settings = {}
+    history_start = settings.get("history_start_date")
+    if settings.get("history_start_verified") and history_start:
+        required_start = max(required_start, date.fromisoformat(history_start))
     return earliest_date <= required_start
 
 
@@ -186,31 +192,41 @@ def first_required_data_date(start_date: date) -> date:
     return current
 
 
-def get_market_data(symbol: str, *, include_intraday: bool = False) -> dict:
+def get_market_data(
+    symbol: str,
+    *,
+    include_intraday: bool = False,
+    progress_callback: Callable[[dict], None] | None = None,
+) -> dict:
     if not normalize_symbol(symbol):
         raise ValueError("Symbol is required")
 
     alias = repository.resolve_symbol_alias(symbol)
     normalized = alias["common_symbol"]
     if include_intraday:
-        return update_full_market_data(
-            normalized,
-            initialize_intraday=True,
-        )
+        update_kwargs = {"initialize_intraday": True}
+        if progress_callback:
+            update_kwargs["progress_callback"] = progress_callback
+        return update_full_market_data(normalized, **update_kwargs)
     display_symbol = alias["display_name"]
     start_date = date.fromisoformat(FULL_HISTORY_START_DATE)
     source = "database"
 
     if not _has_cached_prices(normalized):
-        rows, provider, _provider_symbol = _fetch_daily_prices_with_fallback(alias, start_date)
-        repository.upsert_symbol(normalized)
-        repository.upsert_daily_prices(
-            normalized,
-            rows,
-            source_provider=provider,
-            source_timeframe="1Day",
+        update_kwargs = {"initialize_intraday": False}
+        if progress_callback:
+            update_kwargs["progress_callback"] = progress_callback
+        return update_full_market_data(normalized, **update_kwargs)
+
+    if progress_callback:
+        progress_callback(
+            {
+                "stage": "completed",
+                "progress": 1.0,
+                "current_date": None,
+                "message": "本地行情数据读取完成",
+            }
         )
-        source = provider
 
     rows = repository.get_daily_prices(normalized, start_date.isoformat())
     if not rows:
@@ -243,6 +259,7 @@ def update_full_market_data(
     symbol: str,
     *,
     initialize_intraday: bool = False,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> dict:
     if not normalize_symbol(symbol):
         raise ValueError("Symbol is required")
@@ -252,6 +269,17 @@ def update_full_market_data(
     display_symbol = alias["display_name"]
     start_date = date.fromisoformat(FULL_HISTORY_START_DATE)
     source = "database"
+
+    def emit(**payload) -> None:
+        if progress_callback:
+            progress_callback(payload)
+
+    emit(
+        stage="checking",
+        progress=0.02,
+        current_date=None,
+        message=f"正在检查 {display_symbol} 的数据覆盖范围",
+    )
     try:
         capability = _ensure_alpaca_capability(normalized)
     except MarketDataError as exc:
@@ -265,7 +293,7 @@ def update_full_market_data(
         capability = {"alpaca_supported": False}
 
     sync_state = intraday_repository.get_sync_state(normalized)
-    intraday_ready = _has_initialized_intraday_history(sync_state)
+    intraday_ready = _has_initialized_intraday_history(normalized, sync_state)
     if capability.get("alpaca_supported") and initialize_intraday:
         if intraday_ready:
             start_value = _intraday_incremental_start(
@@ -275,12 +303,61 @@ def update_full_market_data(
         else:
             start_value = FULL_HISTORY_START_DATE
             derive_start = None
-        import_result = import_symbol_history(normalized, start=start_value)
+        progress_start = date.fromisoformat(start_value[:10])
+        progress_end = date.today()
+        total_days = max(1, (progress_end - progress_start).days)
+
+        def import_progress(item: dict) -> None:
+            current_date = str(item.get("page_last_at") or "")[:10] or None
+            completed_ratio = 0.0
+            if current_date:
+                try:
+                    completed_ratio = min(
+                        1.0,
+                        max(
+                            0.0,
+                            (date.fromisoformat(current_date) - progress_start).days
+                            / total_days,
+                        ),
+                    )
+                except ValueError:
+                    completed_ratio = 0.0
+            emit(
+                stage="intraday",
+                progress=0.05 + completed_ratio * 0.85,
+                current_date=current_date,
+                pages=int(item["job"].get("pages_fetched") or 0),
+                rows=int(item["job"].get("rows_written") or 0),
+                message=(
+                    f"分钟数据已更新至 {current_date}"
+                    if current_date
+                    else "正在更新分钟数据"
+                ),
+            )
+
+        import_kwargs = {"start": start_value}
+        if progress_callback:
+            import_kwargs["progress"] = import_progress
+        import_result = import_symbol_history(normalized, **import_kwargs)
+        emit(
+            stage="deriving_daily",
+            progress=0.93,
+            current_date=(
+                str(import_result.get("end") or "")[:10] or None
+            ),
+            message="分钟数据下载完成，正在重建日线",
+        )
         derived = derive_daily_prices_from_minutes(
             normalized,
             start_at=derive_start,
         )
         rows = repository.get_daily_prices(normalized, start_date.isoformat())
+        emit(
+            stage="completed",
+            progress=1.0,
+            current_date=rows[-1]["date"] if rows else None,
+            message="行情数据更新完成",
+        )
         return {
             "ok": True,
             "symbol": display_symbol,
@@ -295,6 +372,12 @@ def update_full_market_data(
         }
 
     recent_start = _overview_sync_start_date(normalized)
+    emit(
+        stage="daily",
+        progress=0.15,
+        current_date=recent_start.isoformat(),
+        message=f"正在更新 {recent_start.isoformat()} 起的日线数据",
+    )
     if capability.get("alpaca_supported"):
         rows = _fetch_alpaca_daily_prices(
             capability.get("alpaca_symbol") or normalized,
@@ -335,6 +418,12 @@ def update_full_market_data(
 
     rows = repository.get_daily_prices(normalized, start_date.isoformat())
     settings = repository.get_symbol(normalized)
+    emit(
+        stage="completed",
+        progress=1.0,
+        current_date=rows[-1]["date"] if rows else None,
+        message="日线数据更新完成",
+    )
     return {
         "ok": True,
         "symbol": display_symbol,
@@ -427,7 +516,7 @@ def _sync_overview_daily_from_alpaca(
                 pending.append(alias)
                 continue
             sync_state = intraday_repository.get_sync_state(normalized)
-            intraday_ready = _has_initialized_intraday_history(sync_state)
+            intraday_ready = _has_initialized_intraday_history(normalized, sync_state)
             if intraday_ready:
                 start_value = _intraday_incremental_start(
                     sync_state["latest_complete_minute_at"]

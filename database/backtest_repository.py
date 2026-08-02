@@ -222,6 +222,78 @@ def upgrade_seeded_strategy_settings_once(
     return get_strategy(strategy_id) if strategy_id is not None else None
 
 
+def upgrade_seeded_strategy_code_version_once(
+    seed_key: str,
+    upgrade_key: str,
+    *,
+    code_key: str,
+    from_versions: tuple[str, ...],
+    to_version: str,
+    parameter_defaults: dict | None = None,
+) -> dict | None:
+    """Upgrade seeded code metadata once, only filling missing parameter defaults."""
+    now = utc_now_iso()
+    marker = f"upgrade:{upgrade_key}:{seed_key}"
+    allowed_versions = set(from_versions)
+    strategy_id: int | None = None
+    with get_connection() as conn:
+        if conn.execute(
+            "SELECT 1 FROM backtest_strategy_seed_state WHERE seed_key = ?",
+            (marker,),
+        ).fetchone():
+            return None
+        seeded = conn.execute(
+            "SELECT strategy_id FROM backtest_strategy_seed_state WHERE seed_key = ?",
+            (seed_key,),
+        ).fetchone()
+        seeded_id = int(seeded["strategy_id"]) if seeded and seeded["strategy_id"] else None
+        row = (
+            conn.execute(
+                """
+                SELECT id, design_mode, code_key, code_version, definition_json
+                FROM backtest_strategies
+                WHERE id = ?
+                """,
+                (seeded_id,),
+            ).fetchone()
+            if seeded_id is not None
+            else None
+        )
+        if row:
+            strategy_id = int(row["id"])
+            if (
+                row["design_mode"] == "code"
+                and row["code_key"] == code_key
+                and row["code_version"] in allowed_versions
+            ):
+                definition = _decode(row["definition_json"], {})
+                if parameter_defaults:
+                    current_params = definition.get("params")
+                    if not isinstance(current_params, dict):
+                        current_params = {}
+                    definition["params"] = {
+                        **parameter_defaults,
+                        **current_params,
+                    }
+                conn.execute(
+                    """
+                    UPDATE backtest_strategies
+                    SET code_version = ?, definition_json = ?,
+                        revision = revision + 1, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (to_version, _json(definition), now, strategy_id),
+                )
+        conn.execute(
+            """
+            INSERT INTO backtest_strategy_seed_state (seed_key, strategy_id, seeded_at)
+            VALUES (?, ?, ?)
+            """,
+            (marker, strategy_id, now),
+        )
+    return get_strategy(strategy_id) if strategy_id is not None else None
+
+
 def update_strategy(
     strategy_id: int,
     payload: dict,

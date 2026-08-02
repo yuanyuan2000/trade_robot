@@ -56,6 +56,14 @@ def parse_bar_spec(period: str) -> dict:
 
 def refresh_alpaca_capability(symbol: str) -> dict:
     normalized = symbol.strip().upper()
+    if normalized == "BTC/USD":
+        settings = repository.set_alpaca_capability(
+            normalized,
+            supported=True,
+            alpaca_symbol=normalized,
+            error=None,
+        )
+        return {"supported": True, "symbol": normalized, "symbol_settings": settings}
     result = fetch_asset(normalized)
     settings = repository.set_alpaca_capability(
         normalized,
@@ -86,7 +94,7 @@ def _merge_group(rows: list[dict], label: str, end_label: str | None = None) -> 
         "high": max(row["high"] for row in rows),
         "low": min(row["low"] for row in rows),
         "close": last["close"],
-        "volume": sum(int(row.get("volume") or 0) for row in rows),
+        "volume": sum(float(row.get("volume") or 0) for row in rows),
     }
     if end_label and end_label != label:
         result["endDate"] = end_label
@@ -242,6 +250,7 @@ def derive_daily_prices_from_minutes(
 ) -> dict:
     """Rebuild regular-session daily OHLCV while holding only one day in memory."""
     normalized = symbol.strip().upper()
+    is_crypto = normalized == "BTC/USD"
     current_date = None
     current_rows: list[dict] = []
     daily_rows: list[dict] = []
@@ -251,8 +260,10 @@ def derive_daily_prices_from_minutes(
         if not current_rows or current_date is None:
             return
         row = _merge_group(current_rows, current_date)
-        row["source_provider"] = "alpaca"
-        row["source_timeframe"] = "derived_1m"
+        row["source_provider"] = "alpaca_crypto" if is_crypto else "alpaca"
+        row["source_timeframe"] = (
+            "nyse_session_derived_1m" if is_crypto else "derived_1m"
+        )
         row["is_complete"] = (
             current_date < now_new_york.date().isoformat()
             or (
@@ -282,15 +293,48 @@ def derive_daily_prices_from_minutes(
         current_date = session_date
         current_rows.append(row)
     flush()
+    removed_non_sessions = 0
+    if is_crypto and daily_rows:
+        # BTC trades continuously, but this strategy makes decisions only on
+        # US equity sessions. Keep one 09:30-16:00 ET bar for actual NYSE
+        # sessions so its lookbacks are comparable with ETF lookbacks.
+        from services.backtest.market_calendar import ensure_market_sessions
+
+        sessions = ensure_market_sessions(
+            daily_rows[0]["date"], daily_rows[-1]["date"]
+        )
+        allowed_dates = {item["trading_date"] for item in sessions}
+        excluded_dates = [
+            row["date"] for row in daily_rows if row["date"] not in allowed_dates
+        ]
+        existing_derived = repository.get_daily_prices(
+            normalized, include_metadata=True
+        )
+        excluded_dates.extend(
+            row["date"]
+            for row in existing_derived
+            if daily_rows[0]["date"] <= row["date"] <= daily_rows[-1]["date"]
+            and row.get("source_timeframe") == "nyse_session_derived_1m"
+            and row["date"] not in allowed_dates
+        )
+        removed_non_sessions = repository.delete_daily_prices(
+            normalized,
+            excluded_dates,
+            source_timeframe="nyse_session_derived_1m",
+        )
+        daily_rows = [row for row in daily_rows if row["date"] in allowed_dates]
     updated = repository.upsert_daily_prices(
         normalized,
         daily_rows,
-        source_provider="alpaca",
-        source_timeframe="derived_1m",
+        source_provider="alpaca_crypto" if is_crypto else "alpaca",
+        source_timeframe=(
+            "nyse_session_derived_1m" if is_crypto else "derived_1m"
+        ),
     )
     return {
         "symbol": normalized,
         "updated_rows": updated,
         "first_date": daily_rows[0]["date"] if daily_rows else None,
         "last_date": daily_rows[-1]["date"] if daily_rows else None,
+        "removed_non_session_rows": removed_non_sessions,
     }

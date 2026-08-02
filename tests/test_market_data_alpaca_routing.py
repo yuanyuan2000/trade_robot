@@ -69,6 +69,42 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         update.assert_called_once_with("GLD", initialize_intraday=True)
 
+    @patch.object(service.repository, "get_symbol")
+    def test_verified_late_inception_counts_as_initialized_history(
+        self, get_symbol
+    ) -> None:
+        get_symbol.return_value = {
+            "history_start_date": "2021-01-01",
+            "history_start_verified": True,
+        }
+        sync_state = {
+            "row_count": 2_600_000,
+            "earliest_minute_at": "2021-01-01T06:00:00Z",
+            "latest_complete_minute_at": "2026-07-31T17:53:00Z",
+        }
+
+        self.assertTrue(
+            service._has_initialized_intraday_history("BTC/USD", sync_state)
+        )
+
+    @patch.object(service.repository, "get_symbol")
+    def test_unverified_late_start_does_not_hide_missing_history(
+        self, get_symbol
+    ) -> None:
+        get_symbol.return_value = {
+            "history_start_date": "2021-01-01",
+            "history_start_verified": False,
+        }
+        sync_state = {
+            "row_count": 2_600_000,
+            "earliest_minute_at": "2021-01-01T06:00:00Z",
+            "latest_complete_minute_at": "2026-07-31T17:53:00Z",
+        }
+
+        self.assertFalse(
+            service._has_initialized_intraday_history("BTC/USD", sync_state)
+        )
+
     @patch.object(service.repository, "log_api_request")
     @patch.object(service, "_fetch_alpaca_daily_prices")
     @patch.object(service, "derive_daily_prices_from_minutes")
@@ -196,13 +232,22 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         derive_daily.return_value = {"updated_rows": 10}
         get_daily_prices.return_value = [{"date": "2020-01-02"}]
 
-        service.update_full_market_data("GLD", initialize_intraday=True)
-
-        import_history.assert_called_once_with(
+        progress_updates = []
+        service.update_full_market_data(
             "GLD",
-            start=service.FULL_HISTORY_START_DATE,
+            initialize_intraday=True,
+            progress_callback=progress_updates.append,
         )
+
+        self.assertEqual(import_history.call_args.args, ("GLD",))
+        self.assertEqual(
+            import_history.call_args.kwargs["start"],
+            service.FULL_HISTORY_START_DATE,
+        )
+        self.assertTrue(callable(import_history.call_args.kwargs["progress"]))
         derive_daily.assert_called_once_with("GLD", start_at=None)
+        self.assertEqual(progress_updates[0]["stage"], "checking")
+        self.assertEqual(progress_updates[-1]["stage"], "completed")
 
     @patch.object(service.repository, "get_symbol")
     @patch.object(service.repository, "get_daily_prices")

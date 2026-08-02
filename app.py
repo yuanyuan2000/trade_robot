@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 import json
 import logging
 import multiprocessing
@@ -12,9 +13,10 @@ import shutil
 import subprocess
 import threading
 import time
+from uuid import uuid4
 import webbrowser
 
-from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
 
 from config import (
     ANALYSIS_MAX_WORKERS,
@@ -59,6 +61,7 @@ from services.backtest.service import (
     validate_saved_strategy,
 )
 from services.backtest.presets import ensure_shipped_strategy_presets
+from services.backtest.export import build_run_xls
 
 
 app = Flask(__name__)
@@ -73,6 +76,8 @@ overview_sync_state = {
     "last_error": None,
     "updated_at": None,
 }
+market_data_update_lock = threading.Lock()
+market_data_update_jobs: dict[str, dict] = {}
 analysis_overview_lock = threading.Lock()
 analysis_executor_lock = threading.Lock()
 analysis_process_executor: ProcessPoolExecutor | None = None
@@ -315,6 +320,38 @@ def update_market_data():
     include_intraday = str(
         payload.get("include_intraday", request.args.get("include_intraday", ""))
     ).strip().lower() in {"1", "true", "yes", "on"}
+    background = str(payload.get("background", "")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    query_only = str(payload.get("query_only", "")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if background:
+        try:
+            job, started = start_market_data_update(
+                symbol,
+                include_intraday=include_intraday,
+                query_only=query_only,
+            )
+            return jsonify(
+                {
+                    "ok": True,
+                    "running": True,
+                    "started": started,
+                    "job": job,
+                }
+            ), 202
+        except ValueError as exc:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "INVALID_INPUT",
+                        "message": str(exc),
+                        "detail": None,
+                    },
+                }
+            ), 400
     try:
         return jsonify(
             update_full_market_data(
@@ -360,6 +397,170 @@ def update_market_data():
             ),
             500,
         )
+
+
+@app.route("/api/market-data/update-status/<job_id>")
+def market_data_update_status(job_id: str):
+    with market_data_update_lock:
+        job = market_data_update_jobs.get(job_id)
+        if not job:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "UPDATE_JOB_NOT_FOUND",
+                        "message": "行情更新任务不存在或已过期。",
+                        "detail": None,
+                    },
+                }
+            ), 404
+        return jsonify({"ok": True, "job": dict(job)})
+
+
+def start_market_data_update(
+    symbol: str,
+    *,
+    include_intraday: bool,
+    query_only: bool = False,
+) -> tuple[dict, bool]:
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        raise ValueError("Symbol is required")
+    with market_data_update_lock:
+        for job in market_data_update_jobs.values():
+            if job["running"] and job["symbol"] == normalized:
+                # All callers attach to the same per-symbol task. A request for
+                # minutes upgrades a queued/running daily-only task; the worker
+                # checks this flag before publishing its final result.
+                if include_intraday and not job["include_intraday"]:
+                    job["include_intraday"] = True
+                    job["message"] = "已合并分钟数据请求，当前任务完成后继续导入"
+                    job["updated_at"] = now_utc().isoformat()
+                return dict(job), False
+        job_id = uuid4().hex
+        now = now_utc().isoformat()
+        job = {
+            "id": job_id,
+            "symbol": normalized,
+            "include_intraday": bool(include_intraday),
+            "query_only": bool(query_only),
+            "running": True,
+            "stage": "queued",
+            "progress": 0.0,
+            "current_date": None,
+            "pages": 0,
+            "rows": 0,
+            "message": "行情更新任务已开始",
+            "result": None,
+            "error": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        market_data_update_jobs[job_id] = job
+        if len(market_data_update_jobs) > 20:
+            completed_ids = [
+                key
+                for key, item in market_data_update_jobs.items()
+                if not item["running"] and key != job_id
+            ]
+            for key in completed_ids[: len(market_data_update_jobs) - 20]:
+                market_data_update_jobs.pop(key, None)
+
+    threading.Thread(
+        target=run_market_data_update,
+        args=(job_id, normalized),
+        daemon=True,
+    ).start()
+    return dict(job), True
+
+
+def run_market_data_update(
+    job_id: str,
+    symbol: str,
+) -> None:
+    def progress(payload: dict) -> None:
+        with market_data_update_lock:
+            job = market_data_update_jobs.get(job_id)
+            if not job or not job["running"]:
+                return
+            for field in (
+                "stage", "progress", "current_date", "pages", "rows", "message"
+            ):
+                if field in payload:
+                    job[field] = payload[field]
+            job["updated_at"] = now_utc().isoformat()
+
+    try:
+        while True:
+            with market_data_update_lock:
+                job = market_data_update_jobs[job_id]
+                include_intraday = bool(job["include_intraday"])
+                query_only = bool(job.get("query_only"))
+            if query_only:
+                result = get_market_data(
+                    symbol,
+                    include_intraday=include_intraday,
+                    progress_callback=progress,
+                )
+            else:
+                result = update_full_market_data(
+                    symbol,
+                    initialize_intraday=include_intraday,
+                    progress_callback=progress,
+                )
+
+            # Check and publish under one lock so a late duplicate request
+            # cannot miss the daily-to-minute upgrade window.
+            with market_data_update_lock:
+                job = market_data_update_jobs[job_id]
+                if bool(job["include_intraday"]) and not include_intraday:
+                    job["message"] = "日线数据已完成，继续导入分钟数据"
+                    job["updated_at"] = now_utc().isoformat()
+                    continue
+                job.update(
+                    {
+                        "running": False,
+                        "stage": "completed",
+                        "progress": 1.0,
+                        "current_date": (
+                            result.get("data", [{}])[-1].get("date")
+                            if result.get("data")
+                            else job.get("current_date")
+                        ),
+                        "message": "行情数据更新完成",
+                        "result": result,
+                        "error": None,
+                        "updated_at": now_utc().isoformat(),
+                    }
+                )
+                break
+    except Exception as exc:
+        app.logger.exception("Background market data update failed")
+        if isinstance(exc, MarketDataError):
+            error = exc.to_dict()
+        elif isinstance(exc, ValueError):
+            error = {
+                "code": "INVALID_INPUT",
+                "message": str(exc),
+                "detail": None,
+            }
+        else:
+            error = {
+                "code": "UNKNOWN_ERROR",
+                "message": "系统更新行情数据时发生未知错误。",
+                "detail": str(exc),
+            }
+        with market_data_update_lock:
+            job = market_data_update_jobs[job_id]
+            job.update(
+                {
+                    "running": False,
+                    "stage": "failed",
+                    "message": error["message"],
+                    "error": error,
+                    "updated_at": now_utc().isoformat(),
+                }
+            )
 
 
 @app.route("/api/market-overview")
@@ -1120,6 +1321,21 @@ def backtest_run_logs(run_id: int):
             limit=int(request.args.get("limit", "1000")),
         )
         return jsonify({"ok": True, "logs": logs})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/runs/<int:run_id>/logs.xls")
+def backtest_run_logs_xls(run_id: int):
+    try:
+        payload = build_run_xls(run_id)
+        return send_file(
+            BytesIO(payload),
+            mimetype="application/vnd.ms-excel",
+            as_attachment=True,
+            download_name=f"backtest-{run_id}.xls",
+            max_age=0,
+        )
     except Exception as exc:
         return backtest_error_response(exc)
 

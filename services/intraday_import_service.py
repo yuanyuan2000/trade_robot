@@ -6,8 +6,11 @@ import threading
 from typing import Callable
 
 from config import FULL_HISTORY_START_DATE
-from database import intraday_repository
-from services.alpaca_data_client import fetch_stock_bars_page
+from database import intraday_repository, repository
+from services.alpaca_data_client import (
+    fetch_crypto_bars_page,
+    fetch_stock_bars_page,
+)
 
 
 ALPACA_HISTORY_DELAY_MINUTES = 16
@@ -49,13 +52,15 @@ def import_symbol_history(
     if max_pages is not None and max_pages < 1:
         raise ValueError("max_pages must be positive")
     end_value = end or default_import_end()
+    is_crypto = normalized == "BTC/USD"
+    effective_feed = "us" if is_crypto and feed == "sip" else feed
 
     with _symbol_lock(normalized):
         job = intraday_repository.create_or_resume_import_job(
             normalized,
             start,
             end_value,
-            feed=feed,
+            feed=effective_feed,
         )
         end_value = job.get("end_at") or end_value
         if job.get("status") == "completed":
@@ -81,17 +86,42 @@ def import_symbol_history(
         )
         try:
             while True:
-                page = fetch_stock_bars_page(
-                    normalized,
-                    timeframe="1Min",
-                    start=start,
-                    end=end_value,
-                    feed=feed,
-                    limit=ALPACA_IMPORT_PAGE_SIZE,
-                    page_token=next_page_token,
+                page = (
+                    fetch_crypto_bars_page(
+                        normalized,
+                        timeframe="1Min",
+                        start=start,
+                        end=end_value,
+                        location=effective_feed,
+                        limit=ALPACA_IMPORT_PAGE_SIZE,
+                        page_token=next_page_token,
+                    )
+                    if is_crypto
+                    else fetch_stock_bars_page(
+                        normalized,
+                        timeframe="1Min",
+                        start=start,
+                        end=end_value,
+                        feed=effective_feed,
+                        limit=ALPACA_IMPORT_PAGE_SIZE,
+                        page_token=next_page_token,
+                    )
                 )
                 rows = page["data"]
-                written = intraday_repository.upsert_minute_bars(normalized, rows)
+                written = intraday_repository.upsert_minute_bars(
+                    normalized,
+                    rows,
+                    asset_class="crypto" if is_crypto else "us_equity",
+                )
+                if rows:
+                    first_date = min(str(row["timestamp"])[:10] for row in rows)
+                    repository.mark_symbol_history_start(
+                        normalized,
+                        first_date,
+                        source="alpaca_crypto" if is_crypto else "alpaca",
+                        asset_class="crypto" if is_crypto else "us_equity",
+                        quantity_step=0.0001 if is_crypto else None,
+                    )
                 for row in rows:
                     touched_months.add(str(row["timestamp"])[:7])
                 next_page_token = page["next_page_token"]
@@ -105,11 +135,15 @@ def import_symbol_history(
                     rows_added=written,
                 )
                 if progress:
+                    page_first_at = rows[0]["timestamp"] if rows else None
+                    page_last_at = rows[-1]["timestamp"] if rows else end_value
                     progress(
                         {
                             "symbol": normalized,
                             "job": job,
                             "page_rows": len(rows),
+                            "page_first_at": page_first_at,
+                            "page_last_at": page_last_at,
                             "rate_limit": page["rate_limit"],
                         }
                     )

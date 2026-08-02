@@ -11,6 +11,21 @@ from services.backtest.validation import (
 
 
 UNIVERSE = ["SPY", "GLD", "NVDA", "MU", "XLE"]
+SEVENSTAR_SMALL = ["GLD", "USO", "SPY", "QQQ", "DIA", "IWM", "TLT"]
+SEVENSTAR_LARGE = [
+    # 商品
+    "GLD", "DBB", "SOYB", "USO", "SLV", "PDBC", "COPX",
+    # 美国指数与风格
+    "SPY", "QQQ", "DIA", "MDY", "IWM", "VUG", "VTV", "USMV", "COWZ", "MAGS",
+    # 行业
+    "XLC", "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLB", "XLRE", "XLK", "XLU",
+    # 国际
+    "EFA", "EEM", "EWJ", "EWY", "EWH", "KWEB",
+    # 主题
+    "SOXX", "IBB", "IGV", "UFOX",
+    # 债券与加密资产
+    "TLT", "CWB", "BTC/USD",
+]
 
 
 def _rule(
@@ -36,6 +51,7 @@ def _rule(
 def shipped_strategy_presets() -> list[tuple[str, dict]]:
     settings = default_backtest_settings()
     code_type = get_code_strategy("rapid_drop_atr_rotation")
+    sevenstar_type = get_code_strategy("sevenstar_etf_rotation")
     values = [
         (
             "tested-single-ma10-v1",
@@ -116,6 +132,44 @@ def shipped_strategy_presets() -> list[tuple[str, dict]]:
                 "default_settings": settings,
             },
         ),
+        (
+            "builtin-sevenstar-etf-rotation-small-v1",
+            {
+                "name": "七星ETF轮动策略（小池）",
+                "description": sevenstar_type.description + " 小池覆盖商品、宽基、成长、小盘与长债。",
+                "design_mode": "code",
+                "selection_mode": "competition",
+                "code_key": sevenstar_type.key,
+                "code_version": sevenstar_type.version,
+                "definition": {
+                    "symbols": [
+                        {"symbol": symbol, "max_weight": 100}
+                        for symbol in SEVENSTAR_SMALL
+                    ],
+                    "params": sevenstar_type.validate_params({}),
+                },
+                "default_settings": settings,
+            },
+        ),
+        (
+            "builtin-sevenstar-etf-rotation-large-v1",
+            {
+                "name": "七星ETF轮动策略（大池）",
+                "description": sevenstar_type.description + " 大池跨商品、风格、行业、国际、主题、债券与 BTC。",
+                "design_mode": "code",
+                "selection_mode": "competition",
+                "code_key": sevenstar_type.key,
+                "code_version": sevenstar_type.version,
+                "definition": {
+                    "symbols": [
+                        {"symbol": symbol, "max_weight": 100}
+                        for symbol in SEVENSTAR_LARGE
+                    ],
+                    "params": sevenstar_type.validate_params({}),
+                },
+                "default_settings": settings,
+            },
+        ),
     ]
     return [
         (seed_key, validate_strategy_payload(payload, creating=True))
@@ -126,6 +180,37 @@ def shipped_strategy_presets() -> list[tuple[str, dict]]:
 def ensure_shipped_strategy_presets() -> None:
     for seed_key, payload in shipped_strategy_presets():
         backtest_repository.seed_strategy_once(seed_key, payload)
+        if payload.get("code_key") == "sevenstar_etf_rotation":
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "sevenstar-effective-w2-r2-v1.0.1",
+                code_key="sevenstar_etf_rotation",
+                from_versions=("1.0.0",),
+                to_version="1.0.1",
+            )
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "sevenstar-formula-mode-v1.1.0",
+                code_key="sevenstar_etf_rotation",
+                from_versions=("1.0.0", "1.0.1"),
+                to_version=payload["code_version"],
+                parameter_defaults={"trend_formula_mode": "consistent_w2"},
+            )
+        if payload.get("code_key") == "rapid_drop_atr_rotation":
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "rapid-drop-multihold-atr-filter-logs-v1.1.0",
+                code_key="rapid_drop_atr_rotation",
+                from_versions=("1.0.0",),
+                to_version="1.1.0",
+            )
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "rapid-drop-atr-weighting-v1.2.0",
+                code_key="rapid_drop_atr_rotation",
+                from_versions=("1.0.0", "1.1.0"),
+                to_version=payload["code_version"],
+            )
         backtest_repository.upgrade_seeded_strategy_settings_once(
             seed_key,
             "runtime-defaults-20260731-v2",
