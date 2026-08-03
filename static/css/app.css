@@ -1737,7 +1737,7 @@ td {
 
 .backtest-symbol-row {
   display: grid;
-  grid-template-columns: minmax(100px, 1fr) 130px 58px 34px;
+  grid-template-columns: minmax(100px, 1fr) 105px 105px 58px 34px;
   gap: 7px;
 }
 
@@ -1873,15 +1873,7 @@ td {
 
 .backtest-results {
   display: grid;
-  grid-template-rows: auto auto minmax(340px, 1fr) auto;
-}
-
-.backtest-run-config-summary {
-  padding: 7px 10px;
-  border-bottom: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.45;
+  grid-template-rows: auto minmax(340px, 1fr) auto;
 }
 
 .backtest-metrics {

@@ -9,7 +9,7 @@ import xlrd
 
 import database.db as main_db
 from database import backtest_repository
-from services.backtest.export import build_run_xls
+from services.backtest.export import _symbol_pnl_rows, build_run_xls
 
 
 class BacktestExportTests(unittest.TestCase):
@@ -29,6 +29,37 @@ class BacktestExportTests(unittest.TestCase):
         for patcher in reversed(self.patchers):
             patcher.stop()
         self.temp_dir.cleanup()
+
+    def test_symbol_pnl_analysis_finds_largest_profit_and_loss(self) -> None:
+        headers, rows = _symbol_pnl_rows(
+            {
+                "strategy_snapshot": {
+                    "definition": {
+                        "symbols": [
+                            {"symbol": "SPY"},
+                            {"symbol": "QQQ"},
+                        ]
+                    }
+                }
+            },
+            [
+                {"symbol": "SPY", "side": "BUY", "event_time": "2024-01-01", "realized_pnl": None},
+                {"symbol": "SPY", "side": "SELL", "event_time": "2024-01-02", "realized_pnl": 12},
+                {"symbol": "SPY", "side": "SELL", "event_time": "2024-01-03", "realized_pnl": -20},
+                {"symbol": "SPY", "side": "SELL", "event_time": "2024-01-04", "realized_pnl": 30},
+                {"symbol": "SPY", "side": "SELL", "event_time": "2024-01-05", "realized_pnl": -5},
+            ],
+        )
+
+        spy = dict(zip(headers, rows[0]))
+        qqq = dict(zip(headers, rows[1]))
+        self.assertEqual(spy["成交次数"], 5)
+        self.assertEqual(spy["已实现盈亏总额"], 17)
+        self.assertEqual(spy["最大一次盈利时间"], "2024-01-04")
+        self.assertEqual(spy["最大一次盈利金额"], 30)
+        self.assertEqual(spy["最大一次亏损时间"], "2024-01-03")
+        self.assertEqual(spy["最大一次亏损金额"], -20)
+        self.assertEqual(qqq["成交次数"], 0)
 
     def test_sevenstar_xls_has_trade_and_daily_analysis_sheets(self) -> None:
         strategy = backtest_repository.create_strategy(
@@ -105,7 +136,7 @@ class BacktestExportTests(unittest.TestCase):
 
         self.assertEqual(
             workbook.sheet_names(),
-            ["运行摘要", "买卖操作", "策略自定义日志"],
+            ["运行摘要", "买卖操作", "标的盈亏分析", "策略自定义日志"],
         )
         trades = workbook.sheet_by_name("买卖操作")
         trade_headers = trades.row_values(0)
@@ -126,6 +157,18 @@ class BacktestExportTests(unittest.TestCase):
         )
         self.assertEqual(custom.cell_value(1, custom_headers.index("最终操作")), "卖出")
         self.assertEqual(custom.cell_value(1, custom_headers.index("卖出PnL")), 25)
+        pnl = workbook.sheet_by_name("标的盈亏分析")
+        pnl_headers = pnl.row_values(0)
+        self.assertEqual(pnl.cell_value(1, pnl_headers.index("标的")), "SPY")
+        self.assertEqual(pnl.cell_value(1, pnl_headers.index("成交次数")), 1)
+        self.assertEqual(pnl.cell_value(1, pnl_headers.index("已实现盈亏总额")), 25)
+        self.assertEqual(
+            pnl.cell_value(1, pnl_headers.index("最大一次盈利时间")),
+            "2024-01-02 14:00",
+        )
+        self.assertEqual(pnl.cell_value(1, pnl_headers.index("最大一次盈利金额")), 25)
+        self.assertEqual(pnl.cell_value(2, pnl_headers.index("标的")), "QQQ")
+        self.assertEqual(pnl.cell_value(2, pnl_headers.index("成交次数")), 0)
 
     def test_rapid_drop_xls_has_daily_formula_filter_action_and_sell_pnl(self) -> None:
         strategy = backtest_repository.create_strategy(

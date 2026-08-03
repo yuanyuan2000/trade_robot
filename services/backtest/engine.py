@@ -148,6 +148,10 @@ class BacktestEngine:
             item["symbol"]: float(item["max_weight"])
             for item in self.definition["symbols"]
         }
+        self.symbol_leverages = {
+            item["symbol"]: float(item.get("leverage_multiplier", 1))
+            for item in self.definition["symbols"]
+        }
         self.progress_callback = progress_callback
         self.cancellation_check = cancellation_check or (lambda: False)
         self.logs: list[dict] = []
@@ -169,6 +173,7 @@ class BacktestEngine:
             if minimum_trade >= (
                 self.settings["initial_capital"]
                 * self.settings["leverage_multiplier"]
+                * min(self.symbol_leverages.values(), default=1)
                 / holdings
             ):
                 raise BacktestValidationError(
@@ -179,6 +184,7 @@ class BacktestEngine:
         )
         for symbol in self.auxiliary_symbols:
             self.max_weights[symbol] = 100.0
+            self.symbol_leverages.setdefault(symbol, 1.0)
         self.benchmark_weights = self._benchmark_weights()
         additional = [
             symbol
@@ -213,6 +219,7 @@ class BacktestEngine:
         self.portfolio = Portfolio(
             self.settings["initial_capital"],
             leverage_multiplier=self.settings["leverage_multiplier"],
+            symbol_leverage_multipliers=self.symbol_leverages,
             **portfolio_kwargs,
         )
         self.benchmark = (
@@ -596,7 +603,7 @@ class BacktestEngine:
         initial_marks: dict[str, float],
     ) -> bool:
         if (
-            self.settings["leverage_multiplier"] <= 1
+            self.portfolio.max_leverage_multiplier <= 1
             or self.termination_reason
             or end_minute <= start_minute
         ):
@@ -711,7 +718,7 @@ class BacktestEngine:
         trading_date: str,
         trigger: str,
     ) -> bool:
-        if self.settings["leverage_multiplier"] <= 1 or self.termination_reason:
+        if self.portfolio.max_leverage_multiplier <= 1 or self.termination_reason:
             return bool(self.termination_reason)
         held = [
             symbol for symbol in self.tradable_symbols

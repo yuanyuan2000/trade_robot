@@ -331,6 +331,7 @@
                     </div>
                   </div>
                   <p id="backtest-selection-help" class="backtest-help"></p>
+                  <p class="backtest-help">每行依次设置：标的代码、最大仓位%、单标的杠杆。最终有效杠杆 = 整体杠杆 × 单标的杠杆。</p>
                   <div id="backtest-symbols" class="backtest-stack"></div>
                 </section>
 
@@ -383,7 +384,6 @@
             </section>
 
             <section class="panel backtest-results">
-              <div id="backtest-run-config-summary" class="backtest-run-config-summary" hidden></div>
               <div id="backtest-metrics" class="backtest-metrics">
                 <div class="backtest-empty">运行后显示关键指标</div>
               </div>
@@ -546,7 +546,7 @@
             <span>允许碎股（默认关闭）</span>
           </label>
         </div>
-        <p class="backtest-help">杠杆会按策略目标仓位放大实际敞口，暂不计融资利息；账户权益不大于 0 时按分钟行情强制平仓并标记爆仓。手续费按每笔 max(股数×每股手续费, 最低手续费) 计算；买卖双边收取。</p>
+        <p class="backtest-help">整体杠杆会与每个标的在策略中的单独杠杆相乘，并按策略目标仓位放大实际敞口；暂不计融资利息。账户权益不大于 0 时按分钟行情强制平仓并标记爆仓。手续费按每笔 max(股数×每股手续费, 最低手续费) 计算；买卖双边收取。</p>
         <div class="backtest-dialog-actions">
           <button type="button" data-close-dialog="backtest-settings-dialog">取消</button>
           <button id="backtest-settings-submit" class="primary-action" type="submit">保存设置</button>
@@ -556,7 +556,7 @@
 
     <script src="{{ url_for('static', filename='js/chart.js', v='20260730-04') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260730-02') }}"></script>
-    <script src="{{ url_for('static', filename='js/backtest.js', v='20260802-02') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest.js', v='20260802-03') }}"></script>
     <script src="{{ url_for('static', filename='js/app.js', v='20260801-01') }}"></script>
   </body>
 </html>

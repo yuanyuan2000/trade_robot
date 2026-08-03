@@ -148,6 +148,46 @@ def _trade_rows(trades: list[dict], logs: list[dict]) -> tuple[list[str], list[l
     return headers, rows
 
 
+def _symbol_pnl_rows(run: dict, trades: list[dict]) -> tuple[list[str], list[list[Any]]]:
+    """Summarize per-symbol fills and FIFO realized PnL from sell trades."""
+    snapshot_symbols = [
+        item.get("symbol")
+        for item in (run.get("strategy_snapshot") or {}).get("definition", {}).get("symbols", [])
+        if item.get("symbol")
+    ]
+    trade_symbols = [trade.get("symbol") for trade in trades if trade.get("symbol")]
+    symbols = list(dict.fromkeys([*snapshot_symbols, *trade_symbols]))
+    headers = [
+        "标的", "成交次数", "已实现盈亏总额",
+        "最大一次盈利时间", "最大一次盈利金额",
+        "最大一次亏损时间", "最大一次亏损金额",
+    ]
+    rows = []
+    for symbol in symbols:
+        symbol_trades = [trade for trade in trades if trade.get("symbol") == symbol]
+        pnl_trades = [
+            trade
+            for trade in symbol_trades
+            if trade.get("side") == "SELL" and trade.get("realized_pnl") is not None
+        ]
+        profits = [trade for trade in pnl_trades if float(trade["realized_pnl"]) > 0]
+        losses = [trade for trade in pnl_trades if float(trade["realized_pnl"]) < 0]
+        largest_profit = max(profits, key=lambda trade: float(trade["realized_pnl"]), default=None)
+        largest_loss = min(losses, key=lambda trade: float(trade["realized_pnl"]), default=None)
+        rows.append(
+            [
+                symbol,
+                len(symbol_trades),
+                sum(float(trade["realized_pnl"]) for trade in pnl_trades),
+                largest_profit.get("event_time") if largest_profit else None,
+                largest_profit.get("realized_pnl") if largest_profit else None,
+                largest_loss.get("event_time") if largest_loss else None,
+                largest_loss.get("realized_pnl") if largest_loss else None,
+            ]
+        )
+    return headers, rows
+
+
 def _sevenstar_rows(
     run: dict,
     trades: list[dict],
@@ -408,6 +448,16 @@ def build_run_xls(run_id: int) -> bytes:
             "成交后持仓市值",
         },
         percent_columns={"成交后仓位"},
+    )
+
+    pnl_headers, pnl_rows = _symbol_pnl_rows(run, trades)
+    pnl_sheet = workbook.add_sheet("标的盈亏分析")
+    _write_table(
+        pnl_sheet,
+        pnl_headers,
+        pnl_rows,
+        styles=styles,
+        money_columns={"已实现盈亏总额", "最大一次盈利金额", "最大一次亏损金额"},
     )
 
     snapshot = run.get("strategy_snapshot") or {}

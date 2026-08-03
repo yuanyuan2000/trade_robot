@@ -18,6 +18,7 @@ from services.backtest.errors import BacktestValidationError
 from services.backtest.metrics import calculate_metrics
 from services.backtest.portfolio import OrderIntent, Portfolio
 from services.backtest.validation import (
+    default_strategy_payload,
     validate_settings,
     validate_strategy_payload,
 )
@@ -150,6 +151,26 @@ class DslSafetyTests(unittest.TestCase):
             validate_settings({"leverage_multiplier": 0.99})
         with self.assertRaises(BacktestValidationError):
             validate_settings({"leverage_multiplier": 10.01})
+
+    def test_symbol_leverage_defaults_and_bounds(self) -> None:
+        strategy = default_strategy_payload(
+            name="逐标的杠杆测试",
+            design_mode="visual",
+            selection_mode="single",
+        )
+        self.assertEqual(
+            strategy["definition"]["symbols"][0]["leverage_multiplier"],
+            1.0,
+        )
+        strategy["definition"]["symbols"][0]["leverage_multiplier"] = 2.5
+        validated = validate_strategy_payload(strategy)
+        self.assertEqual(
+            validated["definition"]["symbols"][0]["leverage_multiplier"],
+            2.5,
+        )
+        strategy["definition"]["symbols"][0]["leverage_multiplier"] = 10.01
+        with self.assertRaisesRegex(BacktestValidationError, "单标的杠杆"):
+            validate_strategy_payload(strategy)
 
     def test_code_strategy_times_must_be_valid_and_ordered(self) -> None:
         with self.assertRaises(BacktestValidationError):
@@ -292,6 +313,63 @@ class PortfolioAccountingTests(unittest.TestCase):
         self.assertEqual(float(portfolio.borrowed_cash), 2000)
         self.assertAlmostEqual(float(portfolio.weight("SPY", {"SPY": 10})), 1)
         self.assertAlmostEqual(float(portfolio.gross_leverage({"SPY": 10})), 3)
+
+    def test_account_and_symbol_leverage_multiply_without_double_counting(self) -> None:
+        portfolio = Portfolio(
+            1000,
+            leverage_multiplier=2,
+            symbol_leverage_multipliers={"SPY": 3},
+        )
+        buy = portfolio.execute(
+            OrderIntent("SPY", "BUY", "TARGET", 50, "combined leverage"),
+            reference_price=10,
+            marks={"SPY": 10},
+            event_time="2024-01-02 OPEN",
+        )
+
+        self.assertEqual(buy["quantity"], 300)
+        self.assertEqual(float(portfolio.effective_leverage("SPY")), 6)
+        self.assertAlmostEqual(float(portfolio.weight("SPY", {"SPY": 10})), 0.5)
+        self.assertAlmostEqual(
+            portfolio.snapshot({"SPY": 10})["SPY"]["strategy_weight"],
+            0.5,
+        )
+
+        sell = portfolio.execute(
+            OrderIntent("SPY", "SELL", "TARGET", 25, "reduce normalized weight"),
+            reference_price=10,
+            marks={"SPY": 10},
+            event_time="2024-01-03 OPEN",
+        )
+        self.assertEqual(sell["quantity"], 150)
+        self.assertAlmostEqual(float(portfolio.weight("SPY", {"SPY": 10})), 0.25)
+
+    def test_different_symbol_leverages_keep_independent_normalized_weights(self) -> None:
+        portfolio = Portfolio(
+            1000,
+            leverage_multiplier=2,
+            symbol_leverage_multipliers={"SPY": 1, "GLD": 3},
+        )
+        portfolio.execute(
+            OrderIntent("SPY", "BUY", "TARGET", 50, "SPY target"),
+            reference_price=10,
+            marks={"SPY": 10, "GLD": 10},
+            max_weight_percent=50,
+            event_time="2024-01-02 OPEN",
+        )
+        portfolio.execute(
+            OrderIntent("GLD", "BUY", "TARGET", 50, "GLD target"),
+            reference_price=10,
+            marks={"SPY": 10, "GLD": 10},
+            max_weight_percent=50,
+            event_time="2024-01-02 OPEN",
+        )
+
+        self.assertEqual(float(portfolio.quantity("SPY")), 100)
+        self.assertEqual(float(portfolio.quantity("GLD")), 300)
+        self.assertAlmostEqual(float(portfolio.weight("SPY", {"SPY": 10, "GLD": 10})), 0.5)
+        self.assertAlmostEqual(float(portfolio.weight("GLD", {"SPY": 10, "GLD": 10})), 0.5)
+        self.assertAlmostEqual(float(portfolio.gross_leverage({"SPY": 10, "GLD": 10})), 4)
 
     def test_round_trip_cash_and_fifo_pnl_include_both_commissions(self) -> None:
         portfolio = Portfolio(
@@ -453,6 +531,36 @@ class EngineTimingTests(unittest.TestCase):
         self.assertEqual(result.trades[0]["reference_price"], 20.0)
         self.assertEqual(result.trades[0]["fill_price"], 20.0)
         self.assertEqual(result.trades[0]["quantity"], 500)
+
+    def test_visual_strategy_combines_account_and_symbol_leverage(self) -> None:
+        trading_date = self.run_dates[0]
+        dataset = HistoricalDataSet(
+            daily={"SPY": daily_rows(self.dates, [100.0] * len(self.dates))},
+            sessions=[trading_date],
+        )
+        strategy = visual_strategy(
+            rule={"condition": "true", "when": "OPEN"},
+            symbols=[
+                {
+                    "symbol": "SPY",
+                    "max_weight": 100,
+                    "leverage_multiplier": 3,
+                }
+            ],
+        )
+
+        result = BacktestEngine(
+            strategy,
+            settings(trading_date, trading_date, leverage_multiplier=2),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(result.trades[0]["quantity"], 600)
+        self.assertAlmostEqual(result.equity_points[0]["gross_leverage"], 6)
+        self.assertAlmostEqual(
+            result.equity_points[0]["positions"]["SPY"]["strategy_weight"],
+            1,
+        )
 
     def test_close_signal_never_fills_same_close(self) -> None:
         dataset = HistoricalDataSet(

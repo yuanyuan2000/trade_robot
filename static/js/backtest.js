@@ -40,7 +40,6 @@ const btChartEmpty = document.getElementById("backtest-chart-empty");
 const btLogOutput = document.getElementById("backtest-log-output");
 const btLogCount = document.getElementById("backtest-log-count");
 const btRunHistory = document.getElementById("backtest-run-history");
-const btRunConfigSummary = document.getElementById("backtest-run-config-summary");
 const btResultsStatus = document.getElementById("backtest-results-status");
 const btResultsTable = document.getElementById("backtest-results-table");
 
@@ -239,7 +238,6 @@ async function openBacktestRunDetail(runId) {
     btWorkspace.hidden = false;
     renderBacktestEditor();
     setBacktestReadOnly(true);
-    renderBacktestConfigurationSummary(run);
     renderBacktestMetrics(run.metrics);
     btChartEmpty.hidden = Boolean(bt.equityPoints.length);
     renderBacktestChart();
@@ -288,6 +286,7 @@ function renderBacktestSymbols() {
     <div class="backtest-symbol-row" data-index="${index}">
       <input class="bt-symbol-code" type="text" value="${btEscape(item.symbol)}" placeholder="SPY" aria-label="标的代码">
       <input class="bt-symbol-weight" type="number" min="0.01" max="100" step="0.01" value="${isSevenStar ? 100 : Number(item.max_weight)}" aria-label="最大仓位" ${isSevenStar ? 'disabled title="七星策略按目标数量等权，候选标的上限固定为 100%"' : ""}>
+      <input class="bt-symbol-leverage" type="number" min="1" max="10" step="0.1" value="${Number(item.leverage_multiplier ?? 1)}" aria-label="单标的杠杆倍率" title="最终有效杠杆 = 整体杠杆 × 单标的杠杆">
       <div class="backtest-symbol-order">
         <button class="bt-move-symbol" data-direction="up" type="button" aria-label="上移标的" ${index === 0 ? "disabled" : ""}>↑</button>
         <button class="bt-move-symbol" data-direction="down" type="button" aria-label="下移标的" ${index === bt.current.definition.symbols.length - 1 ? "disabled" : ""}>↓</button>
@@ -305,6 +304,7 @@ function syncBacktestSymbolsFromEditor() {
     max_weight: bt.current.code_key === "sevenstar_etf_rotation"
       ? 100
       : Number(row.querySelector(".bt-symbol-weight").value),
+    leverage_multiplier: Number(row.querySelector(".bt-symbol-leverage").value),
   }));
 }
 
@@ -407,6 +407,7 @@ function collectBacktestStrategy() {
     max_weight: strategy.code_key === "sevenstar_etf_rotation"
       ? 100
       : Number(row.querySelector(".bt-symbol-weight").value),
+    leverage_multiplier: Number(row.querySelector(".bt-symbol-leverage").value),
   }));
   const symbols = strategy.definition.symbols.map((item) => item.symbol);
   if (new Set(symbols).size !== symbols.length) throw new Error("候选池不能包含重复标的。");
@@ -479,8 +480,6 @@ function resetBacktestResult() {
   bt.chartHoverIndex = null;
   bt.displayInitialCapital = Number(bt.current?.default_settings?.initial_capital || 100000);
   btMetrics.innerHTML = '<div class="backtest-empty">运行后显示关键指标</div>';
-  btRunConfigSummary.hidden = true;
-  btRunConfigSummary.textContent = "";
   btChartEmpty.hidden = false;
   document.getElementById("backtest-trade-summary").textContent = "";
   renderBacktestChart();
@@ -621,7 +620,6 @@ async function loadBacktestRunResult(runId, knownStatus = "") {
     bt.equityPoints = payload.equity_points || [];
     bt.trades = payload.trades || [];
     bt.logs = await loadAllBacktestLogs(runId);
-    renderBacktestConfigurationSummary(payload.run);
     renderBacktestMetrics(payload.run.metrics);
     btChartEmpty.hidden = Boolean(bt.equityPoints.length);
     renderBacktestChart();
@@ -634,12 +632,6 @@ async function loadBacktestRunResult(runId, knownStatus = "") {
   } catch (error) {
     btSetStatus(btErrorText(error), "error", true);
   }
-}
-
-function renderBacktestConfigurationSummary(run) {
-  const summary = String(run?.configuration_summary || "").trim();
-  btRunConfigSummary.textContent = summary;
-  btRunConfigSummary.hidden = !summary;
 }
 
 async function loadAllBacktestLogs(runId) {
@@ -668,7 +660,7 @@ function renderBacktestMetrics(metrics) {
   }
   const fields = [
     ["运行结果", metrics.liquidated ? "已爆仓" : "正常完成", metrics.liquidated ? "账户权益不大于零后已强制平仓并提前结束。" : "回测运行至设置的结束日期。"],
-    ["杠杆倍率", `${btNumber(metrics.leverage_multiplier ?? 1)}×`, "策略仓位对应的账户级固定杠杆倍率。"],
+    ["整体杠杆倍率", `${btNumber(metrics.leverage_multiplier ?? 1)}×`, "账户级杠杆倍率；各标的最终有效杠杆还会乘以策略中设置的单标的杠杆。"],
     ["期末权益", btMoney(metrics.ending_equity), "回测结束时的现金、应收款与持仓市值之和。"],
     ["总收益率", btPercent(metrics.total_return), "期末权益相对初始资金的累计变化。"],
     ["年化收益率", btPercent(metrics.annualized_return), "将区间总收益按交易日折算为一年。短区间结果可能不稳定。"],
@@ -1130,7 +1122,11 @@ function initBacktest() {
   });
   document.getElementById("backtest-add-symbol").addEventListener("click", () => {
     syncBacktestSymbolsFromEditor();
-    bt.current.definition.symbols.push({ symbol: "", max_weight: bt.current.selection_mode === "distribution" ? 10 : 100 });
+    bt.current.definition.symbols.push({
+      symbol: "",
+      max_weight: bt.current.selection_mode === "distribution" ? 10 : 100,
+      leverage_multiplier: 1,
+    });
     renderBacktestSymbols();
   });
   btSymbols.addEventListener("click", (event) => {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
 import math
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -48,6 +49,38 @@ def rows(start: date, count: int, base: float, growth: float) -> list[dict]:
 
 
 class SevenStarAlgorithmTests(unittest.TestCase):
+    def test_rebalance_target_uses_combined_symbol_leverage(self) -> None:
+        strategy = SevenStarEtfRotationStrategy(
+            {
+                "enable_profit_protection": False,
+                "rebalance_tolerance_percent": 0,
+            }
+        )
+        portfolio = Portfolio(
+            1000,
+            leverage_multiplier=2,
+            symbol_leverage_multipliers={"AAA": 3},
+        )
+        portfolio.execute(
+            OrderIntent("AAA", "BUY", "TARGET", 50, "initial"),
+            reference_price=10,
+            marks={"AAA": 10},
+            event_time="2024-01-01 OPEN",
+        )
+        context = SimpleNamespace(
+            portfolio=portfolio,
+            marks={"AAA": 10},
+            all_candidate_symbols=["AAA"],
+            event_prices={"AAA": SimpleNamespace(signal_price=10)},
+            universe=["AAA"],
+        )
+
+        intents = strategy._buy_intents(context, [{"etf": "AAA"}])
+
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0].action, "BUY")
+        self.assertEqual(intents[0].value_percent, 100)
+
     def test_pool_contents_match_product_definition(self) -> None:
         self.assertEqual(SevenStarEtfRotationStrategy.version, "1.1.0")
         self.assertEqual(SEVENSTAR_SMALL, ["GLD", "USO", "SPY", "QQQ", "DIA", "IWM", "TLT"])

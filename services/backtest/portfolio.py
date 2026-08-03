@@ -62,6 +62,7 @@ class Portfolio:
         slippage_bps: float = 0,
         allow_fractional_shares: bool = False,
         quantity_steps: dict[str, float] | None = None,
+        symbol_leverage_multipliers: dict[str, float] | None = None,
     ):
         if D(initial_cash) <= ZERO:
             raise BacktestOrderError("初始资金必须大于 0。")
@@ -70,6 +71,12 @@ class Portfolio:
         self.leverage_multiplier = D(leverage_multiplier)
         if self.leverage_multiplier < ONE:
             raise BacktestOrderError("杠杆倍率不能小于 1。")
+        self.symbol_leverage_multipliers = {
+            symbol: D(multiplier)
+            for symbol, multiplier in (symbol_leverage_multipliers or {}).items()
+        }
+        if any(multiplier < ONE for multiplier in self.symbol_leverage_multipliers.values()):
+            raise BacktestOrderError("单标的杠杆倍率不能小于 1。")
         self.commission_per_share = D(commission_per_share)
         self.minimum_commission = D(minimum_commission)
         self.slippage_bps = D(slippage_bps)
@@ -131,8 +138,17 @@ class Portfolio:
             self.quantity(symbol)
             * D(marks[symbol])
             / equity
-            / self.leverage_multiplier
+            / self.effective_leverage(symbol)
         )
+
+    def effective_leverage(self, symbol: str) -> Decimal:
+        """Return account leverage multiplied by the symbol-specific leverage."""
+        return self.leverage_multiplier * self.symbol_leverage_multipliers.get(symbol, ONE)
+
+    @property
+    def max_leverage_multiplier(self) -> Decimal:
+        symbol_maximum = max(self.symbol_leverage_multipliers.values(), default=ONE)
+        return self.leverage_multiplier * symbol_maximum
 
     def gross_leverage(self, marks: dict[str, float | Decimal]) -> Decimal:
         equity = self.equity(marks)
@@ -159,7 +175,7 @@ class Portfolio:
                 "market_value": float(market_value),
                 "weight": float(market_value / equity) if equity > ZERO else 0.0,
                 "strategy_weight": (
-                    float(market_value / equity / self.leverage_multiplier)
+                    float(market_value / equity / self.effective_leverage(symbol))
                     if equity > ZERO
                     else 0.0
                 ),
@@ -287,7 +303,8 @@ class Portfolio:
         if current_equity <= ZERO:
             raise BacktestOrderError("账户权益不为正，无法继续交易。")
         current_value = position.quantity * D(reference_price)
-        current_weight = current_value / current_equity / self.leverage_multiplier
+        effective_leverage = self.effective_leverage(intent.symbol)
+        current_weight = current_value / current_equity / effective_leverage
 
         if action == "BUY":
             target_weight = (
@@ -302,7 +319,7 @@ class Portfolio:
                 )
             if target_weight <= current_weight + EPSILON:
                 return None
-            actual_target_weight = target_weight * self.leverage_multiplier
+            actual_target_weight = target_weight * effective_leverage
             desired_value = current_equity * actual_target_weight - current_value
             return self._buy(
                 intent,
@@ -335,7 +352,7 @@ class Portfolio:
             sell_all=target_weight == ZERO,
             current_equity=current_equity,
             current_value=current_value,
-            target_weight=target_weight * self.leverage_multiplier,
+            target_weight=target_weight * effective_leverage,
         )
 
     def _quantity_step(self, symbol: str) -> Decimal:
@@ -384,12 +401,12 @@ class Portfolio:
                 projected_equity > ZERO
                 and projected_value / projected_equity <= target_weight + EPSILON
                 and (
-                    self.leverage_multiplier > ONE
+                    self.max_leverage_multiplier > ONE
                     or total_cost <= self.cash + EPSILON
                 )
                 and (
                     current_market_value + quantity * reference_price
-                ) / projected_equity <= self.leverage_multiplier + EPSILON
+                ) / projected_equity <= self.max_leverage_multiplier + EPSILON
             )
 
         step = self._quantity_step(intent.symbol)
@@ -462,8 +479,7 @@ class Portfolio:
                 projected_equity = current_equity - commission - slippage
                 projected_value = current_value - candidate * reference_price
                 return (
-                    self.cash + gross >= commission - EPSILON
-                    and projected_equity > ZERO
+                    projected_equity > ZERO
                     and projected_value / projected_equity
                     <= target_weight + EPSILON
                 )

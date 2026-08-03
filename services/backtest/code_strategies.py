@@ -144,11 +144,11 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
     )
     selection_modes = ("competition",)
     default_symbols = [
-        {"symbol": "SPY", "max_weight": 100},
-        {"symbol": "GLD", "max_weight": 100},
-        {"symbol": "NVDA", "max_weight": 100},
-        {"symbol": "MU", "max_weight": 100},
-        {"symbol": "XLE", "max_weight": 100},
+        {"symbol": "SPY", "max_weight": 100, "leverage_multiplier": 1},
+        {"symbol": "GLD", "max_weight": 100, "leverage_multiplier": 1},
+        {"symbol": "NVDA", "max_weight": 100, "leverage_multiplier": 1},
+        {"symbol": "MU", "max_weight": 100, "leverage_multiplier": 1},
+        {"symbol": "XLE", "max_weight": 100, "leverage_multiplier": 1},
     ]
     parameter_schema = {
         "holdings_num": {
@@ -544,7 +544,7 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
     )
     selection_modes = ("competition",)
     default_symbols = [
-        {"symbol": symbol, "max_weight": 100}
+        {"symbol": symbol, "max_weight": 100, "leverage_multiplier": 1}
         for symbol in ("GLD", "USO", "SPY", "QQQ", "DIA", "IWM", "TLT")
     ]
     parameter_schema = {
@@ -1037,13 +1037,13 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
         target_percent = 100.0 / len(targets)
         tolerance = self.params["rebalance_tolerance_percent"] / 100
         equity = float(context.portfolio.equity(context.marks))
-        target_value = (
-            equity
-            * float(context.portfolio.leverage_multiplier)
-            / len(targets)
-        )
         intents = []
         for symbol in targets:
+            target_value = (
+                equity
+                * float(context.portfolio.effective_leverage(symbol))
+                / len(targets)
+            )
             current_value = float(context.portfolio.quantity(symbol)) * context.marks[symbol]
             within_tolerance = (
                 current_value != 0

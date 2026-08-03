@@ -128,7 +128,24 @@ def _validate_symbols(definition: dict, selection_mode: str) -> list[dict]:
             raise BacktestValidationError(f"{symbol} 最大仓位必须是有限数值。")
         if not 0 < maximum <= 100:
             raise BacktestValidationError(f"{symbol} 最大仓位必须大于 0 且不超过 100%。")
-        symbols.append({"symbol": symbol, "max_weight": maximum})
+        raw_leverage = raw.get("leverage_multiplier", 1)
+        if isinstance(raw_leverage, bool):
+            raise BacktestValidationError(f"{symbol} 单标的杠杆不能是布尔值。")
+        try:
+            leverage = float(raw_leverage)
+        except (TypeError, ValueError) as exc:
+            raise BacktestValidationError(f"{symbol} 单标的杠杆必须是数值。") from exc
+        if not math.isfinite(leverage):
+            raise BacktestValidationError(f"{symbol} 单标的杠杆必须是有限数值。")
+        if not 1 <= leverage <= 10:
+            raise BacktestValidationError(f"{symbol} 单标的杠杆必须在 1 至 10 倍之间。")
+        symbols.append(
+            {
+                "symbol": symbol,
+                "max_weight": maximum,
+                "leverage_multiplier": leverage,
+            }
+        )
     if not symbols:
         raise BacktestValidationError("策略至少需要一个标的。")
     if selection_mode == "single" and len(symbols) != 1:
@@ -315,7 +332,7 @@ def default_strategy_payload(
     count = 1 if selection_mode == "single" else 2
     default_weight = 50 if selection_mode == "distribution" else 100
     symbols = [
-        {"symbol": symbol, "max_weight": default_weight}
+        {"symbol": symbol, "max_weight": default_weight, "leverage_multiplier": 1.0}
         for symbol in ["SPY", "GLD"][:count]
     ]
     standard_rules = [
