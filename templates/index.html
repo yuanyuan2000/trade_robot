@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260804-02') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260804-04') }}">
   </head>
   <body class="theme-dark">
     <aside class="sidebar">
@@ -242,8 +242,11 @@
                 <option value="EMA">EMA</option>
                 <option value="ATR">绝对 ATR（Wilder）</option>
                 <option value="RATR">相对 ATR 动量评分</option>
+                <option value="WTME">加权真实波幅动量效率（WTME）</option>
               </select>
               <input id="custom-indicator-period" type="number" min="2" max="500" value="20" aria-label="指标周期">
+              <input id="custom-indicator-half-life" type="number" min="0.1" max="500" step="0.1" value="15" aria-label="WTME 权重半衰期" title="WTME 权重半衰期 h" hidden>
+              <input id="custom-indicator-epsilon" type="number" min="0.000000000001" max="0.01" step="0.000000000001" value="0.00000001" aria-label="WTME epsilon" title="WTME epsilon" hidden>
               <button type="submit">添加</button>
             </form>
           </section>
@@ -306,7 +309,7 @@
               <label class="realtime-follow-field"><input id="realtime-mail-enabled" type="checkbox"><span>发送提示邮件</span></label>
               <label class="backtest-field"><span>邮件通道（发件身份）</span><select id="realtime-channel"></select></label>
               <label class="backtest-field"><span>收件邮箱（可多个，可与发件邮箱相同）</span><input id="realtime-recipients" placeholder="a@example.com, b@example.com"></label>
-              <label class="backtest-field"><span>主题模板</span><input id="realtime-subject-template" placeholder="实时决策｜&#123;&#123;task.name&#125;&#125;｜&#123;&#123;event&#125;&#125;"></label>
+              <label class="backtest-field"><span>主题模板</span><input id="realtime-subject-template" placeholder="实时决策｜&#123;&#123;task.name&#125;&#125;｜&#123;&#123;decision.datetime&#125;&#125;"></label>
               <label class="backtest-field">
                 <span class="field-label-with-help">
                   正文模板（可留空使用代码策略默认内容）
@@ -314,14 +317,18 @@
                     <button class="syntax-help-icon" type="button" aria-label="查看非代码策略邮件模板语法">?</button>
                     <span class="syntax-help-popover" role="tooltip">
                       <strong>非代码策略邮件模板</strong>
-                      <span><code>&#123;&#123;task.name&#125;&#125;</code> 任务名；<code>&#123;&#123;event&#125;&#125;</code> 日期和决策时间；<code>&#123;&#123;event.name&#125;&#125;</code> 仅决策时间（如 OPEN）。</span>
-                      <span><code>&#123;&#123;decision&#125;&#125;</code> 决策内容；<code>&#123;&#123;basis&#125;&#125;</code> 命中规则、公式及指标实际值；<code>&#123;&#123;summary&#125;&#125;</code> 完整默认正文。</span>
-                      <span class="syntax-help-example">SPY 8/13 EMA 示例：<br>发送时间：<code>&#123;&#123;event.name&#125;&#125;</code><br>决策内容：<code>&#123;&#123;decision&#125;&#125;</code><br>决策依据：<code>&#123;&#123;basis&#125;&#125;</code></span>
-                      <span>命中时会得到类似“BUY SPY 100%”及“ema(8)=…，ema(13)=…”的内容。</span>
+                      <span>占位符必须按下列名称完整填写。系统发送前把整个占位符替换为文本；不能在双大括号内填写自定义值或计算式。固定文字、数字可直接写在占位符外。名称拼错或大括号未闭合时将无法保存。</span>
+                      <span><code>&#123;&#123;task.name&#125;&#125;</code>：任务名称。</span>
+                      <span><code>&#123;&#123;decision.date&#125;&#125;</code>：决策日期；<code>&#123;&#123;decision.time&#125;&#125;</code>：规则时点原值，如 OPEN、09:45；<code>&#123;&#123;decision.time_label&#125;&#125;</code>：带美东时间说明的时点。</span>
+                      <span><code>&#123;&#123;decision.datetime&#125;&#125;</code>：决策日期和时点；<code>&#123;&#123;message.generated_at&#125;&#125;</code>：邮件正文生成时间。实际送达时间以邮箱邮件头为准。</span>
+                      <span><code>&#123;&#123;decision.actions&#125;&#125;</code>：一行或多行决策，如 BUY SPY 100%；<code>&#123;&#123;decision.basis&#125;&#125;</code>：命中规则、条件和指标值；<code>&#123;&#123;decision.summary&#125;&#125;</code>：完整默认正文。</span>
+                      <span id="realtime-template-current-schedule" class="syntax-help-current"></span>
+                      <span class="syntax-help-example">推荐模板：<br>决策时点：<code>&#123;&#123;decision.time_label&#125;&#125;</code><br>邮件生成：<code>&#123;&#123;message.generated_at&#125;&#125;</code><br>决策内容：<br><code>&#123;&#123;decision.actions&#125;&#125;</code><br>决策依据：<br><code>&#123;&#123;decision.basis&#125;&#125;</code></span>
+                      <span>所有替换结果最终都是邮件文本；其中仓位、价格和指标等原始数值会格式化后写入，所有小数最多保留三位。</span>
                     </span>
                   </span>
                 </span>
-                <textarea id="realtime-body-template" rows="8" placeholder="&#123;&#123;summary&#125;&#125;"></textarea>
+                <textarea id="realtime-body-template" rows="8" placeholder="&#123;&#123;decision.summary&#125;&#125;"></textarea>
               </label>
               <div id="realtime-code-body-preview" class="realtime-template-preview" hidden></div>
               <button id="realtime-new-channel" type="button">新增 QQ/Gmail 通道</button>
@@ -683,10 +690,10 @@
       </form>
     </dialog>
 
-    <script src="{{ url_for('static', filename='js/chart.js', v='20260804-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/chart.js', v='20260804-02') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260730-02') }}"></script>
-    <script src="{{ url_for('static', filename='js/backtest.js', v='20260802-03') }}"></script>
-    <script src="{{ url_for('static', filename='js/realtime.js', v='20260804-02') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260804-02') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest.js', v='20260805-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/realtime.js', v='20260804-05') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260804-03') }}"></script>
   </body>
 </html>

@@ -1032,11 +1032,15 @@ button:disabled {
 }
 
 .custom-indicator-form select {
-  width: 96px;
+  width: 190px;
 }
 
 .custom-indicator-form input {
   width: 96px;
+}
+
+.custom-indicator-form {
+  flex-wrap: wrap;
 }
 
 .setting-row {
@@ -1914,6 +1918,13 @@ td {
 .syntax-help-example {
   border-left: 2px solid var(--accent);
   padding-left: 8px;
+}
+
+.syntax-help-current {
+  border-radius: 6px;
+  background: var(--panel-active);
+  padding: 6px 8px;
+  color: var(--text);
 }
 
 .backtest-symbol-row {

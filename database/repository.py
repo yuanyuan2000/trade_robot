@@ -871,6 +871,7 @@ def seed_default_indicators() -> None:
         {"code": "MA20", "name": "MA20", "indicator_type": "MA", "params": {"period": 20}, "description": "简单移动平均"},
         {"code": "ATR14", "name": "ATR14", "indicator_type": "ATR", "params": {"period": 14}, "description": "Wilder 绝对 ATR"},
         {"code": "RATR14", "name": "相对ATR14", "indicator_type": "RATR", "params": {"period": 14}, "description": "(当前收盘价 - 14 个交易日前收盘价) / 前一日 Wilder ATR(14)"},
+        {"code": "WTME40H15E1e-08", "name": "WTME40(h=15)", "indicator_type": "WTME", "params": {"period": 40, "half_life": 15.0, "epsilon": 1e-8}, "description": "加权真实波幅动量效率"},
     ]
     now = utc_now_iso()
     with get_connection() as conn:
@@ -880,9 +881,7 @@ def seed_default_indicators() -> None:
                 INSERT INTO indicators
                     (code, name, indicator_type, params_json, is_favorite, description, created_at, updated_at)
                 VALUES (?, ?, ?, ?, 1, ?, ?, ?)
-                ON CONFLICT(code) DO UPDATE SET
-                    is_favorite = 1,
-                    updated_at = excluded.updated_at
+                ON CONFLICT DO NOTHING
                 """,
                 (
                     item["code"],
@@ -897,9 +896,9 @@ def seed_default_indicators() -> None:
 
 
 def validate_indicator(indicator_type: str, params: dict) -> tuple[str, dict]:
-    normalized_type = indicator_type.strip().upper()
-    if normalized_type not in {"MA", "EMA", "ATR", "RATR"}:
-        raise ValueError("仅支持 MA、EMA、ATR 和相对 ATR 指标。")
+    normalized_type = str(indicator_type or "").strip().upper()
+    if normalized_type not in {"MA", "EMA", "ATR", "RATR", "WTME"}:
+        raise ValueError("仅支持 MA、EMA、ATR、相对 ATR 和 WTME 指标。")
 
     try:
         period = int(params.get("period"))
@@ -909,7 +908,23 @@ def validate_indicator(indicator_type: str, params: dict) -> tuple[str, dict]:
     if period < 2 or period > 500:
         raise ValueError("指标周期必须在 2 到 500 之间。")
 
-    return normalized_type, {"period": period}
+    if normalized_type != "WTME":
+        return normalized_type, {"period": period}
+
+    try:
+        half_life = float(params.get("half_life", 15))
+        epsilon = float(params.get("epsilon", 1e-8))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("WTME 半衰期和 epsilon 必须是数值。") from exc
+    if not math.isfinite(half_life) or half_life < 0.1 or half_life > 500:
+        raise ValueError("WTME 半衰期必须在 0.1 到 500 之间。")
+    if not math.isfinite(epsilon) or epsilon < 1e-12 or epsilon > 0.01:
+        raise ValueError("WTME epsilon 必须在 1e-12 到 0.01 之间。")
+    return normalized_type, {
+        "period": period,
+        "half_life": half_life,
+        "epsilon": epsilon,
+    }
 
 
 def indicator_to_dict(row: sqlite3.Row | dict) -> dict:
@@ -957,12 +972,20 @@ def get_indicator(indicator_id: int) -> dict:
 def get_or_create_indicator(indicator_type: str, params: dict, name: str | None = None) -> dict:
     normalized_type, normalized_params = validate_indicator(indicator_type, params)
     params_json = normalize_params(normalized_params)
-    default_name = (
-        f"相对ATR{normalized_params['period']}"
-        if normalized_type == "RATR"
-        else f"{normalized_type}{normalized_params['period']}"
-    )
+    if normalized_type == "RATR":
+        default_name = f"相对ATR{normalized_params['period']}"
+    elif normalized_type == "WTME":
+        default_name = (
+            f"WTME{normalized_params['period']}"
+            f"(h={normalized_params['half_life']:g})"
+        )
+    else:
+        default_name = f"{normalized_type}{normalized_params['period']}"
     code = f"{normalized_type}{normalized_params['period']}"
+    if normalized_type == "WTME":
+        half_life_code = format(normalized_params["half_life"], ".15g")
+        epsilon_code = format(normalized_params["epsilon"], ".15g")
+        code += f"H{half_life_code}E{epsilon_code}"
     now = utc_now_iso()
 
     with get_connection() as conn:
@@ -993,6 +1016,8 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
                     if normalized_type == "ATR"
                     else "相对 ATR 动量评分（当前价差 / 前一日 Wilder ATR）"
                     if normalized_type == "RATR"
+                    else "加权方向收益 / 加权标准化真实波幅 × 100"
+                    if normalized_type == "WTME"
                     else "用户创建指标"
                 ),
                 now,

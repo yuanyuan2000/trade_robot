@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
 import app as app_module
+import database.db as main_db
 from database import repository
 from services.indicator_service import (
     attach_overview_indicator_values,
     calculate_indicator_values,
     calculate_wilder_atr,
+    calculate_wtme,
+    calculate_wtme_components,
 )
 
 
@@ -26,7 +31,63 @@ class IndicatorCalculationTests(unittest.TestCase):
     def test_indicator_catalog_accepts_configurable_atr_periods(self) -> None:
         self.assertEqual(repository.validate_indicator("ATR", {"period": 14}), ("ATR", {"period": 14}))
         self.assertEqual(repository.validate_indicator("ratr", {"period": "21"}), ("RATR", {"period": 21}))
+        self.assertEqual(
+            repository.validate_indicator(
+                "wtme",
+                {"period": "40", "half_life": "15", "epsilon": "1e-8"},
+            ),
+            ("WTME", {"period": 40, "half_life": 15.0, "epsilon": 1e-8}),
+        )
 
+    def test_wtme_matches_weighted_formula(self) -> None:
+        rows = sample_rows()[:4]
+        components = calculate_wtme_components(rows, 3, 2, 1e-8)
+
+        self.assertIsNotNone(components)
+        raw_weights = [0.5, 2 ** -0.5, 1.0]
+        total = sum(raw_weights)
+        weights = [value / total for value in raw_weights]
+        returns = [0.01, 2 / 101, 3 / 103]
+        true_ranges = [0.01, 2 / 101, 3 / 103]
+        expected_return = sum(w * value for w, value in zip(weights, returns))
+        expected_range = sum(w * value for w, value in zip(weights, true_ranges))
+        self.assertAlmostEqual(components["weighted_return"], expected_return)
+        self.assertAlmostEqual(components["weighted_true_range"], expected_range)
+        self.assertAlmostEqual(
+            components["value"],
+            100 * expected_return / (expected_range + 1e-8),
+        )
+        self.assertAlmostEqual(sum(components["weights"]), 1.0)
+        self.assertAlmostEqual(components["weights"][0], 0.5 / total)
+        self.assertAlmostEqual(components["weights"][-1], 1.0 / total)
+
+    def test_wtme_reflects_direction_efficiency_and_price_scale_invariance(self) -> None:
+        def rows_for(closes: list[float], scale: float = 1.0) -> list[dict]:
+            result = []
+            for index, close in enumerate(closes):
+                previous = closes[index - 1] if index else close
+                result.append({
+                    "date": f"2024-01-{index + 1:02d}",
+                    "open": previous * scale,
+                    "high": max(previous, close) * scale,
+                    "low": min(previous, close) * scale,
+                    "close": close * scale,
+                    "volume": 1,
+                })
+            return result
+
+        smooth = rows_for([100, 101, 102, 103, 104])
+        oscillating = rows_for([100, 110, 100, 110, 104])
+        falling = rows_for([104, 103, 102, 101, 100])
+        smooth_score = calculate_wtme(smooth, 4, 1000)[-1]
+        oscillating_score = calculate_wtme(oscillating, 4, 1000)[-1]
+        falling_score = calculate_wtme(falling, 4, 1000)[-1]
+        scaled_score = calculate_wtme(rows_for([100, 101, 102, 103, 104], 37), 4, 1000)[-1]
+
+        self.assertGreater(smooth_score, 99.9)
+        self.assertLess(abs(oscillating_score), 30)
+        self.assertLess(falling_score, -99.9)
+        self.assertAlmostEqual(smooth_score, scaled_score, places=10)
     def test_wilder_atr_matches_strategy_recurrence(self) -> None:
         values = calculate_wilder_atr(sample_rows(), 3)
 
@@ -58,6 +119,35 @@ class IndicatorCalculationTests(unittest.TestCase):
         reading = result["items"][0]["indicator_values"]["7"]
         self.assertAlmostEqual(reading["value"], 4.5)
         self.assertEqual(reading["date"], "2024-01-05")
+
+
+class IndicatorSeedTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.database_path = Path(self.temp_dir.name) / "market.sqlite"
+        self.patcher = patch.object(main_db, "DATABASE_PATH", self.database_path)
+        self.patcher.start()
+        main_db.init_database()
+
+    def tearDown(self) -> None:
+        self.patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_reseeding_defaults_preserves_user_favorite_choice(self) -> None:
+        relative_atr = next(
+            item for item in repository.list_indicators()
+            if item["code"] == "RATR14"
+        )
+        self.assertTrue(relative_atr["is_favorite"])
+        repository.update_indicator(
+            relative_atr["id"],
+            {"is_favorite": False},
+        )
+
+        repository.seed_default_indicators()
+
+        stored = repository.get_indicator(relative_atr["id"])
+        self.assertFalse(stored["is_favorite"])
 
 
 class MarketOverviewIndicatorRouteTests(unittest.TestCase):
@@ -107,6 +197,8 @@ class MarketOverviewIndicatorRouteTests(unittest.TestCase):
         self.assertIn('id="overview-indicator-2"', html)
         self.assertIn('<option value="ATR">', html)
         self.assertIn('<option value="RATR">', html)
+        self.assertIn('<option value="WTME">', html)
+        self.assertIn('id="custom-indicator-half-life"', html)
 
 
 if __name__ == "__main__":

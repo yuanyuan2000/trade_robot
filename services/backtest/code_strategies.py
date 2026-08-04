@@ -9,6 +9,7 @@ import numpy as np
 from services.backtest.errors import BacktestDataError, BacktestValidationError
 from services.backtest.portfolio import OrderIntent
 from services.backtest.validation import normalize_schedule, normalize_symbol
+from services.indicator_service import calculate_wtme_components
 
 
 class CodeStrategy:
@@ -577,6 +578,315 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
         return intents
 
 
+class RapidDropWtmeRotationStrategy(CodeStrategy):
+    key = "rapid_drop_wtme_rotation"
+    version = "1.1.0"
+    name = "急跌回避与 WTME 动量轮动"
+    description = (
+        "先按百分比单日急跌规则过滤标的，再以指定时点价格构造"
+        "不含未来数据的当前观测，买入 WTME 评分最高的未过滤标的。"
+    )
+    selection_modes = ("competition",)
+    default_symbols = [dict(item) for item in RapidDropAtrRotationStrategy.default_symbols]
+    parameter_schema = {
+        "wtme_period": {
+            "label": "WTME 窗口 N",
+            "type": "integer",
+            "default": 40,
+            "minimum": 2,
+            "maximum": 500,
+            "step": 1,
+            "unit": "个收益观测",
+            "help": "评分包含当前决策价形成的观测，因此需要此前至少 N 根完整日线。",
+        },
+        "wtme_half_life": {
+            "label": "WTME 权重半衰期 h",
+            "type": "number",
+            "default": 15.0,
+            "minimum": 0.1,
+            "maximum": 500.0,
+            "step": 0.1,
+            "unit": "交易日",
+            "help": "距离当前 h 个观测的原始权重为最新观测的一半。",
+        },
+        "wtme_epsilon": {
+            "label": "WTME epsilon",
+            "type": "number",
+            "default": 1e-8,
+            "minimum": 1e-12,
+            "maximum": 0.01,
+            "step": 1e-12,
+            "help": "加入加权标准化真实波幅分母，防止零波动时除零。",
+        },
+        "enable_percent_drop_filter": RapidDropAtrRotationStrategy.parameter_schema[
+            "enable_percent_drop_filter"
+        ],
+        "drop_threshold_percent": RapidDropAtrRotationStrategy.parameter_schema[
+            "drop_threshold_percent"
+        ],
+        "drop_lookback_sessions": RapidDropAtrRotationStrategy.parameter_schema[
+            "drop_lookback_sessions"
+        ],
+        "risk_check_time": RapidDropAtrRotationStrategy.parameter_schema[
+            "risk_check_time"
+        ],
+        "selection_time": RapidDropAtrRotationStrategy.parameter_schema[
+            "selection_time"
+        ],
+        "target_weight": RapidDropAtrRotationStrategy.parameter_schema["target_weight"],
+    }
+
+    @classmethod
+    def realtime_notification_intro(cls) -> str:
+        return "急跌回避 + WTME 轮动：列出硬性过滤、WTME 评分与最终目标。"
+
+    def __init__(self, params: dict | None = None):
+        super().__init__(params)
+        self.risk_off: dict[str, set[str]] = {}
+        self.risk_evaluations: dict[str, dict[str, dict]] = {}
+
+    @classmethod
+    def validate_params(cls, params: dict) -> dict:
+        values = super().validate_params(params)
+        if values["risk_check_time"] >= values["selection_time"]:
+            raise BacktestValidationError("风险检查时间必须早于轮动选标时间。")
+        return values
+
+    @classmethod
+    def required_events(cls, params: dict) -> tuple[str, ...]:
+        values = cls.validate_params(params)
+        return (values["risk_check_time"], values["selection_time"])
+
+    @classmethod
+    def validate_definition(cls, definition: dict) -> None:
+        values = cls.validate_params(definition.get("params", {}))
+        if any(
+            float(item.get("max_weight", 100)) + 1e-9 < values["target_weight"]
+            for item in definition.get("symbols", [])
+        ):
+            raise BacktestValidationError(
+                "候选标的最大仓位不能低于 WTME 策略总目标仓位。"
+            )
+
+    @classmethod
+    def minimum_lookback(cls, params: dict) -> int:
+        values = cls.validate_params(params)
+        drop_requirement = (
+            values["drop_lookback_sessions"]
+            if values["enable_percent_drop_filter"]
+            else 1
+        )
+        return max(
+            drop_requirement,
+            values["wtme_period"],
+        )
+
+    def describe_run(self, definition: dict) -> str:
+        filters = []
+        if self.params["enable_percent_drop_filter"]:
+            filters.append(f"{self.params['drop_threshold_percent']:g}%急跌")
+        return (
+            f"{self.params['risk_check_time']}检查"
+            f"{self.params['drop_lookback_sessions']}日{'/'.join(filters) or '无急跌过滤'}，"
+            f"{self.params['selection_time']}按 WTME("
+            f"N={self.params['wtme_period']}, h={self.params['wtme_half_life']:g}, "
+            f"epsilon={self.params['wtme_epsilon']:g}) 选择最高分标的，"
+            f"目标仓位{self.params['target_weight']:g}%（目标不变时不重复再平衡）"
+        )
+
+    def on_event(self, context) -> list[OrderIntent]:
+        if context.event == self.params["risk_check_time"]:
+            return self._risk_check(context)
+        if context.event == self.params["selection_time"]:
+            return self._select(context)
+        return []
+
+    def _risk_check(self, context) -> list[OrderIntent]:
+        flagged: set[str] = set()
+        evaluations: dict[str, dict] = {}
+        lookback = self.params["drop_lookback_sessions"]
+        threshold = -self.params["drop_threshold_percent"] / 100
+        for symbol in context.universe:
+            rows = context.dataset.daily_before(symbol, context.trading_date)
+            previous_rows = rows[-lookback:]
+            event_price = context.event_prices[symbol].signal_price
+            current_prices = [
+                *[float(row["close"]) for row in previous_rows[1:]],
+                event_price,
+            ]
+            change_details = [
+                {
+                    "from_date": previous["date"],
+                    "to_date": (
+                        previous_rows[index + 1]["date"]
+                        if index + 1 < len(previous_rows)
+                        else context.trading_date + " " + self.params["risk_check_time"]
+                    ),
+                    "previous_close": float(previous["close"]),
+                    "current_price": current_price,
+                    "change": current_price / float(previous["close"]) - 1,
+                    "formula": (
+                        f"{current_price:.6f} / "
+                        f"{float(previous['close']):.6f} - 1"
+                    ),
+                }
+                for index, (previous, current_price) in enumerate(
+                    zip(previous_rows, current_prices)
+                )
+            ]
+            changes = [item["change"] for item in change_details]
+            triggered = (
+                self.params["enable_percent_drop_filter"]
+                and any(value <= threshold for value in changes)
+            )
+            filter_codes = ["percent_drop"] if triggered else []
+            filter_reasons = ["百分比单日急跌"] if triggered else []
+            evaluations[symbol] = {
+                "filter_codes": filter_codes,
+                "filter_reasons": filter_reasons,
+                "percent_changes": changes,
+                "percent_change_details": change_details,
+                "risk_event_price": event_price,
+                "percent_threshold": threshold,
+            }
+            if triggered:
+                flagged.add(symbol)
+            result_label = "过滤：百分比单日急跌" if triggered else "通过"
+            context.log_custom(
+                "RAPID_DROP_WTME_RISK_CHECK",
+                f"{symbol} 风险检查{result_label}；"
+                f"最差单日涨跌 {min(changes, default=0.0):.2%}。",
+                symbol=symbol,
+                context=evaluations[symbol],
+            )
+        self.risk_off[context.trading_date] = flagged
+        self.risk_evaluations[context.trading_date] = evaluations
+        return [
+            OrderIntent(
+                symbol=symbol,
+                action="SELL",
+                sizing_mode="TARGET",
+                value_percent=0,
+                reason=(
+                    f"{self.params['risk_check_time']} 百分比急跌检查命中，"
+                    f"{symbol} 当日回避"
+                ),
+            )
+            for symbol in sorted(flagged)
+            if context.portfolio.quantity(symbol) > 0
+        ]
+
+    def _select(self, context) -> list[OrderIntent]:
+        flagged = self.risk_off.get(context.trading_date, set())
+        period = self.params["wtme_period"]
+        half_life = self.params["wtme_half_life"]
+        epsilon = self.params["wtme_epsilon"]
+        scores: list[tuple[float, str]] = []
+        evaluations: list[dict] = []
+        for symbol in context.universe:
+            completed_rows = context.dataset.daily_before(
+                symbol, context.trading_date
+            )
+            previous_close = float(completed_rows[-1]["close"])
+            current_price = context.event_prices[symbol].signal_price
+            # The current daily bar is not complete at an intraday decision.
+            # Treat its known price path as previous close -> event price.  This
+            # gives a point-in-time TR lower bound without leaking the day's
+            # eventual high/low into the score.
+            current_observation = {
+                "date": context.trading_date,
+                "open": previous_close,
+                "high": max(previous_close, current_price),
+                "low": min(previous_close, current_price),
+                "close": current_price,
+            }
+            score_rows = [*completed_rows[-period:], current_observation]
+            components = calculate_wtme_components(
+                score_rows,
+                period,
+                half_life,
+                epsilon,
+            )
+            score = float(components["value"]) if components is not None else None
+            if score is not None and symbol not in flagged:
+                scores.append((score, symbol))
+            risk = self.risk_evaluations.get(context.trading_date, {}).get(symbol, {})
+            evaluations.append({
+                "symbol": symbol,
+                "score": score,
+                "weighted_return": (
+                    components["weighted_return"] if components is not None else None
+                ),
+                "weighted_true_range": (
+                    components["weighted_true_range"] if components is not None else None
+                ),
+                "score_formula": (
+                    f"100 × Rw / (Aw + {epsilon:g}); WTME(N={period}, "
+                    f"h={half_life:g}) at {self.params['selection_time']}"
+                ),
+                "current_price": current_price,
+                "previous_close": previous_close,
+                "current_observation_true_range": abs(current_price - previous_close),
+                "current_observation_is_partial": True,
+                "filter_codes": list(risk.get("filter_codes", [])),
+                "filter_reasons": list(risk.get("filter_reasons", [])),
+                "percent_changes": list(risk.get("percent_changes", [])),
+                "risk_event_price": risk.get("risk_event_price"),
+            })
+
+        ranked_scores = sorted(scores, key=lambda item: (-item[0], item[1]))
+        target = ranked_scores[0][1] if ranked_scores else None
+        rank_by_symbol = {
+            symbol: index + 1
+            for index, (_score, symbol) in enumerate(ranked_scores)
+        }
+        for item in evaluations:
+            item["rank"] = rank_by_symbol.get(item["symbol"])
+            item["selected_for_target"] = item["symbol"] == target
+            filter_text = (
+                f"，硬性过滤：{'；'.join(item['filter_reasons'])}"
+                if item["filter_reasons"]
+                else "，通过硬性过滤"
+            )
+            rank_text = f"，合格排名第 {item['rank']}" if item["rank"] else ""
+            score_text = (
+                f"{item['score']:.8f}" if item["score"] is not None else "不可计算"
+            )
+            context.log_custom(
+                "RAPID_DROP_WTME_DAILY_SCORE",
+                f"{item['symbol']} WTME 评分 {score_text}{rank_text}{filter_text}。",
+                symbol=item["symbol"],
+                context=item,
+            )
+
+        target_label = target or "无"
+        intents = [
+            OrderIntent(
+                symbol=symbol,
+                action="SELL",
+                sizing_mode="TARGET",
+                value_percent=0,
+                reason=f"{self.params['selection_time']} WTME 轮动换仓，目标标的为 {target_label}",
+            )
+            for symbol in context.universe
+            if symbol != target and context.portfolio.quantity(symbol) > 0
+        ]
+        if target is not None and context.portfolio.quantity(target) <= 0:
+            intents.append(
+                OrderIntent(
+                    symbol=target,
+                    action="BUY",
+                    sizing_mode="TARGET",
+                    value_percent=self.params["target_weight"],
+                    reason=(
+                        f"{self.params['selection_time']} 未过滤标的 WTME 最高："
+                        f"{target}"
+                    ),
+                )
+            )
+        return intents
+
+
 class SevenStarEtfRotationStrategy(CodeStrategy):
     key = "sevenstar_etf_rotation"
     version = "1.1.0"
@@ -1114,6 +1424,7 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
 
 STRATEGY_REGISTRY: dict[str, type[CodeStrategy]] = {
     RapidDropAtrRotationStrategy.key: RapidDropAtrRotationStrategy,
+    RapidDropWtmeRotationStrategy.key: RapidDropWtmeRotationStrategy,
     SevenStarEtfRotationStrategy.key: SevenStarEtfRotationStrategy,
 }
 

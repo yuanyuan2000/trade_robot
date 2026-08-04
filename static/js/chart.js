@@ -637,7 +637,7 @@ function drawIndicators(ctx, plot, priceRange) {
 }
 
 function isOscillatorIndicator(series) {
-  return series.indicator_type === "ATR" || series.indicator_type === "RATR";
+  return ["ATR", "RATR", "WTME"].includes(series.indicator_type);
 }
 
 function getVisibleOscillatorSeries() {
@@ -651,6 +651,7 @@ function drawOscillatorIndicators(ctx, plot, seriesList, theme) {
   const ranges = {
     ATR: getIndicatorRange(seriesList, "ATR"),
     RATR: getIndicatorRange(seriesList, "RATR", true),
+    WTME: getIndicatorRange(seriesList, "WTME", true),
   };
 
   for (const series of seriesList) {
@@ -679,13 +680,16 @@ function drawOscillatorIndicators(ctx, plot, seriesList, theme) {
     ctx.stroke();
   }
 
-  if (ranges.RATR && ranges.RATR.min < 0 && ranges.RATR.max > 0) {
-    ctx.save();
-    ctx.strokeStyle = theme.axis;
-    ctx.setLineDash([3, 3]);
-    const zeroY = priceToY(0, plot, ranges.RATR);
-    drawLine(ctx, plot.left, zeroY, plot.right, zeroY);
-    ctx.restore();
+  for (const indicatorType of ["RATR", "WTME"]) {
+    const range = ranges[indicatorType];
+    if (range && range.min < 0 && range.max > 0) {
+      ctx.save();
+      ctx.strokeStyle = theme.axis;
+      ctx.setLineDash([3, 3]);
+      const zeroY = priceToY(0, plot, range);
+      drawLine(ctx, plot.left, zeroY, plot.right, zeroY);
+      ctx.restore();
+    }
   }
   drawOscillatorAxes(ctx, plot, ranges, theme);
 }
@@ -733,6 +737,11 @@ function drawOscillatorAxes(ctx, plot, ranges, theme) {
       ctx.textAlign = "left";
       ctx.fillText(value.toFixed(2), plot.right + 10, y);
     }
+    if (ranges.WTME) {
+      const value = ranges.WTME.max - (ranges.WTME.max - ranges.WTME.min) * (index / 2);
+      ctx.textAlign = "right";
+      ctx.fillText(value.toFixed(2), plot.right - 8, y);
+    }
   }
   ctx.textBaseline = "top";
   if (ranges.ATR) {
@@ -742,6 +751,10 @@ function drawOscillatorAxes(ctx, plot, ranges, theme) {
   if (ranges.RATR) {
     ctx.textAlign = "right";
     ctx.fillText("相对 ATR", plot.right - 6, plot.top + 4);
+  }
+  if (ranges.WTME) {
+    ctx.textAlign = "right";
+    ctx.fillText("WTME", plot.right - 6, plot.top + (ranges.RATR ? 18 : 4));
   }
 }
 
@@ -1287,6 +1300,14 @@ function calculateIndicatorValues(candles, indicator) {
   if (indicator.indicator_type === "RATR") {
     return calculateRelativeATR(candles, period);
   }
+  if (indicator.indicator_type === "WTME") {
+    return calculateWTME(
+      candles,
+      period,
+      Number(indicator.params?.half_life),
+      Number(indicator.params?.epsilon),
+    );
+  }
   return candles.map(() => null);
 }
 
@@ -1320,6 +1341,43 @@ function calculateRelativeATR(candles, period) {
     const atr = atrValues[index - 1];
     if (atr !== null && atr > 0) {
       values[index] = (candles[index].close - candles[index - period].close) / atr;
+    }
+  }
+  return values;
+}
+
+function calculateWTME(candles, period, halfLife, epsilon) {
+  const values = candles.map(() => null);
+  if (!Number.isFinite(halfLife) || halfLife <= 0 || !Number.isFinite(epsilon) || epsilon <= 0) {
+    return values;
+  }
+  const rawWeights = Array.from(
+    { length: period },
+    (_, index) => 2 ** (-(period - 1 - index) / halfLife),
+  );
+  const weightTotal = rawWeights.reduce((sum, value) => sum + value, 0);
+  const weights = rawWeights.map((value) => value / weightTotal);
+  for (let rowIndex = period; rowIndex < candles.length; rowIndex += 1) {
+    let weightedReturn = 0;
+    let weightedTrueRange = 0;
+    let valid = true;
+    for (let offset = 0; offset < period; offset += 1) {
+      const previous = candles[rowIndex - period + offset];
+      const current = candles[rowIndex - period + offset + 1];
+      if (!Number.isFinite(previous.close) || previous.close <= 0) {
+        valid = false;
+        break;
+      }
+      const trueRange = Math.max(
+        current.high - current.low,
+        Math.abs(current.high - previous.close),
+        Math.abs(current.low - previous.close),
+      );
+      weightedReturn += weights[offset] * ((current.close - previous.close) / previous.close);
+      weightedTrueRange += weights[offset] * (trueRange / previous.close);
+    }
+    if (valid) {
+      values[rowIndex] = 100 * weightedReturn / (weightedTrueRange + epsilon);
     }
   }
   return values;

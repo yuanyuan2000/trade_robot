@@ -10,6 +10,7 @@ import smtplib
 import threading
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -20,6 +21,25 @@ from services.backtest.code_strategies import get_code_strategy
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 RETRY_DELAYS = (10, 30, 120)
+NEW_YORK = ZoneInfo("America/New_York")
+_LONG_DECIMAL_PATTERN = re.compile(
+    r"(?<![\w.])([+-]?\d+\.\d{4,})(?![\w.]|\.\d)"
+)
+_TEMPLATE_TOKEN_PATTERN = re.compile(r"\{\{[^{}]*\}\}")
+MESSAGE_TEMPLATE_PLACEHOLDERS = {
+    "{{task.name}}",
+    "{{decision.date}}",
+    "{{decision.time}}",
+    "{{decision.time_label}}",
+    "{{decision.datetime}}",
+    "{{decision.actions}}",
+    "{{decision.basis}}",
+    "{{decision.summary}}",
+    "{{message.generated_at}}",
+    # Legacy aliases remain valid for already-saved and copied templates.
+    "{{event}}", "{{event.name}}", "{{date}}", "{{decision}}",
+    "{{basis}}", "{{summary}}",
+}
 
 
 class MailError(RuntimeError):
@@ -172,7 +192,36 @@ def send_smtp(channel_id: int, *, recipient: str, subject: str, body: str, timeo
 
 def _format_number(value) -> str:
     number = float(value)
-    return f"{number:.6f}".rstrip("0").rstrip(".")
+    return f"{number:.3f}".rstrip("0").rstrip(".")
+
+
+def _limit_decimal_places(value: str) -> str:
+    """Limit standalone decimal numbers in rendered mail to three places."""
+    return _LONG_DECIMAL_PATTERN.sub(
+        lambda match: _format_number(match.group(1)),
+        str(value),
+    )
+
+
+def validate_message_template(value: str) -> None:
+    template = str(value or "")
+    tokens = set(_TEMPLATE_TOKEN_PATTERN.findall(template))
+    unknown = sorted(tokens - MESSAGE_TEMPLATE_PLACEHOLDERS)
+    remainder = _TEMPLATE_TOKEN_PATTERN.sub("", template)
+    if "{{" in remainder or "}}" in remainder:
+        raise ValueError("邮件模板存在未闭合的双大括号占位符。")
+    if unknown:
+        raise ValueError(
+            "邮件模板包含不支持的占位符：" + "、".join(unknown)
+        )
+
+
+def _decision_time_label(event: str) -> str:
+    if event == "OPEN":
+        return "OPEN（美东常规开盘 09:30）"
+    if event == "CLOSE":
+        return "CLOSE（美东常规收盘 16:00；提前收市日除外）"
+    return f"{event}（美东时间）"
 
 
 def _decision_template_text(recommendations: list[dict]) -> str:
@@ -221,19 +270,36 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
     basis_text = _basis_template_text(engine_logs)
     code_key = strategy_snapshot.get("code_key")
     params = strategy_snapshot.get("definition", {}).get("params", {})
+    rapid_drop_code = code_key in {
+        "rapid_drop_atr_rotation",
+        "rapid_drop_wtme_rotation",
+    }
     lines = [
         f"{task['name']} · {decision['trading_date']} {event}",
         "",
     ]
     if strategy_snapshot.get("design_mode") == "code":
         strategy_type = get_code_strategy(code_key or "")
-        if code_key == "rapid_drop_atr_rotation" and event == params.get("risk_check_time"):
-            lines.append("急跌风险检查：按百分比/ATR 单日急跌规则排查当日需回避的标的。")
+        if rapid_drop_code and event == params.get("risk_check_time"):
+            risk_rule_label = (
+                "百分比单日急跌"
+                if code_key == "rapid_drop_wtme_rotation"
+                else "百分比/ATR 单日急跌"
+            )
+            lines.append(f"急跌风险检查：按{risk_rule_label}规则排查当日需回避的标的。")
         else:
             lines.append(strategy_type.realtime_notification_intro())
 
-    if code_key == "rapid_drop_atr_rotation" and event == params.get("risk_check_time"):
-        risk_logs = [log for log in engine_logs if log.get("event_type") == "RAPID_DROP_ATR_RISK_CHECK"]
+    if rapid_drop_code and event == params.get("risk_check_time"):
+        risk_event_type = (
+            "RAPID_DROP_WTME_RISK_CHECK"
+            if code_key == "rapid_drop_wtme_rotation"
+            else "RAPID_DROP_ATR_RISK_CHECK"
+        )
+        risk_logs = [
+            log for log in engine_logs
+            if log.get("event_type") == risk_event_type
+        ]
         lines.extend(["", "风险检查结果："])
         if risk_logs:
             lines.extend(f"- {log.get('message', '')}" for log in risk_logs[:12])
@@ -247,18 +313,27 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
                 )
         else:
             lines.append("- 没有已持仓标的触发风险卖出。")
-    elif code_key == "rapid_drop_atr_rotation" and event == params.get("selection_time"):
-        score_logs = [log for log in engine_logs if log.get("event_type") == "RAPID_DROP_ATR_DAILY_SCORE"]
+    elif rapid_drop_code and event == params.get("selection_time"):
+        score_event_type = (
+            "RAPID_DROP_WTME_DAILY_SCORE"
+            if code_key == "rapid_drop_wtme_rotation"
+            else "RAPID_DROP_ATR_DAILY_SCORE"
+        )
+        score_label = "WTME" if code_key == "rapid_drop_wtme_rotation" else "ATR 动量"
+        score_logs = [
+            log for log in engine_logs
+            if log.get("event_type") == score_event_type
+        ]
         score_logs.sort(key=lambda log: (
             (log.get("context") or {}).get("rank") is None,
             (log.get("context") or {}).get("rank") or 9999,
             str(log.get("symbol") or ""),
         ))
-        lines.extend(["", "ATR 动量评分与排名："])
+        lines.extend(["", f"{score_label}评分与排名："])
         if score_logs:
             lines.extend(f"- {log.get('message', '')}" for log in score_logs[:12])
         else:
-            lines.append("- 本次事件没有生成有效 ATR 动量评分。")
+            lines.append(f"- 本次事件没有生成有效{score_label}评分。")
         lines.extend(["", "轮动与调仓建议："])
         if recommendations:
             for item in recommendations[:12]:
@@ -283,10 +358,14 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
     warnings = decision.get("data_warnings") or result.get("data_manifest", {}).get("missing") or []
     if warnings:
         lines.extend(["", "数据提示：", *[f"- 已忽略：{item}" for item in warnings[:8]]])
-    if strategy_snapshot.get("design_mode") == "code" and code_key != "rapid_drop_atr_rotation":
+    if strategy_snapshot.get("design_mode") == "code" and not rapid_drop_code:
         calculations = []
         for log in engine_logs:
-            if log.get("event_type") in {"RAPID_DROP_ATR_DAILY_SCORE", "SEVENSTAR_DAILY_SCORE"}:
+            if log.get("event_type") in {
+                "RAPID_DROP_ATR_DAILY_SCORE",
+                "RAPID_DROP_WTME_DAILY_SCORE",
+                "SEVENSTAR_DAILY_SCORE",
+            }:
                 calculations.append(str(log.get("message", "")))
         if calculations:
             lines.extend(["", "评分摘要：", *[f"- {item}" for item in calculations[:12]]])
@@ -295,7 +374,7 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
         "本邮件为实时决策辅助信息，需人工核验行情、风险和实际持仓后再决定是否交易。",
     ])
     event_label = event
-    if code_key == "rapid_drop_atr_rotation":
+    if rapid_drop_code:
         if event == params.get("risk_check_time"):
             event_label = f"风险检查 {event}"
         elif event == params.get("selection_time"):
@@ -304,9 +383,23 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
     settings = task.get("notification_settings") or {}
     subject_template = str(settings.get("subject_template") or default_subject)
     body_template = str(settings.get("body_template") or "")
+    decision_datetime = f"{decision['trading_date']} {event}"
+    generated_at = datetime.now(NEW_YORK).strftime(
+        "%Y-%m-%d %H:%M:%S America/New_York"
+    )
     replacements = {
         "{{task.name}}": task["name"],
-        "{{event}}": f"{decision['trading_date']} {event}",
+        "{{decision.date}}": decision["trading_date"],
+        "{{decision.time}}": event,
+        "{{decision.time_label}}": _decision_time_label(event),
+        "{{decision.datetime}}": decision_datetime,
+        "{{decision.actions}}": decision_text,
+        "{{decision.basis}}": basis_text,
+        "{{decision.summary}}": "\n".join(lines),
+        "{{message.generated_at}}": generated_at,
+        # Backward-compatible aliases for tasks saved before the clearer
+        # decision.* placeholder names were introduced.
+        "{{event}}": decision_datetime,
         "{{event.name}}": event,
         "{{date}}": decision["trading_date"],
         "{{decision}}": decision_text,
@@ -316,7 +409,11 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
     for key, value in replacements.items():
         subject_template = subject_template.replace(key, str(value))
         body_template = body_template.replace(key, str(value))
-    return subject_template[:200], (body_template.strip() or "\n".join(lines))[:20000]
+    rendered_body = body_template.strip() or "\n".join(lines)
+    return (
+        _limit_decimal_places(subject_template)[:200],
+        _limit_decimal_places(rendered_body)[:20000],
+    )
 
 
 class NotificationDispatcher:

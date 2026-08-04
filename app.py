@@ -66,7 +66,12 @@ from services.backtest.export import build_run_xls
 from services.backtest.validation import validate_strategy_payload
 from database import realtime_repository
 from services.realtime_mail import bootstrap_env_qq_channel
-from services.realtime_mail import encrypt_secret, normalize_recipients, send_smtp
+from services.realtime_mail import (
+    encrypt_secret,
+    normalize_recipients,
+    send_smtp,
+    validate_message_template,
+)
 from services.realtime_scheduler import run_manager as realtime_run_manager
 
 
@@ -1493,6 +1498,8 @@ def _realtime_task_payload(payload: dict, *, current: dict | None = None) -> tup
     settings = {**strategy.get("default_settings", {}), **(current.get("settings") or {}), **(payload.get("settings") or {})}
     notification = {**(current.get("notification_settings") or {}), **(payload.get("notification_settings") or {})}
     notification.setdefault("enabled", False)
+    validate_message_template(notification.get("subject_template") or "")
+    validate_message_template(notification.get("body_template") or "")
     if notification.get("enabled"):
         if not notification.get("channel_id"):
             raise ValueError("启用邮件通知时必须选择邮件通道。")

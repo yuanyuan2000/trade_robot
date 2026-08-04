@@ -65,7 +65,7 @@ class BacktestRouteTests(unittest.TestCase):
         )
         self.assertEqual(deleted.status_code, 200)
         listed = self.client.get("/api/backtest/strategies").get_json()
-        self.assertEqual(len(listed["strategies"]), 7)
+        self.assertEqual(len(listed["strategies"]), 8)
         self.assertNotIn(
             "API测试策略已改名",
             [item["name"] for item in listed["strategies"]],
@@ -123,6 +123,17 @@ class BacktestRouteTests(unittest.TestCase):
             ["consistent_w2", "legacy_v1"],
         )
         self.assertEqual(sevenstar["parameter_schema"]["lookback_days"]["default"], 25)
+        wtme = next(
+            item for item in catalog.get_json()["strategies"]
+            if item["key"] == "rapid_drop_wtme_rotation"
+        )
+        self.assertEqual(wtme["version"], "1.1.0")
+        self.assertEqual(wtme["parameter_schema"]["wtme_period"]["default"], 40)
+        self.assertEqual(wtme["parameter_schema"]["wtme_half_life"]["default"], 15.0)
+        self.assertEqual(wtme["parameter_schema"]["wtme_epsilon"]["default"], 1e-8)
+        self.assertNotIn("atr_period", wtme["parameter_schema"])
+        self.assertNotIn("atr_weighting", wtme["parameter_schema"])
+        self.assertNotIn("enable_atr_drop_filter", wtme["parameter_schema"])
 
         listed = self.client.get("/api/backtest/strategies").get_json()["strategies"]
         sevenstar_presets = [
@@ -151,6 +162,27 @@ class BacktestRouteTests(unittest.TestCase):
         )
         self.assertEqual(strategy["default_settings"]["minimum_commission"], 1.0)
         self.assertEqual(strategy["default_settings"]["risk_free_rate"], 0.045)
+        refused_delete = self.client.delete(
+            f"/api/backtest/strategies/{strategy['id']}"
+        )
+        self.assertEqual(refused_delete.status_code, 400)
+        self.assertIn(
+            "代码模式策略禁止删除",
+            refused_delete.get_json()["error"]["message"],
+        )
+        self.assertEqual(
+            self.client.get(
+                f"/api/backtest/strategies/{strategy['id']}"
+            ).status_code,
+            200,
+        )
+        wtme_strategy = next(
+            item
+            for item in listed
+            if item["code_key"] == "rapid_drop_wtme_rotation"
+        )
+        self.assertEqual(wtme_strategy["code_version"], "1.1.0")
+        self.assertEqual(wtme_strategy["definition"]["params"]["wtme_period"], 40)
 
         created = self.client.post(
             "/api/backtest/strategies",

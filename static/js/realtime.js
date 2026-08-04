@@ -52,10 +52,32 @@ function rtCodeBodyPreview(strategy) {
   if (key === "rapid_drop_atr_rotation") {
     return "代码策略默认正文按事件生成：\n\n风险检查时间：逐项列出通过/被过滤标的、最差单日涨跌、ATR 急跌结果及已持仓卖出建议。\n\n轮动选标时间：按排名列出 ATR 动量评分、过滤原因、最终目标和调仓建议。\n\n数据提示：列出被 IEX 忽略的标的。";
   }
+  if (key === "rapid_drop_wtme_rotation") {
+    return "代码策略默认正文按事件生成：\n\n风险检查时间：逐项列出通过/被过滤标的、最差单日百分比涨跌及已持仓卖出建议。\n\n轮动选标时间：按排名列出 WTME 评分、过滤原因、最终目标和调仓建议。\n\n数据提示：列出被 IEX 忽略的标的。";
+  }
   if (key === "sevenstar_etf_rotation") {
     return "代码策略默认正文：\n七星 ETF 趋势轮动：按加权趋势评分排名，列出过滤原因与最终目标/防御标的。\n\n建议：列出趋势评分、排名、过滤原因和最终调仓建议。\n数据提示：列出被 IEX 忽略的标的。";
   }
   return "代码策略默认正文：显示策略评分、排名、过滤原因、调仓建议和数据提示。";
+}
+
+function rtVisualDecisionSchedule(strategy) {
+  const definition = strategy?.definition || {};
+  const events = (definition.rules || [])
+    .filter((rule) => rule.enabled)
+    .map((rule) => rule.when);
+  if (strategy?.selection_mode === "competition" && definition.competition?.when) {
+    events.push(definition.competition.when);
+  }
+  const unique = [...new Set(events)];
+  const describe = (event) => {
+    if (event === "OPEN") return "OPEN（美东常规开盘 09:30）";
+    if (event === "CLOSE") return "CLOSE（美东常规收盘 16:00；提前收市日除外）";
+    return `${event}（美东时间）`;
+  };
+  return unique.length
+    ? `当前任务的 decision.time：${unique.map(describe).join("、")}`
+    : "当前任务没有已启用的决策时点。";
 }
 
 async function loadRealtimeStrategies() {
@@ -182,6 +204,7 @@ function renderRealtimeDetail(full = true) {
   document.getElementById("realtime-subject-template").value = notification.subject_template || "";
   document.getElementById("realtime-body-template").value = notification.body_template || "";
   document.getElementById("realtime-body-template-help").hidden = task.strategy_snapshot?.design_mode !== "visual";
+  document.getElementById("realtime-template-current-schedule").textContent = rtVisualDecisionSchedule(task.strategy_snapshot);
   const preview = document.getElementById("realtime-code-body-preview");
   if (task.strategy_snapshot?.design_mode === "code" && !notification.body_template) {
     preview.hidden = false;

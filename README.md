@@ -233,6 +233,8 @@ AUTO_OPEN_BROWSER=false python app.py
 - 删除会真实移除策略记录；已完成运行仍保留不可变策略快照和结果。
 - 非代码策略支持 single、distribution、competition，公式支持 OHLCV、MA、EMA、ATR
   和布尔/比较运算。
+- 内置“急跌回避与 ATR 动量轮动”代码策略的完整参数、计算公式、数据边界、当前配置差异
+  和改进建议见 [策略专项说明](docs/rapid_drop_atr_rotation.md)。
 - 设置起止日期、初始资金、1–10 倍账户杠杆、每股/最低手续费、滑点、碎股、无风险利率
   及比较基准后运行。杠杆账户按分钟监控权益，爆仓后强平并提前结束，但仍生成完整结果。
 - 新策略默认结束日期为当前日期前一天、每股手续费 0.01 美元、每笔最低手续费 1 美元、
@@ -364,9 +366,13 @@ GET /api/alpaca/stock-bars?symbol=GLD&timeframe=1Min&start=2020-01-02&end=2020-0
   授权码只会加密保存到数据库，接口不返回明文；普通通知按任务至少间隔 1 分钟，网络临时
   失败按退避策略重试。邮件通道表示发件身份，收件邮箱表示通知目标；两者可以填写同一个
   地址。详情页可发送通道测试邮件，测试收件地址默认为当前通道发件地址。
-- 非代码策略正文模板支持 `{{task.name}}`、`{{event}}`、`{{event.name}}`、`{{date}}`、
-  `{{decision}}`、`{{basis}}` 和 `{{summary}}`；其中 `decision` 输出动作、标的与目标仓位，
-  `basis` 输出命中规则、条件公式及公式引用的实际指标值。
+- 非代码策略正文模板使用只读文本占位符：`{{task.name}}`、`{{decision.date}}`、
+  `{{decision.time}}`、`{{decision.time_label}}`、`{{decision.datetime}}`、
+  `{{decision.actions}}`、`{{decision.basis}}`、`{{decision.summary}}` 和
+  `{{message.generated_at}}`。占位符必须原样填写，不能在双大括号内放自定义字符串、数字或
+  计算式；固定内容直接写在占位符外。邮件是纯文本，因此所有替换结果最终也是文本，数值
+  会先格式化，所有小数最多保留三位。旧的 `event`、`event.name`、`date`、`decision`、
+  `basis`、`summary` 别名继续兼容已有任务；未知名称或未闭合的大括号会在保存时直接报错。
 
 完整设计、数据口径、审计字段和运行建议见
 [实时决策模块文档](docs/realtime_decision.md)。

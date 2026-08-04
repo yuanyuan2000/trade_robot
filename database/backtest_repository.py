@@ -230,8 +230,9 @@ def upgrade_seeded_strategy_code_version_once(
     from_versions: tuple[str, ...],
     to_version: str,
     parameter_defaults: dict | None = None,
+    removed_parameters: tuple[str, ...] = (),
 ) -> dict | None:
-    """Upgrade seeded code metadata once, only filling missing parameter defaults."""
+    """Upgrade seeded code metadata and apply explicit parameter migrations."""
     now = utc_now_iso()
     marker = f"upgrade:{upgrade_key}:{seed_key}"
     allowed_versions = set(from_versions)
@@ -274,6 +275,15 @@ def upgrade_seeded_strategy_code_version_once(
                     definition["params"] = {
                         **parameter_defaults,
                         **current_params,
+                    }
+                if removed_parameters:
+                    current_params = definition.get("params")
+                    if not isinstance(current_params, dict):
+                        current_params = {}
+                    definition["params"] = {
+                        name: value
+                        for name, value in current_params.items()
+                        if name not in set(removed_parameters)
                     }
                 conn.execute(
                     """
@@ -351,6 +361,8 @@ def update_strategy(
 
 def delete_strategy(strategy_id: int) -> dict:
     current = get_strategy(strategy_id)
+    if current["design_mode"] == "code":
+        raise ValueError("内置代码模式策略禁止删除。")
     with get_connection() as conn:
         live_task = conn.execute(
             """

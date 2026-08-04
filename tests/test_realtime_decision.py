@@ -9,7 +9,7 @@ from unittest.mock import patch
 import database.db as main_db
 from database import realtime_repository
 from services.backtest.service import create_default_strategy
-from services.realtime_mail import render_message
+from services.realtime_mail import render_message, validate_message_template
 from services.realtime_scheduler import RealtimeTaskManager
 from services.realtime_market_data import IEXMarketDataHub
 
@@ -124,10 +124,13 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
             "name": "SPY 8和13EMA 测试策略",
             "strategy_snapshot": {"design_mode": "visual", "definition": {}},
             "notification_settings": {
+                "subject_template": "SPY 指标 1.234567",
                 "body_template": (
-                    "发送时间：{{event.name}}\n"
-                    "决策内容：{{decision}}\n"
-                    "决策依据：{{basis}}"
+                    "决策日期：{{decision.date}}\n"
+                    "决策时点：{{decision.time_label}}\n"
+                    "决策内容：{{decision.actions}}\n"
+                    "决策依据：{{decision.basis}}\n"
+                    "固定阈值：1.234567"
                 )
             },
         }
@@ -138,7 +141,7 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
                 "recommendations": [{
                     "action": "BUY",
                     "symbol": "SPY",
-                    "target_weight_percent": 100,
+                    "target_weight_percent": 99.12389,
                     "effective_leverage": 1,
                     "reason": "规则命中：EMA 金叉",
                 }],
@@ -151,17 +154,50 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
                     "rule_name": "EMA 金叉",
                     "condition": "ema(8) > ema(13)",
                     "matched": True,
-                    "inputs": {"ema(8)": 635.125, "ema(13)": 632.5},
+                    "inputs": {"ema(8)": 635.12567, "ema(13)": 632.5},
                 },
             }]},
         }
 
+        subject, body = render_message(task, result)
+
+        self.assertEqual(subject, "SPY 指标 1.235")
+        self.assertIn("决策日期：2026-08-03", body)
+        self.assertIn("决策时点：OPEN（美东常规开盘 09:30）", body)
+        self.assertIn("决策内容：BUY SPY 99.124%", body)
+        self.assertIn("ema(8)=635.126", body)
+        self.assertIn("ema(13)=632.5", body)
+        self.assertIn("固定阈值：1.235", body)
+
+    def test_legacy_visual_template_aliases_remain_compatible(self) -> None:
+        task = {
+            "name": "旧模板",
+            "strategy_snapshot": {"design_mode": "visual"},
+            "notification_settings": {
+                "body_template": "{{event.name}}|{{decision}}|{{basis}}",
+            },
+        }
+        result = {
+            "decision": {
+                "trading_date": "2026-08-03",
+                "event": "OPEN",
+                "recommendations": [],
+            },
+            "calculation": {"engine_logs": []},
+        }
+
         _subject, body = render_message(task, result)
 
-        self.assertIn("发送时间：OPEN", body)
-        self.assertIn("决策内容：BUY SPY 100%", body)
-        self.assertIn("ema(8)=635.125", body)
-        self.assertIn("ema(13)=632.5", body)
+        self.assertEqual(body, "OPEN|无新调仓决策|没有非代码规则命中")
+
+    def test_message_template_rejects_unknown_or_unclosed_placeholders(self) -> None:
+        validate_message_template(
+            "{{task.name}} {{decision.time}} {{decision.actions}}"
+        )
+        with self.assertRaisesRegex(ValueError, "不支持的占位符"):
+            validate_message_template("{{decision.action}}")
+        with self.assertRaisesRegex(ValueError, "未闭合"):
+            validate_message_template("{{decision.actions}")
 
     def test_rapid_strategy_notification_matches_each_event_role(self) -> None:
         task = {
@@ -202,6 +238,41 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
         self.assertIn("ATR 动量评分与排名", selection_body)
         self.assertIn("BUY XLE", selection_body)
         self.assertNotIn("风险检查结果", selection_body)
+
+    def test_wtme_notification_uses_percent_filter_without_atr_wording(self) -> None:
+        task = {
+            "name": "WTME 事件文案测试",
+            "strategy_snapshot": {
+                "design_mode": "code",
+                "code_key": "rapid_drop_wtme_rotation",
+                "definition": {
+                    "params": {
+                        "risk_check_time": "09:40",
+                        "selection_time": "10:00",
+                    }
+                },
+            },
+            "notification_settings": {},
+        }
+        result = {
+            "decision": {
+                "trading_date": "2026-08-03",
+                "event": "09:40",
+                "recommendations": [],
+            },
+            "data_manifest": {},
+            "calculation": {"engine_logs": [{
+                "event_type": "RAPID_DROP_WTME_RISK_CHECK",
+                "message": "SPY 风险检查通过；最差单日涨跌 -1.00%。",
+                "symbol": "SPY",
+            }]},
+        }
+
+        _subject, body = render_message(task, result)
+
+        self.assertIn("按百分比单日急跌规则", body)
+        self.assertIn("SPY 风险检查通过", body)
+        self.assertNotIn("百分比/ATR", body)
 
     def test_event_calculation_aliases_are_persisted_for_audit(self) -> None:
         strategy = create_default_strategy(name="事件审计策略", design_mode="visual", selection_mode="single")

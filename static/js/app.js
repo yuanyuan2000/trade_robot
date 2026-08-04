@@ -37,6 +37,8 @@ const favoriteIndicators = document.getElementById("favorite-indicators");
 const customIndicatorForm = document.getElementById("custom-indicator-form");
 const customIndicatorType = document.getElementById("custom-indicator-type");
 const customIndicatorPeriod = document.getElementById("custom-indicator-period");
+const customIndicatorHalfLife = document.getElementById("custom-indicator-half-life");
+const customIndicatorEpsilon = document.getElementById("custom-indicator-epsilon");
 const updateDataButton = document.getElementById("update-data-button");
 const marketUpdateProgress = document.getElementById("market-update-progress");
 const marketUpdateProgressContent = document.getElementById("market-update-progress-content");
@@ -698,6 +700,8 @@ function renderMarketOverviewTable(items) {
       const value = reading.value;
       const formula = indicator.indicator_type === "RATR"
         ? `（收盘价 - ${indicator.params.period} 个交易日前收盘价）/ 前一日 Wilder ATR(${indicator.params.period})`
+        : indicator.indicator_type === "WTME"
+          ? `100 × 加权方向收益 /（加权标准化真实波幅 + ${indicator.params.epsilon}），N=${indicator.params.period}，h=${indicator.params.half_life}`
         : indicator.indicator_type === "ATR"
           ? `Wilder ATR(${indicator.params.period})`
           : `${indicator.indicator_type}(${indicator.params.period})`;
@@ -1173,7 +1177,7 @@ function formatOverviewIndicator(value, indicator) {
     return "-";
   }
   const number = Number(value);
-  if (indicator.indicator_type === "RATR") {
+  if (["RATR", "WTME"].includes(indicator.indicator_type)) {
     return `${number >= 0 ? "+" : ""}${number.toFixed(2)}`;
   }
   return number.toLocaleString("en-US", {
@@ -1831,6 +1835,16 @@ async function createAndAddIndicator(event) {
 
   const indicatorType = customIndicatorType.value;
   const period = Number(customIndicatorPeriod.value);
+  const params = { period };
+  if (indicatorType === "WTME") {
+    params.half_life = Number(customIndicatorHalfLife.value);
+    params.epsilon = Number(customIndicatorEpsilon.value);
+  }
+  const displayName = indicatorType === "RATR"
+    ? `相对ATR${period}`
+    : indicatorType === "WTME"
+      ? `WTME${period}(h=${params.half_life})`
+      : `${indicatorType}${period}`;
   const response = await fetch(
     `/api/symbols/${encodeURIComponent(currentSymbol)}/chart-views/${encodeURIComponent(currentViewCode)}/indicators`,
     {
@@ -1838,8 +1852,8 @@ async function createAndAddIndicator(event) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         indicator_type: indicatorType,
-        params: { period },
-        name: indicatorType === "RATR" ? `相对ATR${period}` : `${indicatorType}${period}`,
+        params,
+        name: displayName,
       }),
     },
   );
@@ -1852,7 +1866,13 @@ async function createAndAddIndicator(event) {
   currentSymbolIndicators = payload.symbol_indicators;
   setChartIndicators(currentSymbolIndicators);
   await loadIndicatorCatalog();
-  setStatus(`已添加 ${indicatorType === "RATR" ? "相对ATR" : indicatorType}${period}。`, "success");
+  setStatus(`已添加 ${displayName}。`, "success");
+}
+
+function updateCustomIndicatorFields() {
+  const isWtme = customIndicatorType.value === "WTME";
+  customIndicatorHalfLife.hidden = !isWtme;
+  customIndicatorEpsilon.hidden = !isWtme;
 }
 
 async function handleIndicatorAction(event) {
@@ -2152,6 +2172,7 @@ favoriteIndicators.addEventListener("click", (event) => {
   }
 });
 customIndicatorForm.addEventListener("submit", createAndAddIndicator);
+customIndicatorType.addEventListener("change", updateCustomIndicatorFields);
 updateDataButton.addEventListener("click", updateCurrentMarketData);
 overviewSymbolToggle.addEventListener("click", toggleCurrentOverview);
 runAnalysisButton.addEventListener("click", runTrendlineAnalysis);
@@ -2213,6 +2234,7 @@ initBacktest();
 initRealtime();
 initChart();
 initTheme();
+updateCustomIndicatorFields();
 startHeartbeat();
 initializeOverviewIndicatorSelection();
 loadIndicatorCatalog().finally(() => loadMarketOverview());

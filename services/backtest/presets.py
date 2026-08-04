@@ -51,6 +51,7 @@ def _rule(
 def shipped_strategy_presets() -> list[tuple[str, dict]]:
     settings = default_backtest_settings()
     code_type = get_code_strategy("rapid_drop_atr_rotation")
+    wtme_type = get_code_strategy("rapid_drop_wtme_rotation")
     sevenstar_type = get_code_strategy("sevenstar_etf_rotation")
     values = [
         (
@@ -128,6 +129,22 @@ def shipped_strategy_presets() -> list[tuple[str, dict]]:
                 "definition": {
                     "symbols": deepcopy(code_type.default_symbols),
                     "params": code_type.validate_params({}),
+                },
+                "default_settings": settings,
+            },
+        ),
+        (
+            "builtin-rapid-drop-wtme-rotation-v1",
+            {
+                "name": "急跌回避与WTME动量轮动策略",
+                "description": wtme_type.description,
+                "design_mode": "code",
+                "selection_mode": "competition",
+                "code_key": wtme_type.key,
+                "code_version": wtme_type.version,
+                "definition": {
+                    "symbols": deepcopy(wtme_type.default_symbols),
+                    "params": wtme_type.validate_params({}),
                 },
                 "default_settings": settings,
             },
@@ -217,6 +234,20 @@ def ensure_shipped_strategy_presets() -> None:
                 code_key="rapid_drop_atr_rotation",
                 from_versions=("1.0.0", "1.1.0", "1.2.0"),
                 to_version=payload["code_version"],
+            )
+        if payload.get("code_key") == "rapid_drop_wtme_rotation":
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "rapid-drop-wtme-remove-atr-parameters-v1.1.0",
+                code_key="rapid_drop_wtme_rotation",
+                from_versions=("1.0.0",),
+                to_version=payload["code_version"],
+                removed_parameters=(
+                    "enable_atr_drop_filter",
+                    "drop_threshold_atr",
+                    "atr_period",
+                    "atr_weighting",
+                ),
             )
         backtest_repository.upgrade_seeded_strategy_settings_once(
             seed_key,

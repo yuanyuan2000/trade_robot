@@ -58,6 +58,21 @@ class BacktestRepositoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             backtest_repository.get_strategy(strategy["id"], include_deleted=True)
 
+    def test_builtin_code_strategy_cannot_be_deleted(self) -> None:
+        seed_key, payload = next(
+            item for item in shipped_strategy_presets()
+            if item[1]["design_mode"] == "code"
+        )
+        strategy = backtest_repository.seed_strategy_once(seed_key, payload)
+
+        with self.assertRaisesRegex(ValueError, "代码模式策略禁止删除"):
+            backtest_repository.delete_strategy(strategy["id"])
+
+        self.assertEqual(
+            backtest_repository.get_strategy(strategy["id"])["id"],
+            strategy["id"],
+        )
+
     def test_run_keeps_immutable_strategy_and_settings_snapshot(self) -> None:
         strategy = create_default_strategy(
             name="快照测试",
@@ -176,25 +191,42 @@ class BacktestRepositoryTests(unittest.TestCase):
             backtest_repository.get_strategy(seeded["id"])["revision"], 3
         )
 
-        deleted_legacy = deepcopy(legacy)
-        deleted_legacy["name"] = "七星已删除迁移测试"
-        deleted_seed_key = "test-deleted-sevenstar-v1"
-        deleted = backtest_repository.seed_strategy_once(
-            deleted_seed_key, deleted_legacy
+    def test_seeded_code_version_upgrade_can_remove_retired_parameters(self) -> None:
+        _, shipped = next(
+            item
+            for item in shipped_strategy_presets()
+            if item[0] == "builtin-rapid-drop-wtme-rotation-v1"
         )
-        backtest_repository.delete_strategy(deleted["id"])
-        self.assertIsNone(
-            backtest_repository.upgrade_seeded_strategy_code_version_once(
-                deleted_seed_key,
-                "test-effective-w2-r2-v1.0.1",
-                code_key="sevenstar_etf_rotation",
-                from_versions=("1.0.0",),
-                to_version="1.0.1",
-            )
+        legacy = deepcopy(shipped)
+        legacy["name"] = "WTME 参数迁移测试"
+        legacy["code_version"] = "1.0.0"
+        legacy["definition"]["params"].update({
+            "enable_atr_drop_filter": False,
+            "drop_threshold_atr": 2.0,
+            "atr_period": 5,
+            "atr_weighting": "wilder",
+        })
+        seed_key = "test-wtme-remove-atr-params"
+        backtest_repository.seed_strategy_once(seed_key, legacy)
+
+        upgraded = backtest_repository.upgrade_seeded_strategy_code_version_once(
+            seed_key,
+            "test-wtme-remove-atr-params-v1.1.0",
+            code_key="rapid_drop_wtme_rotation",
+            from_versions=("1.0.0",),
+            to_version="1.1.0",
+            removed_parameters=(
+                "enable_atr_drop_filter",
+                "drop_threshold_atr",
+                "atr_period",
+                "atr_weighting",
+            ),
         )
-        self.assertNotIn(
-            deleted_legacy["name"],
-            [item["name"] for item in backtest_repository.list_strategies()],
+
+        self.assertEqual(upgraded["code_version"], "1.1.0")
+        self.assertEqual(
+            upgraded["definition"]["params"],
+            shipped["definition"]["params"],
         )
 
     def test_output_round_trip_preserves_equity_trade_and_log(self) -> None:

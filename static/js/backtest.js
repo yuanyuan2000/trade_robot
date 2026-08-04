@@ -122,7 +122,9 @@ function renderBacktestStrategyList() {
         <td>
           <div class="backtest-row-actions">
             ${strategy.design_mode === "visual" ? '<button type="button" data-bt-action="duplicate">复制</button>' : ""}
-            <button type="button" data-bt-action="delete">删除</button>
+            ${strategy.design_mode === "code"
+              ? '<button type="button" disabled title="内置代码模式策略禁止删除">删除</button>'
+              : '<button type="button" data-bt-action="delete">删除</button>'}
           </div>
         </td>
       </tr>`;
