@@ -18,6 +18,7 @@ data/*.sqlite-*
 data/*.db
 data/*.db-*
 data/backups/
+data/.realtime-master.key
 
 # Generated market data and charts
 data/*.csv

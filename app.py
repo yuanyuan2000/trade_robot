@@ -40,6 +40,7 @@ from services.market_data_service import (
     update_full_market_data,
 )
 from services.intraday_bar_service import get_chart_bars
+from services.indicator_service import attach_overview_indicator_values
 from services.analysis_overview_service import (
     build_trendline_overview_summary,
     merge_analysis_overview,
@@ -62,6 +63,11 @@ from services.backtest.service import (
 )
 from services.backtest.presets import ensure_shipped_strategy_presets
 from services.backtest.export import build_run_xls
+from services.backtest.validation import validate_strategy_payload
+from database import realtime_repository
+from services.realtime_mail import bootstrap_env_qq_channel
+from services.realtime_mail import encrypt_secret, normalize_recipients, send_smtp
+from services.realtime_scheduler import run_manager as realtime_run_manager
 
 
 app = Flask(__name__)
@@ -96,10 +102,14 @@ analysis_overview_state = {
 
 
 class HeartbeatAccessLogFilter(logging.Filter):
-    """Keep high-frequency session heartbeats out of the terminal."""
+    """Keep high-frequency browser status polling out of the terminal."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return "/api/session/heartbeat" not in record.getMessage()
+        message = record.getMessage()
+        return (
+            "/api/session/heartbeat" not in message
+            and '"GET /api/realtime/tasks' not in message
+        )
 
 
 def now_utc() -> datetime:
@@ -573,7 +583,47 @@ def market_overview():
     try:
         page = int(request.args.get("page", "1"))
         page_size = int(request.args.get("page_size", "100"))
-        return jsonify({"ok": True, **repository.list_market_overview(page, page_size)})
+        raw_indicator_ids = request.args.get("indicator_ids", "")
+        requested_ids: list[int] = []
+        for raw_value in raw_indicator_ids.split(","):
+            if not raw_value.strip():
+                continue
+            indicator_id = int(raw_value)
+            if indicator_id not in requested_ids:
+                requested_ids.append(indicator_id)
+        if len(requested_ids) > 2:
+            raise ValueError("行情总览最多显示 2 个自定义指标。")
+
+        favorite_by_id = {
+            int(indicator["id"]): indicator
+            for indicator in repository.list_indicators(favorite=True)
+        }
+        selected_indicators = [
+            favorite_by_id[indicator_id]
+            for indicator_id in requested_ids
+            if indicator_id in favorite_by_id
+        ]
+        overview = repository.list_market_overview(page, page_size)
+        if selected_indicators:
+            daily_rows_by_symbol = {
+                item["symbol"]: repository.get_daily_prices(item["symbol"])
+                for item in overview["items"]
+            }
+            attach_overview_indicator_values(
+                overview,
+                selected_indicators,
+                daily_rows_by_symbol,
+            )
+        else:
+            overview["selected_indicators"] = []
+            for item in overview["items"]:
+                item["indicator_values"] = {}
+        return jsonify({"ok": True, **overview})
+    except ValueError as exc:
+        return jsonify({
+            "ok": False,
+            "error": {"code": "INVALID_INDICATOR", "message": str(exc)},
+        }), 400
     except Exception as exc:
         app.logger.exception("Unexpected market overview error")
         return (
@@ -1432,6 +1482,235 @@ def backtest_run_events(run_id: int):
     )
 
 
+def _realtime_task_payload(payload: dict, *, current: dict | None = None) -> tuple[dict, dict, dict]:
+    current = current or {}
+    strategy_id = payload.get("strategy_id", current.get("strategy_id"))
+    if strategy_id is None:
+        raise ValueError("必须选择一个历史回测策略。")
+    strategy = backtest_repository.get_strategy(int(strategy_id))
+    strategy_snapshot = payload.get("strategy_snapshot", current.get("strategy_snapshot", strategy))
+    validate_strategy_payload(strategy_snapshot)
+    settings = {**strategy.get("default_settings", {}), **(current.get("settings") or {}), **(payload.get("settings") or {})}
+    notification = {**(current.get("notification_settings") or {}), **(payload.get("notification_settings") or {})}
+    notification.setdefault("enabled", False)
+    if notification.get("enabled"):
+        if not notification.get("channel_id"):
+            raise ValueError("启用邮件通知时必须选择邮件通道。")
+        normalize_recipients(notification.get("recipients"))
+        if strategy.get("design_mode") != "code" and not str(notification.get("body_template") or "").strip():
+            raise ValueError("非代码策略启用邮件时必须填写信息内容模板。")
+    portfolio = {**(current.get("portfolio_state") or {}), **(payload.get("portfolio_state") or {})}
+    portfolio.setdefault("cash", float(settings.get("initial_capital", 100000)))
+    portfolio.setdefault("positions", {})
+    return strategy, settings, {"notification": notification, "portfolio": portfolio}
+
+
+@app.route("/api/realtime/tasks")
+def realtime_tasks():
+    try:
+        tasks = realtime_repository.list_tasks()
+        for task in tasks:
+            runs = realtime_repository.list_runs(task["id"], limit=1)
+            task["latest_run"] = runs[0] if runs else None
+        return jsonify({"ok": True, "tasks": tasks})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks", methods=["POST"])
+def create_realtime_task():
+    payload = request.get_json(silent=True) or {}
+    try:
+        strategy, settings, extras = _realtime_task_payload(payload)
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            existing = {item["name"] for item in realtime_repository.list_tasks()}
+            index = 1
+            base = strategy["name"]
+            name = f"{base} #{index}"
+            while name in existing:
+                index += 1
+                name = f"{base} #{index}"
+        task = realtime_repository.create_task(
+            name=name,
+            strategy=strategy,
+            follow_strategy=bool(payload.get("follow_strategy", True)),
+            settings=settings,
+            notification_settings=extras["notification"],
+            portfolio_state=extras["portfolio"],
+        )
+        return jsonify({"ok": True, "task": task}), 201
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>")
+def get_realtime_task(task_id: int):
+    try:
+        task = realtime_run_manager.status(task_id)
+        task["runs"] = realtime_repository.list_runs(task_id, limit=20)
+        task["events"] = realtime_repository.list_events(task_id, limit=50)
+        task["notifications"] = realtime_repository.list_notifications(task_id, limit=50)
+        return jsonify({"ok": True, "task": task})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>", methods=["PATCH"])
+def patch_realtime_task(task_id: int):
+    payload = request.get_json(silent=True) or {}
+    try:
+        current = realtime_repository.get_task(task_id)
+        strategy, settings, extras = _realtime_task_payload(payload, current=current)
+        follow = bool(payload.get("follow_strategy", current["follow_strategy"]))
+        snapshot = current["strategy_snapshot"]
+        if not follow and "strategy_snapshot" in payload:
+            snapshot = payload["strategy_snapshot"]
+        elif follow and current["follow_strategy"]:
+            snapshot = current["strategy_snapshot"]
+        elif follow:
+            snapshot = strategy
+        task = realtime_repository.update_task(
+            task_id,
+            name=str(payload["name"]).strip() if "name" in payload else None,
+            strategy_snapshot=snapshot,
+            source_strategy_revision=int(snapshot["revision"]),
+            source_code_version=snapshot.get("code_version"),
+            follow_strategy=follow,
+            settings=settings,
+            notification_settings=extras["notification"],
+            portfolio_state=extras["portfolio"],
+            expected_revision=payload.get("revision"),
+        )
+        return jsonify({"ok": True, "task": task})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>", methods=["DELETE"])
+def delete_realtime_task(task_id: int):
+    try:
+        if (request.get_json(silent=True) or {}).get("confirm") is not True:
+            raise ValueError("必须明确确认删除实时决策任务。")
+        return jsonify({"ok": True, "task": realtime_repository.soft_delete_task(task_id)})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>/start", methods=["POST"])
+def start_realtime_task(task_id: int):
+    try:
+        return jsonify({"ok": True, "task": realtime_run_manager.start(task_id)}), 202
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>/stop", methods=["POST"])
+def stop_realtime_task(task_id: int):
+    try:
+        return jsonify({"ok": True, "task": realtime_run_manager.stop(task_id)})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>/validate", methods=["POST"])
+def validate_realtime_task(task_id: int):
+    try:
+        task = realtime_repository.get_task(task_id)
+        strategy = validate_strategy_payload(task["strategy_snapshot"])
+        return jsonify({"ok": True, "events": _events_for_realtime_strategy(strategy), "strategy_revision": strategy["revision"]})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+def _events_for_realtime_strategy(strategy: dict) -> list[str]:
+    from services.realtime_scheduler import _events_for_strategy
+    return _events_for_strategy(strategy)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>/events")
+def realtime_task_events(task_id: int):
+    try:
+        realtime_repository.get_task(task_id)
+        after = max(0, int(request.args.get("after", "0")))
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+    @stream_with_context
+    def stream():
+        cursor = after
+        while True:
+            task = realtime_run_manager.status(task_id)
+            events = [item for item in realtime_repository.list_events(task_id, limit=500) if int(item["id"]) > cursor]
+            if events:
+                cursor = max(int(item["id"]) for item in events)
+            yield "event: update\ndata: " + json.dumps({"task": task, "events": events}, ensure_ascii=False, allow_nan=False) + "\n\n"
+            if task["runtime_state"] in {"stopped", "error"}:
+                break
+            time.sleep(1.0)
+
+    return Response(stream(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/realtime/email-channels")
+def realtime_email_channels():
+    try:
+        with __import__("database.db", fromlist=["get_connection"]).get_connection() as conn:
+            rows = conn.execute("SELECT id FROM email_channels ORDER BY id").fetchall()
+        return jsonify({"ok": True, "channels": [realtime_repository.get_email_channel(row["id"]) for row in rows]})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/email-channels", methods=["POST"])
+def create_realtime_email_channel():
+    payload = request.get_json(silent=True) or {}
+    try:
+        secret = str(payload.pop("secret", "")).strip()
+        if not secret:
+            raise ValueError("必须填写邮箱授权码。")
+        sender = str(payload.get("sender_email") or payload.get("username") or "").strip()
+        if not sender:
+            raise ValueError("必须填写发件邮箱。")
+        if payload.get("provider") in {"gmail_smtp", "qq_smtp"}:
+            defaults = {
+                "gmail_smtp": {"smtp_host": "smtp.gmail.com", "smtp_port": 465, "security_mode": "ssl"},
+                "qq_smtp": {"smtp_host": "smtp.qq.com", "smtp_port": 465, "security_mode": "ssl"},
+            }[payload["provider"]]
+            for key, value in defaults.items():
+                payload.setdefault(key, value)
+        channel = realtime_repository.create_email_channel(payload, secret_ciphertext=encrypt_secret(secret))
+        return jsonify({"ok": True, "channel": channel}), 201
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/email-channels/<int:channel_id>", methods=["PATCH"])
+def patch_realtime_email_channel(channel_id: int):
+    payload = request.get_json(silent=True) or {}
+    try:
+        secret_value = payload.pop("secret", None)
+        secret_ciphertext = encrypt_secret(str(secret_value).strip()) if secret_value else None
+        return jsonify({"ok": True, "channel": realtime_repository.update_email_channel(channel_id, payload, secret_ciphertext=secret_ciphertext)})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/email-channels/<int:channel_id>/test", methods=["POST"])
+def test_realtime_email_channel(channel_id: int):
+    payload = request.get_json(silent=True) or {}
+    try:
+        channel = realtime_repository.get_email_channel(channel_id)
+        recipient = str(payload.get("recipient") or channel["sender_email"] or "").strip()
+        normalize_recipients([recipient])
+        send_smtp(channel_id, recipient=recipient, subject="交易分析决策系统测试邮件", body="邮件通道测试成功。")
+        realtime_repository.mark_email_channel_test(channel_id, ok=True)
+        return jsonify({"ok": True, "message": "测试邮件已提交。"})
+    except Exception as exc:
+        realtime_repository.mark_email_channel_test(channel_id, ok=False, error=str(exc))
+        return backtest_error_response(exc)
+
+
 @app.route("/api/db/tables")
 def db_tables():
     return jsonify({"ok": True, "tables": repository.list_tables()})
@@ -1657,7 +1936,7 @@ def shutdown_if_inactive() -> None:
             and last_heartbeat_at is not None
             and now_utc() - last_heartbeat_at > timedelta(seconds=3)
         )
-    if should_shutdown and not backtest_run_manager.has_active_runs():
+    if should_shutdown and not backtest_run_manager.has_active_runs() and not realtime_run_manager.has_active_tasks():
         os._exit(0)
 
 
@@ -1672,6 +1951,7 @@ def shutdown_process() -> None:
 
 def terminate_child_processes() -> None:
     backtest_run_manager.shutdown()
+    realtime_run_manager.shutdown()
     terminate_analysis_process_executor()
     children = multiprocessing.active_children()
     for process in children:
@@ -1755,7 +2035,9 @@ def main() -> None:
     init_database()
     init_intraday_database()
     ensure_shipped_strategy_presets()
+    bootstrap_env_qq_channel()
     backtest_run_manager.recover_interrupted_runs()
+    realtime_run_manager.start_services()
     configure_access_logging()
     start_overview_sync()
     if AUTO_OPEN_BROWSER:

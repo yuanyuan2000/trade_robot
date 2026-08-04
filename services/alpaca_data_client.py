@@ -476,3 +476,58 @@ def fetch_stock_bars(
         },
         "rate_limit": rate_limit,
     }
+
+
+def fetch_latest_stock_bars(
+    symbols: list[str] | tuple[str, ...],
+    *,
+    feed: str = "iex",
+    timeframe: str = "1Min",
+) -> dict[str, dict]:
+    """Fetch the latest bar for several symbols using one IEX request.
+
+    This endpoint is intentionally separate from the delayed historical import:
+    realtime tasks must make the selected feed and timestamp explicit.
+    """
+    if not ALPACA_API_KEY or not ALPACA_SECRET:
+        raise MissingAlpacaCredentialsError()
+    normalized_symbols = sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()})
+    if not normalized_symbols:
+        raise ValueError("At least one symbol is required")
+    normalized_timeframe = _normalize_timeframe(timeframe)
+    normalized_feed = feed.strip().lower()
+    if normalized_feed not in {"iex", "sip"}:
+        raise ValueError("feed must be either iex or sip")
+    payload, rate_limit = _request_bars_page(
+        {
+            "symbols": ",".join(normalized_symbols),
+            "feed": normalized_feed,
+            "timeframe": normalized_timeframe,
+        },
+        url=f"{ALPACA_DATA_BASE_URL}/stocks/bars/latest",
+    )
+    raw = payload.get("bars")
+    if not isinstance(raw, dict):
+        raise InvalidResponseError(detail="Alpaca latest bars response is missing bars.")
+    result: dict[str, dict] = {}
+    for symbol, values in raw.items():
+        if not isinstance(values, dict):
+            continue
+        try:
+            result[str(symbol).upper()] = {
+                "timestamp": str(values["t"]),
+                "open": float(values["o"]),
+                "high": float(values["h"]),
+                "low": float(values["l"]),
+                "close": float(values["c"]),
+                "volume": float(values.get("v") or 0),
+                "trade_count": int(values["n"]) if values.get("n") is not None else None,
+                "vwap": float(values["vw"]) if values.get("vw") is not None else None,
+                "source": "alpaca",
+                "feed": normalized_feed,
+                "timeframe": normalized_timeframe,
+                "rate_limit": rate_limit,
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DataParseError(detail=f"Invalid Alpaca latest bar: {exc}") from exc
+    return result

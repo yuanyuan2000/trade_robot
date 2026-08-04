@@ -347,8 +347,30 @@ function drawChart() {
   ctx.fillStyle = theme.background;
   ctx.fillRect(0, 0, width, height);
 
-  const plot = getPlotArea();
+  const fullPlot = getPlotArea();
+  const oscillatorSeries = getVisibleOscillatorSeries();
+  const oscillatorHeight = oscillatorSeries.length
+    ? Math.max(100, Math.min(150, fullPlot.height * 0.28))
+    : 0;
+  const oscillatorGap = oscillatorSeries.length ? 16 : 0;
+  const plot = oscillatorSeries.length
+    ? {
+        ...fullPlot,
+        bottom: fullPlot.bottom - oscillatorHeight - oscillatorGap,
+        height: fullPlot.height - oscillatorHeight - oscillatorGap,
+      }
+    : fullPlot;
+  const oscillatorPlot = oscillatorSeries.length
+    ? {
+        ...fullPlot,
+        top: plot.bottom + oscillatorGap,
+        height: oscillatorHeight,
+      }
+    : null;
   drawGrid(ctx, plot, theme);
+  if (oscillatorPlot) {
+    drawGrid(ctx, oscillatorPlot, theme);
+  }
 
   if (!chartState.candles.length) {
     drawEmptyState(ctx, width, height);
@@ -358,11 +380,14 @@ function drawChart() {
   const visible = getVisibleCandles();
   const priceRange = getPriceRange(visible);
   drawValueAxes(ctx, plot, visible, priceRange, theme);
-  drawTimeAxis(ctx, plot, visible, theme);
+  drawTimeAxis(ctx, oscillatorPlot || plot, visible, theme);
   drawCandleSeries(ctx, plot, visible, priceRange, theme);
   drawIndicators(ctx, plot, priceRange);
+  if (oscillatorPlot) {
+    drawOscillatorIndicators(ctx, oscillatorPlot, oscillatorSeries, theme);
+  }
   drawTrendlines(ctx, plot, priceRange, theme);
-  drawCrosshair(ctx, plot, visible, priceRange, theme);
+  drawCrosshair(ctx, plot, visible, priceRange, theme, oscillatorPlot || plot);
   renderIndicatorLegend();
   updateTrendlineLegendPlacement();
 }
@@ -474,8 +499,11 @@ function drawTimeAxis(ctx, plot, visible, theme) {
   }
 }
 
-function drawCrosshair(ctx, plot, visible, priceRange, theme) {
+function drawCrosshair(ctx, plot, visible, priceRange, theme, timeAxisPlot = plot) {
   if (chartState.hoverX === null || chartState.hoverY === null) {
+    return;
+  }
+  if (chartState.hoverY < plot.top || chartState.hoverY > plot.bottom) {
     return;
   }
 
@@ -499,10 +527,20 @@ function drawCrosshair(ctx, plot, visible, priceRange, theme) {
   drawLine(ctx, plot.left, y, plot.right, y);
   ctx.setLineDash([]);
 
-  drawCrosshairAxisLabels(ctx, plot, visible, theme, x, y, price, candle);
+  drawCrosshairAxisLabels(
+    ctx,
+    plot,
+    visible,
+    theme,
+    x,
+    y,
+    price,
+    candle,
+    timeAxisPlot.bottom,
+  );
 }
 
-function drawCrosshairAxisLabels(ctx, plot, visible, theme, x, y, price, candle) {
+function drawCrosshairAxisLabels(ctx, plot, visible, theme, x, y, price, candle, timeAxisBottom) {
   const basePrice = visible[0]?.open || 0;
   const percent = basePrice ? (price / basePrice - 1) * 100 : 0;
   const priceText = formatPrice(price);
@@ -539,7 +577,7 @@ function drawCrosshairAxisLabels(ctx, plot, visible, theme, x, y, price, candle)
       plot.left,
       plot.right - dateWidth,
     );
-    const dateY = plot.bottom + 6;
+    const dateY = timeAxisBottom + 6;
     ctx.fillStyle = theme.background;
     ctx.strokeStyle = theme.crosshair;
     ctx.fillRect(dateX, dateY, dateWidth, labelHeight);
@@ -568,7 +606,7 @@ function crosshairDateText(candle) {
 function drawIndicators(ctx, plot, priceRange) {
   const slot = plot.width / chartState.visibleCount;
   for (const series of chartState.indicatorSeries) {
-    if (!series.visible) {
+    if (!series.visible || isOscillatorIndicator(series)) {
       continue;
     }
 
@@ -595,6 +633,115 @@ function drawIndicators(ctx, plot, priceRange) {
       }
     }
     ctx.stroke();
+  }
+}
+
+function isOscillatorIndicator(series) {
+  return series.indicator_type === "ATR" || series.indicator_type === "RATR";
+}
+
+function getVisibleOscillatorSeries() {
+  return chartState.indicatorSeries.filter((series) => (
+    series.visible && isOscillatorIndicator(series)
+  ));
+}
+
+function drawOscillatorIndicators(ctx, plot, seriesList, theme) {
+  const slot = plot.width / chartState.visibleCount;
+  const ranges = {
+    ATR: getIndicatorRange(seriesList, "ATR"),
+    RATR: getIndicatorRange(seriesList, "RATR", true),
+  };
+
+  for (const series of seriesList) {
+    const range = ranges[series.indicator_type];
+    if (!range) continue;
+    ctx.strokeStyle = series.color;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    let drawing = false;
+    for (let dataIndex = chartState.firstVisible; dataIndex < chartState.firstVisible + chartState.visibleCount; dataIndex += 1) {
+      const value = series.values[dataIndex];
+      if (!Number.isFinite(value) || dataIndex >= chartState.candles.length) {
+        drawing = false;
+        continue;
+      }
+      const visibleIndex = dataIndex - chartState.firstVisible;
+      const x = plot.left + slot * (visibleIndex + 0.5);
+      const y = priceToY(value, plot, range);
+      if (!drawing) {
+        ctx.moveTo(x, y);
+        drawing = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+  }
+
+  if (ranges.RATR && ranges.RATR.min < 0 && ranges.RATR.max > 0) {
+    ctx.save();
+    ctx.strokeStyle = theme.axis;
+    ctx.setLineDash([3, 3]);
+    const zeroY = priceToY(0, plot, ranges.RATR);
+    drawLine(ctx, plot.left, zeroY, plot.right, zeroY);
+    ctx.restore();
+  }
+  drawOscillatorAxes(ctx, plot, ranges, theme);
+}
+
+function getIndicatorRange(seriesList, indicatorType, includeZero = false) {
+  const values = [];
+  for (const series of seriesList) {
+    if (series.indicator_type !== indicatorType) continue;
+    for (let index = chartState.firstVisible; index < chartState.firstVisible + chartState.visibleCount; index += 1) {
+      if (Number.isFinite(series.values[index])) values.push(series.values[index]);
+    }
+  }
+  if (!values.length) return null;
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (includeZero) {
+    min = Math.min(min, 0);
+    max = Math.max(max, 0);
+  }
+  if (min === max) {
+    const padding = Math.max(Math.abs(min) * 0.1, 1);
+    min -= padding;
+    max += padding;
+  } else {
+    const padding = (max - min) * 0.08;
+    min -= padding;
+    max += padding;
+  }
+  return { min, max };
+}
+
+function drawOscillatorAxes(ctx, plot, ranges, theme) {
+  ctx.fillStyle = theme.label;
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+  for (let index = 0; index <= 2; index += 1) {
+    const y = plot.top + (plot.height * index) / 2;
+    if (ranges.ATR) {
+      const value = ranges.ATR.max - (ranges.ATR.max - ranges.ATR.min) * (index / 2);
+      ctx.textAlign = "right";
+      ctx.fillText(formatPrice(value), plot.left - 10, y);
+    }
+    if (ranges.RATR) {
+      const value = ranges.RATR.max - (ranges.RATR.max - ranges.RATR.min) * (index / 2);
+      ctx.textAlign = "left";
+      ctx.fillText(value.toFixed(2), plot.right + 10, y);
+    }
+  }
+  ctx.textBaseline = "top";
+  if (ranges.ATR) {
+    ctx.textAlign = "left";
+    ctx.fillText("ATR", plot.left + 6, plot.top + 4);
+  }
+  if (ranges.RATR) {
+    ctx.textAlign = "right";
+    ctx.fillText("相对 ATR", plot.right - 6, plot.top + 4);
   }
 }
 
@@ -1134,7 +1281,48 @@ function calculateIndicatorValues(candles, indicator) {
   if (indicator.indicator_type === "EMA") {
     return calculateEMA(candles, period);
   }
+  if (indicator.indicator_type === "ATR") {
+    return calculateWilderATR(candles, period);
+  }
+  if (indicator.indicator_type === "RATR") {
+    return calculateRelativeATR(candles, period);
+  }
   return candles.map(() => null);
+}
+
+function calculateWilderATR(candles, period) {
+  const values = candles.map(() => null);
+  const trueRanges = [];
+  for (let index = 1; index < candles.length; index += 1) {
+    const current = candles[index];
+    const previousClose = candles[index - 1].close;
+    trueRanges.push(Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previousClose),
+      Math.abs(current.low - previousClose),
+    ));
+  }
+  if (trueRanges.length < period) return values;
+
+  let atr = trueRanges.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
+  values[period] = atr;
+  for (let rowIndex = period + 1; rowIndex < candles.length; rowIndex += 1) {
+    atr = (atr * (period - 1) + trueRanges[rowIndex - 1]) / period;
+    values[rowIndex] = atr;
+  }
+  return values;
+}
+
+function calculateRelativeATR(candles, period) {
+  const values = candles.map(() => null);
+  const atrValues = calculateWilderATR(candles, period);
+  for (let index = period + 1; index < candles.length; index += 1) {
+    const atr = atrValues[index - 1];
+    if (atr !== null && atr > 0) {
+      values[index] = (candles[index].close - candles[index - period].close) / atr;
+    }
+  }
+  return values;
 }
 
 function calculateMA(candles, period) {
@@ -1224,7 +1412,7 @@ function getPriceRange(candles) {
   const highs = candles.map((candle) => candle.high);
   const visibleIndicatorValues = [];
   for (const series of chartState.indicatorSeries) {
-    if (!series.visible) {
+    if (!series.visible || isOscillatorIndicator(series)) {
       continue;
     }
     for (let index = chartState.firstVisible; index < chartState.firstVisible + chartState.visibleCount; index += 1) {

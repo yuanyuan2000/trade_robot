@@ -27,6 +27,18 @@ ANALYSIS_MAX_WORKERS = max(
     1,
     min(4, int(os.getenv("ANALYSIS_MAX_WORKERS", "4"))),
 )
+REALTIME_MAX_WORKERS = max(
+    1,
+    min(8, int(os.getenv("REALTIME_MAX_WORKERS", "4"))),
+)
+REALTIME_EVENT_GRACE_SECONDS = max(
+    10,
+    int(os.getenv("REALTIME_EVENT_GRACE_SECONDS", "60")),
+)
+REALTIME_RECOVERY_STALE_SECONDS = max(
+    60,
+    int(os.getenv("REALTIME_RECOVERY_STALE_SECONDS", "300")),
+)
 
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com/time_series"

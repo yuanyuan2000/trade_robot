@@ -245,7 +245,6 @@ def get_market_data(
             "source": source,
             "warning": f"没有可展示的 {FULL_HISTORY_START_DATE} 以来行情数据。",
             "symbol_settings": repository.get_symbol(normalized),
-            "intraday_sync": intraday_repository.get_sync_state(normalized),
             "data": [],
             "start_date": start_date.isoformat(),
         }
@@ -269,7 +268,6 @@ def get_market_data(
         "source": source,
         "warning": adjusted["warning"],
         "symbol_settings": settings,
-        "intraday_sync": intraday_repository.get_sync_state(normalized),
         "data": adjusted["rows"],
         "adjustment": adjusted["adjustment"],
         "corporate_actions": adjusted["actions"],
@@ -315,9 +313,12 @@ def update_full_market_data(
         )
         capability = {"alpaca_supported": False}
 
-    sync_state = intraday_repository.get_sync_state(normalized)
-    intraday_ready = _has_initialized_intraday_history(normalized, sync_state)
     if capability.get("alpaca_supported") and initialize_intraday:
+        # Daily-only updates must not open (or wait for the write lock of) the
+        # large minute database. Minute coverage is relevant only when the
+        # caller explicitly requests an intraday update.
+        sync_state = intraday_repository.get_sync_state(normalized)
+        intraday_ready = _has_initialized_intraday_history(normalized, sync_state)
         if intraday_ready:
             start_value = _intraday_incremental_start(
                 sync_state["latest_complete_minute_at"]
@@ -485,7 +486,6 @@ def update_full_market_data(
             else None
         ),
         "symbol_settings": settings,
-        "intraday_sync": intraday_repository.get_sync_state(normalized),
         "data": adjusted["rows"],
         "adjustment": adjusted["adjustment"],
         "corporate_actions": adjusted["actions"],

@@ -352,6 +352,16 @@ def update_strategy(
 def delete_strategy(strategy_id: int) -> dict:
     current = get_strategy(strategy_id)
     with get_connection() as conn:
+        live_task = conn.execute(
+            """
+            SELECT id FROM realtime_decision_tasks
+            WHERE strategy_id = ? AND deleted_at IS NULL
+            LIMIT 1
+            """,
+            (int(strategy_id),),
+        ).fetchone()
+        if live_task:
+            raise ValueError("该策略仍被实时决策任务引用，请先停止并删除任务。")
         conn.execute(
             "UPDATE backtest_runs SET strategy_id = NULL WHERE strategy_id = ?",
             (int(strategy_id),),

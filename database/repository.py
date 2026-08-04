@@ -866,9 +866,11 @@ def list_symbol_chart_views(symbol: str) -> list[dict]:
 
 def seed_default_indicators() -> None:
     defaults = [
-        {"code": "EMA8", "name": "EMA8", "indicator_type": "EMA", "params": {"period": 8}},
-        {"code": "EMA13", "name": "EMA13", "indicator_type": "EMA", "params": {"period": 13}},
-        {"code": "MA20", "name": "MA20", "indicator_type": "MA", "params": {"period": 20}},
+        {"code": "EMA8", "name": "EMA8", "indicator_type": "EMA", "params": {"period": 8}, "description": "指数移动平均"},
+        {"code": "EMA13", "name": "EMA13", "indicator_type": "EMA", "params": {"period": 13}, "description": "指数移动平均"},
+        {"code": "MA20", "name": "MA20", "indicator_type": "MA", "params": {"period": 20}, "description": "简单移动平均"},
+        {"code": "ATR14", "name": "ATR14", "indicator_type": "ATR", "params": {"period": 14}, "description": "Wilder 绝对 ATR"},
+        {"code": "RATR14", "name": "相对ATR14", "indicator_type": "RATR", "params": {"period": 14}, "description": "(当前收盘价 - 14 个交易日前收盘价) / 前一日 Wilder ATR(14)"},
     ]
     now = utc_now_iso()
     with get_connection() as conn:
@@ -887,7 +889,7 @@ def seed_default_indicators() -> None:
                     item["name"],
                     item["indicator_type"],
                     normalize_params(item["params"]),
-                    "系统内置常用指标",
+                    item["description"],
                     now,
                     now,
                 ),
@@ -896,8 +898,8 @@ def seed_default_indicators() -> None:
 
 def validate_indicator(indicator_type: str, params: dict) -> tuple[str, dict]:
     normalized_type = indicator_type.strip().upper()
-    if normalized_type not in {"MA", "EMA"}:
-        raise ValueError("仅支持 MA 和 EMA 指标。")
+    if normalized_type not in {"MA", "EMA", "ATR", "RATR"}:
+        raise ValueError("仅支持 MA、EMA、ATR 和相对 ATR 指标。")
 
     try:
         period = int(params.get("period"))
@@ -955,8 +957,12 @@ def get_indicator(indicator_id: int) -> dict:
 def get_or_create_indicator(indicator_type: str, params: dict, name: str | None = None) -> dict:
     normalized_type, normalized_params = validate_indicator(indicator_type, params)
     params_json = normalize_params(normalized_params)
-    default_name = f"{normalized_type}{normalized_params['period']}"
-    code = default_name.upper()
+    default_name = (
+        f"相对ATR{normalized_params['period']}"
+        if normalized_type == "RATR"
+        else f"{normalized_type}{normalized_params['period']}"
+    )
+    code = f"{normalized_type}{normalized_params['period']}"
     now = utc_now_iso()
 
     with get_connection() as conn:
@@ -982,7 +988,13 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
                 name or default_name,
                 normalized_type,
                 params_json,
-                "用户创建指标",
+                (
+                    "Wilder 绝对 ATR"
+                    if normalized_type == "ATR"
+                    else "相对 ATR 动量评分（当前价差 / 前一日 Wilder ATR）"
+                    if normalized_type == "RATR"
+                    else "用户创建指标"
+                ),
                 now,
                 now,
             ),

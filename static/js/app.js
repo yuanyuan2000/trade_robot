@@ -17,6 +17,11 @@ const overviewPageText = document.getElementById("overview-page-text");
 const overviewLiveToggle = document.getElementById("overview-live-toggle");
 const overviewLiveLabel = document.getElementById("overview-live-label");
 const overviewLiveControl = document.getElementById("overview-live-control");
+const overviewIndicatorControls = document.getElementById("overview-indicator-controls");
+const overviewIndicatorSelects = [
+  document.getElementById("overview-indicator-1"),
+  document.getElementById("overview-indicator-2"),
+];
 const analysisRefreshAll = document.getElementById("analysis-refresh-all");
 const overviewTitle = document.getElementById("overview-title");
 const analysisOverviewProgress = document.getElementById("analysis-overview-progress");
@@ -56,6 +61,8 @@ let currentViewCode = "1D";
 let currentWorkspaceMode = "market";
 let currentSymbolIndicators = [];
 let indicatorCatalog = [];
+let overviewIndicatorIds = ["", ""];
+let overviewSelectedIndicators = [];
 let currentRawMarketData = [];
 let currentSymbolSettings = { show_weekend_data: true };
 let currentIntradaySync = { status: "not_initialized", row_count: 0 };
@@ -73,12 +80,14 @@ let overviewLiveTimer;
 let overviewLiveRefreshInFlight = false;
 let marketOverviewAutoUpdate = false;
 let marketLoadRequestId = 0;
+let marketOverviewFetchId = 0;
 let analysisOverviewStatusTimer;
 let analysisOverviewLoadInFlight;
 let lastAnalysisRefreshState = {};
 let analysisIndicatorLegendVisible = false;
 let overviewLoadInFlight;
 const overviewLiveRefreshMs = 5 * 60 * 1000;
+const overviewIndicatorStorageKey = "trade-overview-indicator-columns";
 
 function applyTheme(theme) {
   const nextTheme = theme === "light" ? "light" : "dark";
@@ -117,6 +126,7 @@ function applyWorkspaceMode(mode) {
   overviewLiveLabel.textContent = "自动更新";
   overviewLiveToggle.checked = marketOverviewAutoUpdate;
   overviewLiveControl.hidden = isAnalysis;
+  overviewIndicatorControls.hidden = isAnalysis;
   analysisRefreshAll.hidden = !isAnalysis;
   overviewLiveControl.title = "每5分钟刷新总览最新价格";
   analysisOverviewProgress.hidden = !isAnalysis;
@@ -240,40 +250,57 @@ async function loadMarketData(symbol, { includeIntraday = false } = {}) {
   );
 
   try {
-    const response = await fetch("/api/market-data/update", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    let payload;
+    if (includeIntraday) {
+      const response = await fetch("/api/market-data/update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: normalized,
+          include_intraday: true,
+          background: true,
+          query_only: true,
+        }),
+      });
+      const started = await parseJsonResponse(response);
+      if (requestId !== marketLoadRequestId) return;
+      if (!started.ok) {
+        const error = started.error || {};
+        setStatus(error.message || "行情数据加载失败。", "error");
+        chartSource.textContent = error.code || "加载失败";
+        renderCandles([]);
+        return;
+      }
+      renderMarketUpdateProgress(started.job);
+      payload = await waitForMarketDataUpdate(started.job.id, {
+        shouldRender: () => requestId === marketLoadRequestId,
+      });
+    } else {
+      // The default 1D view is a direct main-database read. Do not create a
+      // background minute job or wait for minute-database state/locks here.
+      const params = new URLSearchParams({
         symbol: normalized,
-        include_intraday: includeIntraday,
-        background: true,
-        query_only: true,
-      }),
-    });
-    const started = await parseJsonResponse(response);
-    if (requestId !== marketLoadRequestId) return;
-    if (!started.ok) {
-      const error = started.error || {};
-      setStatus(error.message || "行情数据加载失败。", "error");
-      chartSource.textContent = error.code || "加载失败";
-      renderCandles([]);
-      return;
+        adjustment: priceAdjustmentMode.value,
+      });
+      payload = await parseJsonResponse(await fetch(`/api/market-data?${params}`));
+      if (!payload.ok) {
+        const error = payload.error || {};
+        setStatus(error.message || "行情数据加载失败。", "error");
+        chartSource.textContent = error.code || "加载失败";
+        renderCandles([]);
+        return;
+      }
     }
-    renderMarketUpdateProgress(started.job);
-    const payload = await waitForMarketDataUpdate(started.job.id, {
-      shouldRender: () => requestId === marketLoadRequestId,
-    });
     if (requestId !== marketLoadRequestId) return;
 
     currentRawMarketData = payload.data;
     currentSymbolSettings = payload.symbol_settings || { show_weekend_data: true };
-    currentIntradaySync = payload.intraday_sync || {
-      status: "not_initialized",
-      row_count: 0,
-    };
+    currentIntradaySync = payload.intraday_sync || currentIntradaySync;
     currentCorporateActions = payload.corporate_actions || [];
     renderCorporateActionEvents();
-    includeIntradayData.checked = Number(currentIntradaySync.row_count || 0) > 0;
+    if (payload.intraday_sync) {
+      includeIntradayData.checked = Number(currentIntradaySync.row_count || 0) > 0;
+    }
     currentSymbol = payload.canonical_symbol || payload.symbol || normalized;
     symbolInput.value = payload.symbol || normalized;
     showWeekendData.checked = Boolean(currentSymbolSettings.show_weekend_data);
@@ -310,17 +337,32 @@ async function loadMarketData(symbol, { includeIntraday = false } = {}) {
 
 async function loadMarketOverview(page = overviewPage) {
   if (overviewLoadInFlight) {
-    return overviewLoadInFlight;
+    if (currentWorkspaceMode === "market") {
+      renderCachedMarketOverview();
+    }
+    await overviewLoadInFlight;
+    if (currentWorkspaceMode === "market") {
+      renderCachedMarketOverview();
+    }
+    return;
   }
-  overviewLoadInFlight = loadMarketOverviewInner(page).finally(() => {
-    overviewLoadInFlight = null;
-  });
-  return overviewLoadInFlight;
+  const request = loadMarketOverviewInner(page);
+  overviewLoadInFlight = request;
+  try {
+    await request;
+  } finally {
+    if (overviewLoadInFlight === request) {
+      overviewLoadInFlight = null;
+    }
+    if (currentWorkspaceMode === "market") {
+      renderCachedMarketOverview();
+    }
+  }
 }
 
 async function loadMarketOverviewInner(page = overviewPage) {
   overviewPage = page;
-  if (currentWorkspaceMode === "market") {
+  if (isMarketOverviewActive()) {
     showMarketOverview();
     overviewSummary.textContent = "加载中";
     setStatus("正在加载行情总览...", "neutral");
@@ -335,16 +377,16 @@ async function loadMarketOverviewInner(page = overviewPage) {
         await fetchAndRenderMarketOverview({ silent: true });
       } catch (error) {
         syncFailed = true;
-        if (currentWorkspaceMode === "market") {
+        if (isMarketOverviewActive()) {
           setStatus(error.message || "行情总览更新失败，已保留本地数据。", "warning");
         }
       }
     }
-    if (!syncFailed && currentWorkspaceMode === "market") {
+    if (!syncFailed && isMarketOverviewActive()) {
       setStatus("行情总览已加载。", "success");
     }
   } catch (error) {
-    if (currentWorkspaceMode === "market") {
+    if (isMarketOverviewActive()) {
       setStatus(error.message || "行情总览加载失败。", "error");
       overviewSummary.textContent = "加载失败";
       marketOverviewItems = [];
@@ -355,8 +397,18 @@ async function loadMarketOverviewInner(page = overviewPage) {
 }
 
 async function fetchAndRenderMarketOverview(options = {}) {
-  const response = await fetch("/api/market-overview");
+  const requestId = ++marketOverviewFetchId;
+  const params = new URLSearchParams();
+  const selectedIds = overviewIndicatorIds.filter(Boolean);
+  if (selectedIds.length) {
+    params.set("indicator_ids", selectedIds.join(","));
+  }
+  const query = params.toString();
+  const response = await fetch(`/api/market-overview${query ? `?${query}` : ""}`);
   const payload = await parseJsonResponse(response);
+  if (requestId !== marketOverviewFetchId) {
+    return payload;
+  }
   if (!payload.ok) {
     throw new Error(payload.error?.message || "行情总览加载失败。");
   }
@@ -364,20 +416,33 @@ async function fetchAndRenderMarketOverview(options = {}) {
   overviewPage = payload.page;
   overviewTotalPages = payload.total_pages;
   marketOverviewItems = payload.items || [];
-  if (currentWorkspaceMode === "market") {
-    overviewItems = marketOverviewItems;
-    renderOverviewTable(getSortedOverviewItems());
-    overviewSummary.textContent = `共 ${payload.total_rows} 个标的`;
-    overviewPageText.textContent = "";
-    overviewPagination.hidden = true;
-    overviewPrev.disabled = true;
-    overviewNext.disabled = true;
+  overviewSelectedIndicators = payload.selected_indicators || [];
+  if (currentWorkspaceMode === "market" && !currentSymbol) {
+    renderCachedMarketOverview(payload.total_rows);
 
     if (!options.silent) {
       setStatus("已显示本地行情总览。", "success");
     }
   }
   return payload;
+}
+
+function renderCachedMarketOverview(totalRows = marketOverviewItems.length) {
+  if (currentWorkspaceMode !== "market" || currentSymbol) {
+    return;
+  }
+  showMarketOverview();
+  overviewItems = marketOverviewItems;
+  renderOverviewTable(getSortedOverviewItems());
+  overviewSummary.textContent = `共 ${totalRows} 个标的`;
+  overviewPageText.textContent = "";
+  overviewPagination.hidden = true;
+  overviewPrev.disabled = true;
+  overviewNext.disabled = true;
+}
+
+function isMarketOverviewActive() {
+  return currentWorkspaceMode === "market" && !currentSymbol && !marketOverviewPanel.hidden;
 }
 
 async function loadAnalysisOverview() {
@@ -530,7 +595,7 @@ function renderAnalysisProgress(state) {
 
 async function syncMarketOverviewDaily() {
   overviewDailySyncDone = true;
-  if (currentWorkspaceMode === "market") {
+  if (isMarketOverviewActive()) {
     overviewSummary.textContent = "更新行情中";
     setStatus("正在更新行情总览；已初始化标的同步分钟数据，其余标的更新日线...", "neutral");
   }
@@ -544,7 +609,7 @@ async function syncMarketOverviewDaily() {
   const result = await waitForOverviewSync();
   const failed = (result.items || []).filter((item) => item.status !== "success").length;
   const suffix = failed ? `，${failed} 个标的需要稍后重试` : "";
-  if (currentWorkspaceMode === "market") {
+  if (isMarketOverviewActive()) {
     setStatus(`行情总览更新完成，共写入 ${result.updated_rows || 0} 条日线${suffix}。`, failed ? "warning" : "success");
   }
 }
@@ -599,6 +664,12 @@ function renderOverviewTable(items) {
 
 function renderMarketOverviewTable(items) {
   overviewTable.classList.remove("analysis-overview-table");
+  overviewTable.classList.toggle("has-custom-indicators", overviewSelectedIndicators.length > 0);
+  const indicatorHeaders = overviewSelectedIndicators.map((indicator) => ({
+    label: indicator.name,
+    key: `indicator_${indicator.id}`,
+    className: "overview-indicator-column",
+  }));
   const headers = [
     { label: "标的代码", key: "display_order" },
     { label: "最新价格", key: "latest_price" },
@@ -607,7 +678,8 @@ function renderMarketOverviewTable(items) {
     { label: "周涨跌", key: "weekly_percent" },
     { label: "月涨跌", key: "monthly_percent" },
     { label: "YTD", key: "ytd_percent" },
-    { label: "", key: "" },
+    ...indicatorHeaders,
+    { label: "", key: "", className: "overview-actions-column" },
   ];
   const thead = `<thead><tr>${headers.map(renderOverviewHeader).join("")}</tr></thead>`;
 
@@ -621,6 +693,16 @@ function renderMarketOverviewTable(items) {
     const weeklyClass = numberTone(item.weekly_percent);
     const monthlyClass = numberTone(item.monthly_percent);
     const ytdClass = numberTone(item.ytd_percent);
+    const indicatorCells = overviewSelectedIndicators.map((indicator) => {
+      const reading = item.indicator_values?.[String(indicator.id)] || {};
+      const value = reading.value;
+      const formula = indicator.indicator_type === "RATR"
+        ? `（收盘价 - ${indicator.params.period} 个交易日前收盘价）/ 前一日 Wilder ATR(${indicator.params.period})`
+        : indicator.indicator_type === "ATR"
+          ? `Wilder ATR(${indicator.params.period})`
+          : `${indicator.indicator_type}(${indicator.params.period})`;
+      return `<td class="number-neutral overview-indicator-value" title="${escapeHtml(`${formula}；数据日 ${reading.date || "-"}`)}">${formatOverviewIndicator(value, indicator)}</td>`;
+    }).join("");
     return `
       <tr class="overview-row" draggable="true" data-symbol="${escapeHtml(item.symbol)}">
         <td>
@@ -632,6 +714,7 @@ function renderMarketOverviewTable(items) {
         <td class="${weeklyClass}">${formatOverviewPercent(item.weekly_percent)}</td>
         <td class="${monthlyClass}">${formatOverviewPercent(item.monthly_percent)}</td>
         <td class="${ytdClass}">${formatOverviewPercent(item.ytd_percent)}</td>
+        ${indicatorCells}
         <td class="drag-cell">
           <button class="drag-handle" type="button" title="${overviewDragTitle()}" aria-label="${overviewDragTitle()}" draggable="true" data-drag-disabled="${overviewDragDisabledText()}" data-symbol="${escapeHtml(item.symbol)}">
             <span></span><span></span><span></span>
@@ -654,6 +737,7 @@ function renderMarketOverviewTable(items) {
 
 function renderAnalysisOverviewTable(items) {
   overviewTable.classList.add("analysis-overview-table");
+  overviewTable.classList.remove("has-custom-indicators");
   const headers = [
     { label: "标的代码", key: "symbol" },
     { label: "最新价格", key: "latest_price" },
@@ -836,10 +920,9 @@ async function hideOverviewSymbol(symbol) {
       setStatus(payload.error?.message || "隐藏标的失败。", "error");
       return;
     }
-    marketOverviewItems = payload.items || marketOverviewItems.filter((item) => item.symbol !== symbol);
-    overviewItems = marketOverviewItems;
-    renderOverviewTable(getSortedOverviewItems());
-    overviewSummary.textContent = `共 ${payload.total_rows ?? overviewItems.length} 个标的`;
+    marketOverviewItems = marketOverviewItems.filter((item) => item.symbol !== symbol);
+    renderCachedMarketOverview(payload.total_rows ?? marketOverviewItems.length);
+    await fetchAndRenderMarketOverview({ silent: true });
     setStatus(`已从行情总览隐藏 ${symbol}，历史数据仍保留。`, "success");
   } catch (error) {
     setStatus(error.message || "隐藏标的失败。", "error");
@@ -919,13 +1002,13 @@ function setOverviewLiveRefresh(enabled) {
 
 function renderOverviewHeader(header) {
   if (!header.key) {
-    return "<th></th>";
+    return `<th class="${escapeHtml(header.className || "")}"></th>`;
   }
   const isActive = overviewSort.key === header.key;
   const direction = isActive ? overviewSort.direction : "";
   const title = `${header.label}${isActive ? (direction === "asc" ? " 升序" : " 降序") : ""}`;
   return `
-    <th>
+    <th class="${escapeHtml(header.className || "")}">
       <span class="overview-th-content">
         <span>${escapeHtml(header.label)}</span>
         <button
@@ -965,6 +1048,13 @@ function compareOverviewValues(left, right, key) {
     return compareNullableNumbers(
       analysisOverviewSortScore(left.analysis),
       analysisOverviewSortScore(right.analysis),
+    );
+  }
+  if (key.startsWith("indicator_")) {
+    const indicatorId = key.slice("indicator_".length);
+    return compareNullableNumbers(
+      left.indicator_values?.[indicatorId]?.value,
+      right.indicator_values?.[indicatorId]?.value,
     );
   }
   const numericResult = compareNullableNumbers(left[key], right[key]);
@@ -1076,6 +1166,20 @@ function formatOverviewPercent(value) {
   const number = Number(value);
   const prefix = number >= 0 ? "+" : "";
   return `(${prefix}${number.toFixed(2)}%)`;
+}
+
+function formatOverviewIndicator(value, indicator) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) {
+    return "-";
+  }
+  const number = Number(value);
+  if (indicator.indicator_type === "RATR") {
+    return `${number >= 0 ? "+" : ""}${number.toFixed(2)}`;
+  }
+  return number.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4,
+  });
 }
 
 function formatOverviewUpdatedAt(value) {
@@ -1574,15 +1678,88 @@ async function parseJsonResponse(response) {
 }
 
 async function loadIndicatorCatalog() {
-  const response = await fetch("/api/indicators?favorite=1");
-  const payload = await parseJsonResponse(response);
-  if (!payload.ok) {
+  try {
+    const response = await fetch("/api/indicators?favorite=1");
+    const payload = await parseJsonResponse(response);
+    if (!payload.ok) {
+      favoriteIndicators.textContent = "收藏指标加载失败";
+      return;
+    }
+
+    indicatorCatalog = payload.indicators;
+    renderFavoriteIndicators();
+    renderOverviewIndicatorControls();
+  } catch (error) {
     favoriteIndicators.textContent = "收藏指标加载失败";
-    return;
+    renderOverviewIndicatorControls();
+  }
+}
+
+function initializeOverviewIndicatorSelection() {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(overviewIndicatorStorageKey) || "[]");
+    if (Array.isArray(stored)) {
+      overviewIndicatorIds = [0, 1].map((index) => {
+        const value = Number(stored[index]);
+        return Number.isInteger(value) && value > 0 ? String(value) : "";
+      });
+    }
+  } catch (error) {
+    overviewIndicatorIds = ["", ""];
+  }
+}
+
+function renderOverviewIndicatorControls() {
+  const favoriteIds = new Set(indicatorCatalog.map((indicator) => String(indicator.id)));
+  let changed = false;
+  overviewIndicatorIds = overviewIndicatorIds.map((indicatorId) => {
+    if (indicatorId && !favoriteIds.has(indicatorId)) {
+      changed = true;
+      return "";
+    }
+    return indicatorId;
+  });
+  if (overviewIndicatorIds[0] && overviewIndicatorIds[0] === overviewIndicatorIds[1]) {
+    overviewIndicatorIds[1] = "";
+    changed = true;
+  }
+  if (changed) {
+    saveOverviewIndicatorSelection();
   }
 
-  indicatorCatalog = payload.indicators;
-  renderFavoriteIndicators();
+  const options = indicatorCatalog.map((indicator) => (
+    `<option value="${indicator.id}">${escapeHtml(indicator.name)}</option>`
+  )).join("");
+  overviewIndicatorSelects.forEach((select, index) => {
+    select.innerHTML = `<option value="">不显示</option>${options}`;
+    select.value = overviewIndicatorIds[index];
+  });
+}
+
+function saveOverviewIndicatorSelection() {
+  window.localStorage.setItem(
+    overviewIndicatorStorageKey,
+    JSON.stringify(overviewIndicatorIds),
+  );
+}
+
+async function changeOverviewIndicatorColumn(index, value) {
+  const normalized = value ? String(Number(value)) : "";
+  const duplicateIndex = overviewIndicatorIds.findIndex((item, itemIndex) => (
+    itemIndex !== index && item && item === normalized
+  ));
+  if (duplicateIndex >= 0) {
+    overviewIndicatorIds[duplicateIndex] = "";
+  }
+  overviewIndicatorIds[index] = normalized;
+  saveOverviewIndicatorSelection();
+  renderOverviewIndicatorControls();
+  overviewSort = { ...defaultOverviewSort };
+  try {
+    await fetchAndRenderMarketOverview();
+  } catch (error) {
+    setStatus(error.message || "总览指标列加载失败。", "error");
+  }
 }
 
 async function loadSymbolIndicators() {
@@ -1662,7 +1839,7 @@ async function createAndAddIndicator(event) {
       body: JSON.stringify({
         indicator_type: indicatorType,
         params: { period },
-        name: `${indicatorType}${period}`,
+        name: indicatorType === "RATR" ? `相对ATR${period}` : `${indicatorType}${period}`,
       }),
     },
   );
@@ -1675,7 +1852,7 @@ async function createAndAddIndicator(event) {
   currentSymbolIndicators = payload.symbol_indicators;
   setChartIndicators(currentSymbolIndicators);
   await loadIndicatorCatalog();
-  setStatus(`已添加 ${indicatorType}${period}。`, "success");
+  setStatus(`已添加 ${indicatorType === "RATR" ? "相对ATR" : indicatorType}${period}。`, "success");
 }
 
 async function handleIndicatorAction(event) {
@@ -1766,6 +1943,10 @@ function bindNavigation() {
 
       if (button.dataset.view === "database-view") {
         loadTables();
+      } else if (button.dataset.view === "realtime-view") {
+        if (typeof loadRealtimeTasks === "function") {
+          loadRealtimeTasks();
+        }
       } else if (button.dataset.view === "market-view" && currentWorkspaceMode === "analysis") {
         if (!currentSymbol) {
           loadAnalysisOverview();
@@ -1940,6 +2121,11 @@ shutdownButton.addEventListener("click", shutdownSystem);
 overviewLiveToggle.addEventListener("change", () => {
   setOverviewLiveRefresh(overviewLiveToggle.checked);
 });
+overviewIndicatorSelects.forEach((select, index) => {
+  select.addEventListener("change", () => {
+    changeOverviewIndicatorColumn(index, select.value);
+  });
+});
 analysisRefreshAll.addEventListener("click", () => startAnalysisOverviewRefresh());
 themeToggle.addEventListener("click", () => {
   const nextTheme = document.body.classList.contains("theme-dark") ? "light" : "dark";
@@ -2024,11 +2210,12 @@ document.addEventListener("chart-period-change", async (event) => {
 bindNavigation();
 bindDatabaseBrowser();
 initBacktest();
+initRealtime();
 initChart();
 initTheme();
 startHeartbeat();
-loadIndicatorCatalog();
-loadMarketOverview();
+initializeOverviewIndicatorSelection();
+loadIndicatorCatalog().finally(() => loadMarketOverview());
 
 function escapeHtml(value) {
   return String(value)

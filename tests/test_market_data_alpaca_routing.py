@@ -196,6 +196,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
 
         fetch_daily.assert_called_once_with("GLD", date(2024, 1, 1))
         import_history.assert_not_called()
+        get_sync_state.assert_not_called()
 
     @patch.object(service.repository, "get_symbol")
     @patch.object(service.repository, "get_daily_prices")

@@ -115,6 +115,28 @@ class CompiledExpression:
             raise BacktestValidationError("规则计算得到了非有限数值。")
         return value
 
+    def resolve_inputs(self, context) -> dict[str, float]:
+        """Return the concrete variables and indicator values used by a rule."""
+        values: dict[str, float] = {}
+        names = {
+            node.id.lower()
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.Name)
+        }
+        if "price" in names:
+            values["price"] = float(context.price)
+        if "position" in names:
+            values["position"] = float(context.position)
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            name = node.func.id.lower()
+            period = int(node.args[0].value)
+            key = f"{name}({period})"
+            if key not in values:
+                values[key] = float(context.resolve_function(name, period))
+        return values
+
 
 def compile_expression(expression: str) -> CompiledExpression:
     normalized = normalize_expression(expression)

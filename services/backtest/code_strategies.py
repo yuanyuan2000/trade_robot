@@ -133,6 +133,10 @@ class CodeStrategy:
             values.append(f"{label}={value}")
         return f"{self.name}：{'，'.join(values)}"
 
+    @classmethod
+    def realtime_notification_intro(cls) -> str:
+        return f"{cls.name}实时评分结果（仅供人工核验）："
+
 
 class RapidDropAtrRotationStrategy(CodeStrategy):
     key = "rapid_drop_atr_rotation"
@@ -243,6 +247,10 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
         },
     }
 
+    @classmethod
+    def realtime_notification_intro(cls) -> str:
+        return "急跌回避 + ATR 动量轮动：按 ATR 动量评分排名，列出硬性过滤与最终目标。"
+
     def __init__(self, params: dict | None = None):
         super().__init__(params)
         self.risk_off: dict[str, set[str]] = {}
@@ -330,24 +338,46 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
                 *[float(row["close"]) for row in previous_rows[1:]],
                 event_price,
             ]
-            percent_changes = [
-                current_price / float(previous["close"]) - 1
-                for previous, current_price in zip(previous_rows, current_prices)
+            percent_change_details = [
+                {
+                    "from_date": previous["date"],
+                    "to_date": (
+                        previous_rows[index + 1]["date"]
+                        if index + 1 < len(previous_rows)
+                        else context.trading_date + " " + self.params["risk_check_time"]
+                    ),
+                    "previous_close": float(previous["close"]),
+                    "current_price": current_price,
+                    "change": current_price / float(previous["close"]) - 1,
+                    "formula": f"{current_price:.6f} / {float(previous['close']):.6f} - 1",
+                }
+                for index, (previous, current_price) in enumerate(zip(previous_rows, current_prices))
             ]
+            percent_changes = [item["change"] for item in percent_change_details]
             atr_changes: list[float] = []
+            atr_change_details: list[dict] = []
             if self.params["enable_atr_drop_filter"]:
                 atr_series = self._atr_series(
                     rows,
                     self.params["atr_period"],
                     self.params["atr_weighting"],
                 )
-                atr_changes = [
-                    (current_price - float(previous["close"])) / atr_series[index]
-                    for index, (previous, current_price) in enumerate(
-                        zip(previous_rows, current_prices), start=start
-                    )
-                    if atr_series[index] is not None and atr_series[index] > 0
-                ]
+                for row_index, (previous, current_price) in enumerate(
+                    zip(previous_rows, current_prices), start=start
+                ):
+                    atr_value = atr_series[row_index]
+                    if atr_value is None or atr_value <= 0:
+                        continue
+                    change = (current_price - float(previous["close"])) / atr_value
+                    atr_changes.append(change)
+                    atr_change_details.append({
+                        "from_date": previous["date"],
+                        "previous_close": float(previous["close"]),
+                        "current_price": current_price,
+                        "atr": atr_value,
+                        "change_atr": change,
+                        "formula": f"({current_price:.6f} - {float(previous['close']):.6f}) / {atr_value:.6f}",
+                    })
             filter_codes: list[str] = []
             filter_reasons: list[str] = []
             if (
@@ -372,11 +402,26 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
                 "filter_codes": filter_codes,
                 "filter_reasons": filter_reasons,
                 "percent_changes": percent_changes,
+                "percent_change_details": percent_change_details,
                 "atr_changes": atr_changes,
+                "atr_change_details": atr_change_details,
                 "risk_event_price": event_price,
+                "percent_threshold": -self.params["drop_threshold_percent"] / 100,
+                "atr_threshold": -self.params["drop_threshold_atr"],
             }
             if filter_codes:
                 flagged.add(symbol)
+            result_label = "过滤：" + "、".join(filter_reasons) if filter_reasons else "通过"
+            worst_percent = min(percent_changes, default=0.0)
+            worst_atr = min(atr_changes, default=0.0)
+            context.log_custom(
+                "RAPID_DROP_ATR_RISK_CHECK",
+                f"{symbol} 风险检查{result_label}；最差单日涨跌 {worst_percent:.2%}"
+                + (f"，最差 ATR 变化 {worst_atr:.4f}" if atr_changes else "")
+                + "。",
+                symbol=symbol,
+                context=evaluations[symbol],
+            )
         self.risk_off[context.trading_date] = flagged
         self.risk_evaluations[context.trading_date] = evaluations
         return [
@@ -696,6 +741,10 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
             "suggestion": "默认 BIL（1–3 月美国国债 ETF）。",
         },
     }
+
+    @classmethod
+    def realtime_notification_intro(cls) -> str:
+        return "七星 ETF 趋势轮动：按加权趋势评分排名，列出过滤原因与最终目标/防御标的。"
 
     def __init__(self, params: dict | None = None):
         super().__init__(params)

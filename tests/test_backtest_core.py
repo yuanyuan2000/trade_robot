@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 import math
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -107,6 +108,19 @@ class DslSafetyTests(unittest.TestCase):
             "price > ma(20) AND (position <= 0.5 OR close(1) = open(1))"
         )
         self.assertEqual(expression.max_lookback, 20)
+
+    def test_expression_reports_values_used_by_notification_basis(self) -> None:
+        expression = compile_expression("ema(8) > ema(13) AND position < 0.5")
+        context = SimpleNamespace(
+            price=100.0,
+            position=0.25,
+            resolve_function=lambda name, period: {("ema", 8): 101.5, ("ema", 13): 99.25}[(name, period)],
+        )
+
+        self.assertEqual(
+            expression.resolve_inputs(context),
+            {"position": 0.25, "ema(8)": 101.5, "ema(13)": 99.25},
+        )
 
     def test_expression_rejects_zero_lookback_and_arbitrary_code(self) -> None:
         with self.assertRaises(BacktestValidationError):

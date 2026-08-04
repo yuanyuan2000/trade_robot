@@ -322,6 +322,158 @@ CREATE TABLE IF NOT EXISTS backtest_logs (
 CREATE INDEX IF NOT EXISTS idx_backtest_logs_filter
 ON backtest_logs(run_id, level, sequence);
 
+-- Live decision tasks keep calculation snapshots and notification audits
+-- separate from immutable historical backtest runs.
+CREATE TABLE IF NOT EXISTS realtime_decision_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    strategy_id INTEGER NOT NULL,
+    follow_strategy INTEGER NOT NULL DEFAULT 1,
+    source_strategy_revision INTEGER NOT NULL,
+    source_code_version TEXT,
+    strategy_snapshot_json TEXT NOT NULL,
+    settings_json TEXT NOT NULL,
+    notification_settings_json TEXT NOT NULL,
+    portfolio_state_json TEXT NOT NULL DEFAULT '{}',
+    desired_state TEXT NOT NULL DEFAULT 'stopped'
+        CHECK(desired_state IN ('stopped', 'running')),
+    runtime_state TEXT NOT NULL DEFAULT 'stopped'
+        CHECK(runtime_state IN ('stopped', 'starting', 'running', 'degraded', 'stopping', 'error')),
+    run_started_at TEXT,
+    stopped_at TEXT,
+    heartbeat_at TEXT,
+    next_event_at TEXT,
+    last_event_at TEXT,
+    last_error_code TEXT,
+    last_error_message TEXT,
+    successful_notification_count INTEGER NOT NULL DEFAULT 0,
+    next_allowed_normal_send_at TEXT,
+    revision INTEGER NOT NULL DEFAULT 1,
+    deleted_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(strategy_id) REFERENCES backtest_strategies(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_realtime_tasks_active
+ON realtime_decision_tasks(deleted_at, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_realtime_tasks_runtime
+ON realtime_decision_tasks(runtime_state, desired_state, next_event_at);
+
+CREATE TABLE IF NOT EXISTS realtime_decision_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    strategy_snapshot_json TEXT NOT NULL,
+    settings_json TEXT NOT NULL,
+    notification_settings_json TEXT NOT NULL,
+    state_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'starting'
+        CHECK(status IN ('starting', 'running', 'degraded', 'stopping', 'stopped', 'failed')),
+    started_at TEXT NOT NULL,
+    stopped_at TEXT,
+    heartbeat_at TEXT,
+    last_event_at TEXT,
+    last_error_code TEXT,
+    last_error_message TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES realtime_decision_tasks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_realtime_runs_task
+ON realtime_decision_runs(task_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS realtime_decision_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    task_id INTEGER NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    trading_date TEXT NOT NULL,
+    event_name TEXT NOT NULL,
+    scheduled_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN ('queued', 'running', 'completed', 'skipped', 'failed')),
+    data_manifest_json TEXT,
+    decision_json TEXT,
+    calculation_json TEXT,
+    message_subject TEXT,
+    message_body TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES realtime_decision_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY(task_id) REFERENCES realtime_decision_tasks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_realtime_events_task_time
+ON realtime_decision_events(task_id, scheduled_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS email_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    provider TEXT NOT NULL CHECK(provider IN ('gmail_smtp', 'qq_smtp', 'custom_smtp')),
+    sender_email TEXT NOT NULL,
+    smtp_host TEXT NOT NULL,
+    smtp_port INTEGER NOT NULL,
+    security_mode TEXT NOT NULL CHECK(security_mode IN ('ssl', 'starttls')),
+    username TEXT NOT NULL,
+    secret_ciphertext TEXT,
+    secret_key_id TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_test_at TEXT,
+    last_test_ok INTEGER,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS realtime_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL,
+    task_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    recipient TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN ('queued', 'sending', 'sent', 'retrying', 'failed', 'suppressed')),
+    is_retry INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    sent_at TEXT,
+    provider_message_id TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES realtime_decision_events(id) ON DELETE CASCADE,
+    FOREIGN KEY(task_id) REFERENCES realtime_decision_tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY(channel_id) REFERENCES email_channels(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_realtime_notifications_queue
+ON realtime_notifications(status, next_attempt_at, created_at);
+
+CREATE TABLE IF NOT EXISTS realtime_notification_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    notification_id INTEGER NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    status TEXT NOT NULL CHECK(status IN ('sent', 'retrying', 'failed')),
+    provider_message_id TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    FOREIGN KEY(notification_id) REFERENCES realtime_notifications(id) ON DELETE CASCADE,
+    UNIQUE(notification_id, attempt_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_realtime_notification_attempts_notification
+ON realtime_notification_attempts(notification_id, attempt_number);
+
 CREATE TABLE IF NOT EXISTS corporate_actions (
     provider_id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,

@@ -881,9 +881,11 @@ class BacktestEngine:
                 symbol=symbol,
                 context={
                     "rule_id": rule["id"],
+                    "rule_name": rule["name"],
                     "condition": rule["condition"],
                     "price": context.price,
                     "position": context.position,
+                    "inputs": compiled.resolve_inputs(context),
                     "matched": matched,
                 },
             )
