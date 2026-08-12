@@ -17,11 +17,6 @@ const overviewPageText = document.getElementById("overview-page-text");
 const overviewLiveToggle = document.getElementById("overview-live-toggle");
 const overviewLiveLabel = document.getElementById("overview-live-label");
 const overviewLiveControl = document.getElementById("overview-live-control");
-const overviewIndicatorControls = document.getElementById("overview-indicator-controls");
-const overviewIndicatorSelects = [
-  document.getElementById("overview-indicator-1"),
-  document.getElementById("overview-indicator-2"),
-];
 const analysisRefreshAll = document.getElementById("analysis-refresh-all");
 const overviewTitle = document.getElementById("overview-title");
 const analysisOverviewProgress = document.getElementById("analysis-overview-progress");
@@ -39,6 +34,7 @@ const customIndicatorType = document.getElementById("custom-indicator-type");
 const customIndicatorPeriod = document.getElementById("custom-indicator-period");
 const customIndicatorHalfLife = document.getElementById("custom-indicator-half-life");
 const customIndicatorEpsilon = document.getElementById("custom-indicator-epsilon");
+const customIndicatorThreshold = document.getElementById("custom-indicator-threshold");
 const updateDataButton = document.getElementById("update-data-button");
 const marketUpdateProgress = document.getElementById("market-update-progress");
 const marketUpdateProgressContent = document.getElementById("market-update-progress-content");
@@ -63,7 +59,7 @@ let currentViewCode = "1D";
 let currentWorkspaceMode = "market";
 let currentSymbolIndicators = [];
 let indicatorCatalog = [];
-let overviewIndicatorIds = ["", ""];
+let overviewIndicatorIds = ["", "", ""];
 let overviewSelectedIndicators = [];
 let currentRawMarketData = [];
 let currentSymbolSettings = { show_weekend_data: true };
@@ -78,8 +74,6 @@ const defaultOverviewSort = { key: "display_order", direction: "asc" };
 let overviewSort = { ...defaultOverviewSort };
 let draggedOverviewSymbol = "";
 let overviewDailySyncDone = false;
-let overviewLiveTimer;
-let overviewLiveRefreshInFlight = false;
 let marketOverviewAutoUpdate = false;
 let marketLoadRequestId = 0;
 let marketOverviewFetchId = 0;
@@ -88,7 +82,6 @@ let analysisOverviewLoadInFlight;
 let lastAnalysisRefreshState = {};
 let analysisIndicatorLegendVisible = false;
 let overviewLoadInFlight;
-const overviewLiveRefreshMs = 5 * 60 * 1000;
 const overviewIndicatorStorageKey = "trade-overview-indicator-columns";
 
 function applyTheme(theme) {
@@ -128,24 +121,12 @@ function applyWorkspaceMode(mode) {
   overviewLiveLabel.textContent = "自动更新";
   overviewLiveToggle.checked = marketOverviewAutoUpdate;
   overviewLiveControl.hidden = isAnalysis;
-  overviewIndicatorControls.hidden = isAnalysis;
   analysisRefreshAll.hidden = !isAnalysis;
   overviewLiveControl.title = "每5分钟刷新总览最新价格";
   analysisOverviewProgress.hidden = !isAnalysis;
   if (isAnalysis) {
-    if (overviewLiveTimer) {
-      window.clearInterval(overviewLiveTimer);
-      overviewLiveTimer = null;
-    }
     if (!marketOverviewPanel.hidden) {
       renderAnalysisProgress(lastAnalysisRefreshState);
-    }
-  } else {
-    if (marketOverviewAutoUpdate && !overviewLiveTimer) {
-      overviewLiveTimer = window.setInterval(
-        refreshOverviewLivePrices,
-        overviewLiveRefreshMs,
-      );
     }
   }
   analysisControls.hidden = !isAnalysis;
@@ -666,45 +647,50 @@ function renderOverviewTable(items) {
 
 function renderMarketOverviewTable(items) {
   overviewTable.classList.remove("analysis-overview-table");
-  overviewTable.classList.toggle("has-custom-indicators", overviewSelectedIndicators.length > 0);
-  const indicatorHeaders = overviewSelectedIndicators.map((indicator) => ({
-    label: indicator.name,
-    key: `indicator_${indicator.id}`,
-    className: "overview-indicator-column",
-  }));
+  overviewTable.classList.add("has-custom-indicators");
+  const selectedById = new Map(
+    overviewSelectedIndicators.map((indicator) => [String(indicator.id), indicator]),
+  );
+  const indicatorSlots = overviewIndicatorIds.map((indicatorId) => (
+    indicatorId ? selectedById.get(indicatorId) || null : null
+  ));
   const headers = [
     { label: "标的代码", key: "display_order" },
     { label: "最新价格", key: "latest_price" },
     { label: "更新时间", key: "latest_price_updated_at" },
     { label: "日涨跌", key: "daily_change_percent" },
-    { label: "周涨跌", key: "weekly_percent" },
-    { label: "月涨跌", key: "monthly_percent" },
     { label: "YTD", key: "ytd_percent" },
-    ...indicatorHeaders,
-    { label: "", key: "", className: "overview-actions-column" },
   ];
-  const thead = `<thead><tr>${headers.map(renderOverviewHeader).join("")}</tr></thead>`;
+  const indicatorHeaders = indicatorSlots.map((indicator, index) => (
+    renderOverviewIndicatorHeader(index, indicator)
+  )).join("");
+  const actionHeader = '<th class="overview-actions-column"></th>';
+  const thead = `<thead><tr>${headers.map(renderOverviewHeader).join("")}${indicatorHeaders}${actionHeader}</tr></thead>`;
+  const columnCount = headers.length + indicatorSlots.length + 1;
 
   if (!items.length) {
-    overviewTable.innerHTML = `${thead}<tbody><tr><td class="empty-cell" colspan="${headers.length}">暂无标的。查询并保存行情后会显示在这里。</td></tr></tbody>`;
+    overviewTable.innerHTML = `${thead}<tbody><tr><td class="empty-cell" colspan="${columnCount}">暂无标的。查询并保存行情后会显示在这里。</td></tr></tbody>`;
     return;
   }
 
   const rows = items.map((item) => {
     const dailyClass = numberTone(item.daily_change);
-    const weeklyClass = numberTone(item.weekly_percent);
-    const monthlyClass = numberTone(item.monthly_percent);
     const ytdClass = numberTone(item.ytd_percent);
-    const indicatorCells = overviewSelectedIndicators.map((indicator) => {
+    const indicatorCells = indicatorSlots.map((indicator) => {
+      if (!indicator) {
+        return '<td class="number-neutral overview-indicator-value"></td>';
+      }
       const reading = item.indicator_values?.[String(indicator.id)] || {};
       const value = reading.value;
       const formula = indicator.indicator_type === "RATR"
         ? `（收盘价 - ${indicator.params.period} 个交易日前收盘价）/ 前一日 Wilder ATR(${indicator.params.period})`
         : indicator.indicator_type === "WTME"
           ? `100 × 加权方向收益 /（加权标准化真实波幅 + ${indicator.params.epsilon}），N=${indicator.params.period}，h=${indicator.params.half_life}`
-        : indicator.indicator_type === "ATR"
-          ? `Wilder ATR(${indicator.params.period})`
-          : `${indicator.indicator_type}(${indicator.params.period})`;
+          : indicator.indicator_type === "RAPID_DROP"
+            ? `近 ${indicator.params.period} 个连续变化段任一跌幅 ≤ -${indicator.params.threshold_percent}% 时为 1，否则为 0（包含最新未结束 K 线）`
+            : indicator.indicator_type === "ATR"
+              ? `Wilder ATR(${indicator.params.period})`
+              : `${indicator.indicator_type}(${indicator.params.period})`;
       return `<td class="number-neutral overview-indicator-value" title="${escapeHtml(`${formula}；数据日 ${reading.date || "-"}`)}">${formatOverviewIndicator(value, indicator)}</td>`;
     }).join("");
     return `
@@ -715,23 +701,23 @@ function renderMarketOverviewTable(items) {
         <td class="${dailyClass}">${formatOverviewPrice(item.latest_price)}</td>
         <td class="number-neutral">${formatOverviewUpdatedAt(item.latest_price_updated_at)}</td>
         <td class="${dailyClass}">${formatOverviewPercent(item.daily_change_percent)}</td>
-        <td class="${weeklyClass}">${formatOverviewPercent(item.weekly_percent)}</td>
-        <td class="${monthlyClass}">${formatOverviewPercent(item.monthly_percent)}</td>
         <td class="${ytdClass}">${formatOverviewPercent(item.ytd_percent)}</td>
         ${indicatorCells}
         <td class="drag-cell">
-          <button class="drag-handle" type="button" title="${overviewDragTitle()}" aria-label="${overviewDragTitle()}" draggable="true" data-drag-disabled="${overviewDragDisabledText()}" data-symbol="${escapeHtml(item.symbol)}">
-            <span></span><span></span><span></span>
-          </button>
-          <button class="overview-remove-button" type="button" title="从总览隐藏" aria-label="从总览隐藏" data-symbol="${escapeHtml(item.symbol)}">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M3 6h18" />
-              <path d="M8 6V4h8v2" />
-              <path d="M6 6l1 15h10l1-15" />
-              <path d="M10 11v6" />
-              <path d="M14 11v6" />
-            </svg>
-          </button>
+          <div class="overview-row-actions">
+            <button class="drag-handle" type="button" title="${overviewDragTitle()}" aria-label="${overviewDragTitle()}" draggable="true" data-drag-disabled="${overviewDragDisabledText()}" data-symbol="${escapeHtml(item.symbol)}">
+              <span></span><span></span><span></span>
+            </button>
+            <button class="overview-remove-button" type="button" title="从总览隐藏" aria-label="从总览隐藏" data-symbol="${escapeHtml(item.symbol)}">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 6h18" />
+                <path d="M8 6V4h8v2" />
+                <path d="M6 6l1 15h10l1-15" />
+                <path d="M10 11v6" />
+                <path d="M14 11v6" />
+              </svg>
+            </button>
+          </div>
         </td>
       </tr>
     `;
@@ -933,75 +919,39 @@ async function hideOverviewSymbol(symbol) {
   }
 }
 
-async function refreshOverviewLivePrices() {
-  if (
-    overviewLiveRefreshInFlight
-    || marketOverviewPanel.hidden
-    || currentWorkspaceMode !== "market"
-  ) {
-    return;
-  }
-  overviewLiveRefreshInFlight = true;
+async function setOverviewLiveRefresh(enabled) {
   try {
-    const response = await fetch("/api/market-overview/refresh-prices", { method: "POST" });
+    const response = await fetch("/api/market-overview/auto-refresh", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: Boolean(enabled) }),
+    });
     const payload = await parseJsonResponse(response);
-    if (!payload.ok) {
-      setStatus(payload.error?.message || "总览实时价格刷新失败。", "error");
-      return;
-    }
-    mergeOverviewLivePrices(payload.items || []);
-    setStatus("总览自动更新已启动，先显示本地最新价格。", "neutral");
-    try {
-      const result = await waitForOverviewSync();
-      await fetchAndRenderMarketOverview({ silent: true });
-      const failed = (result.items || []).filter((item) => item.status !== "success").length;
-      setStatus(failed ? `总览价格已部分刷新，${failed} 个标的未更新。` : "总览价格已刷新。", failed ? "warning" : "success");
-    } catch (syncError) {
-      setStatus(syncError.message || "后台刷新仍在进行，本地数据已先显示。", "warning");
-    }
+    if (!payload.ok) throw new Error(payload.error?.message || "自动更新设置失败。");
+    marketOverviewAutoUpdate = Boolean(payload.auto_enabled);
+    overviewLiveToggle.checked = marketOverviewAutoUpdate;
+    setStatus(
+      marketOverviewAutoUpdate
+        ? "总览自动更新已开启，由服务端每5分钟统一更新一次。"
+        : "总览自动更新已关闭；正式决策事件仍会按时独立获取行情。",
+      marketOverviewAutoUpdate ? "success" : "neutral",
+    );
   } catch (error) {
-    setStatus(error.message || "总览实时价格刷新失败。", "error");
-  } finally {
-    overviewLiveRefreshInFlight = false;
+    overviewLiveToggle.checked = marketOverviewAutoUpdate;
+    setStatus(error.message || "自动更新设置失败。", "error");
   }
 }
 
-function mergeOverviewLivePrices(items) {
-  const bySymbol = new Map(items.map((item) => [item.symbol, item]));
-  marketOverviewItems = marketOverviewItems.map((item) => {
-    const live = bySymbol.get(item.symbol);
-    if (!live || live.status !== "success" || live.latest_price === null || live.latest_price === undefined) {
-      return item;
-    }
-    const next = {
-      ...item,
-      latest_price: live.latest_price,
-    };
-    if (live.daily_change !== null && live.daily_change !== undefined) {
-      next.daily_change = live.daily_change;
-    }
-    if (live.daily_change_percent !== null && live.daily_change_percent !== undefined) {
-      next.daily_change_percent = live.daily_change_percent;
-    }
-    return next;
-  });
-  overviewItems = marketOverviewItems;
-  renderOverviewTable(getSortedOverviewItems());
-}
-
-function setOverviewLiveRefresh(enabled) {
-  marketOverviewAutoUpdate = enabled;
-  if (overviewLiveTimer) {
-    window.clearInterval(overviewLiveTimer);
-    overviewLiveTimer = null;
+async function loadOverviewRefreshPreference() {
+  try {
+    const response = await fetch("/api/market-overview/sync-status");
+    const payload = await parseJsonResponse(response);
+    if (!payload.ok) return;
+    marketOverviewAutoUpdate = Boolean(payload.auto_enabled);
+    overviewLiveToggle.checked = marketOverviewAutoUpdate;
+  } catch (_error) {
+    // Keep the existing switch value when the coordinator is unavailable.
   }
-  if (!enabled) {
-    setStatus("总览自动更新已关闭。", "neutral");
-    return;
-  }
-  refreshOverviewLivePrices();
-  overviewLiveTimer = window.setInterval(refreshOverviewLivePrices, overviewLiveRefreshMs);
-  setStatus("总览自动更新已开启，每5分钟刷新一次最新价格。", "success");
 }
 
 function renderOverviewHeader(header) {
@@ -1177,6 +1127,9 @@ function formatOverviewIndicator(value, indicator) {
     return "-";
   }
   const number = Number(value);
+  if (indicator.indicator_type === "RAPID_DROP") {
+    return number >= 0.5 ? "1" : "0";
+  }
   if (["RATR", "WTME"].includes(indicator.indicator_type)) {
     return `${number >= 0 ? "+" : ""}${number.toFixed(2)}`;
   }
@@ -1703,13 +1656,13 @@ function initializeOverviewIndicatorSelection() {
   try {
     const stored = JSON.parse(window.localStorage.getItem(overviewIndicatorStorageKey) || "[]");
     if (Array.isArray(stored)) {
-      overviewIndicatorIds = [0, 1].map((index) => {
+      overviewIndicatorIds = [0, 1, 2].map((index) => {
         const value = Number(stored[index]);
         return Number.isInteger(value) && value > 0 ? String(value) : "";
       });
     }
   } catch (error) {
-    overviewIndicatorIds = ["", ""];
+    overviewIndicatorIds = ["", "", ""];
   }
 }
 
@@ -1723,21 +1676,77 @@ function renderOverviewIndicatorControls() {
     }
     return indicatorId;
   });
-  if (overviewIndicatorIds[0] && overviewIndicatorIds[0] === overviewIndicatorIds[1]) {
-    overviewIndicatorIds[1] = "";
+  const seen = new Set();
+  overviewIndicatorIds = overviewIndicatorIds.map((indicatorId) => {
+    if (indicatorId && seen.has(indicatorId)) {
+      changed = true;
+      return "";
+    }
+    if (indicatorId) seen.add(indicatorId);
+    return indicatorId;
+  });
+  while (overviewIndicatorIds.length < 3) {
+    overviewIndicatorIds.push("");
     changed = true;
   }
+  overviewIndicatorIds = overviewIndicatorIds.slice(0, 3);
   if (changed) {
     saveOverviewIndicatorSelection();
   }
+  if (currentWorkspaceMode === "market" && !currentSymbol && !marketOverviewPanel.hidden) {
+    renderCachedMarketOverview();
+  }
+}
 
-  const options = indicatorCatalog.map((indicator) => (
-    `<option value="${indicator.id}">${escapeHtml(indicator.name)}</option>`
-  )).join("");
-  overviewIndicatorSelects.forEach((select, index) => {
-    select.innerHTML = `<option value="">不显示</option>${options}`;
-    select.value = overviewIndicatorIds[index];
-  });
+function renderOverviewIndicatorSelect(index) {
+  const selectedId = overviewIndicatorIds[index] || "";
+  const selectedIndicator = indicatorCatalog.find(
+    (indicator) => String(indicator.id) === selectedId,
+  );
+  const options = indicatorCatalog.map((indicator) => {
+    const value = String(indicator.id);
+    return `<option value="${value}"${value === selectedId ? " selected" : ""}>${escapeHtml(indicator.name)}</option>`;
+  }).join("");
+  return `
+    <select
+      id="overview-indicator-${index + 1}"
+      class="overview-indicator-select"
+      data-overview-indicator-index="${index}"
+      aria-label="行情总览指标列 ${index + 1}"
+      title="${escapeHtml(selectedIndicator?.name || `选择指标列 ${index + 1}`)}"
+    >
+      <option value=""${selectedId ? "" : " selected"}></option>
+      ${options}
+    </select>
+  `;
+}
+
+function renderOverviewIndicatorHeader(index, indicator) {
+  const sortKey = indicator ? `indicator_${indicator.id}` : "";
+  const isActive = Boolean(sortKey) && overviewSort.key === sortKey;
+  const direction = isActive ? overviewSort.direction : "";
+  const sortTitle = indicator
+    ? `${indicator.name}${isActive ? (direction === "asc" ? " 升序" : " 降序") : ""}`
+    : "请先选择指标";
+  return `
+    <th class="overview-indicator-column">
+      <span class="overview-indicator-header">
+        ${renderOverviewIndicatorSelect(index)}
+        <button
+          class="overview-sort-button ${isActive ? "is-active" : ""}"
+          type="button"
+          title="${escapeHtml(sortTitle)}"
+          aria-label="${escapeHtml(sortTitle)}"
+          data-sort-key="${escapeHtml(sortKey)}"
+          data-sort-direction="${escapeHtml(direction)}"
+          ${sortKey ? "" : "disabled"}
+        >
+          <span class="sort-triangle sort-triangle-up"></span>
+          <span class="sort-triangle sort-triangle-down"></span>
+        </button>
+      </span>
+    </th>
+  `;
 }
 
 function saveOverviewIndicatorSelection() {
@@ -1839,12 +1848,16 @@ async function createAndAddIndicator(event) {
   if (indicatorType === "WTME") {
     params.half_life = Number(customIndicatorHalfLife.value);
     params.epsilon = Number(customIndicatorEpsilon.value);
+  } else if (indicatorType === "RAPID_DROP") {
+    params.threshold_percent = Number(customIndicatorThreshold.value);
   }
   const displayName = indicatorType === "RATR"
     ? `相对ATR${period}`
     : indicatorType === "WTME"
       ? `WTME${period}(h=${params.half_life})`
-      : `${indicatorType}${period}`;
+      : indicatorType === "RAPID_DROP"
+        ? `急跌过滤${period}日${params.threshold_percent}%`
+        : `${indicatorType}${period}`;
   const response = await fetch(
     `/api/symbols/${encodeURIComponent(currentSymbol)}/chart-views/${encodeURIComponent(currentViewCode)}/indicators`,
     {
@@ -1871,8 +1884,15 @@ async function createAndAddIndicator(event) {
 
 function updateCustomIndicatorFields() {
   const isWtme = customIndicatorType.value === "WTME";
+  const isRapidDrop = customIndicatorType.value === "RAPID_DROP";
   customIndicatorHalfLife.hidden = !isWtme;
   customIndicatorEpsilon.hidden = !isWtme;
+  customIndicatorThreshold.hidden = !isRapidDrop;
+  customIndicatorPeriod.min = isRapidDrop ? "1" : "2";
+  customIndicatorPeriod.setAttribute(
+    "aria-label",
+    isRapidDrop ? "急跌观察变化段数" : "指标周期",
+  );
 }
 
 async function handleIndicatorAction(event) {
@@ -2042,7 +2062,7 @@ overviewNext.addEventListener("click", () => {
 });
 overviewTable.addEventListener("click", (event) => {
   const sortButton = event.target.closest(".overview-sort-button");
-  if (sortButton) {
+  if (sortButton && !sortButton.disabled) {
     event.stopPropagation();
     applyOverviewSort(sortButton.dataset.sortKey);
     return;
@@ -2061,6 +2081,14 @@ overviewTable.addEventListener("click", (event) => {
     return;
   }
   loadMarketData(row.dataset.symbol);
+});
+overviewTable.addEventListener("change", (event) => {
+  const select = event.target.closest(".overview-indicator-select");
+  if (!select) return;
+  const index = Number(select.dataset.overviewIndicatorIndex);
+  if (Number.isInteger(index) && index >= 0 && index < 3) {
+    changeOverviewIndicatorColumn(index, select.value);
+  }
 });
 overviewTable.addEventListener("mouseover", (event) => {
   const target = event.target.closest("[data-analysis-trend-tooltip]");
@@ -2140,11 +2168,6 @@ overviewTable.addEventListener("dragend", async () => {
 shutdownButton.addEventListener("click", shutdownSystem);
 overviewLiveToggle.addEventListener("change", () => {
   setOverviewLiveRefresh(overviewLiveToggle.checked);
-});
-overviewIndicatorSelects.forEach((select, index) => {
-  select.addEventListener("change", () => {
-    changeOverviewIndicatorColumn(index, select.value);
-  });
 });
 analysisRefreshAll.addEventListener("click", () => startAnalysisOverviewRefresh());
 themeToggle.addEventListener("click", () => {
@@ -2237,6 +2260,7 @@ initTheme();
 updateCustomIndicatorFields();
 startHeartbeat();
 initializeOverviewIndicatorSelection();
+loadOverviewRefreshPreference();
 loadIndicatorCatalog().finally(() => loadMarketOverview());
 
 function escapeHtml(value) {

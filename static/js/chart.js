@@ -637,7 +637,7 @@ function drawIndicators(ctx, plot, priceRange) {
 }
 
 function isOscillatorIndicator(series) {
-  return ["ATR", "RATR", "WTME"].includes(series.indicator_type);
+  return ["ATR", "RATR", "WTME", "RAPID_DROP"].includes(series.indicator_type);
 }
 
 function getVisibleOscillatorSeries() {
@@ -652,6 +652,7 @@ function drawOscillatorIndicators(ctx, plot, seriesList, theme) {
     ATR: getIndicatorRange(seriesList, "ATR"),
     RATR: getIndicatorRange(seriesList, "RATR", true),
     WTME: getIndicatorRange(seriesList, "WTME", true),
+    RAPID_DROP: getIndicatorRange(seriesList, "RAPID_DROP", true),
   };
 
   for (const series of seriesList) {
@@ -742,6 +743,11 @@ function drawOscillatorAxes(ctx, plot, ranges, theme) {
       ctx.textAlign = "right";
       ctx.fillText(value.toFixed(2), plot.right - 8, y);
     }
+    if (ranges.RAPID_DROP) {
+      const value = ranges.RAPID_DROP.max - (ranges.RAPID_DROP.max - ranges.RAPID_DROP.min) * (index / 2);
+      ctx.textAlign = "left";
+      ctx.fillText(value.toFixed(1), plot.left + 8, y);
+    }
   }
   ctx.textBaseline = "top";
   if (ranges.ATR) {
@@ -755,6 +761,10 @@ function drawOscillatorAxes(ctx, plot, ranges, theme) {
   if (ranges.WTME) {
     ctx.textAlign = "right";
     ctx.fillText("WTME", plot.right - 6, plot.top + (ranges.RATR ? 18 : 4));
+  }
+  if (ranges.RAPID_DROP) {
+    ctx.textAlign = "left";
+    ctx.fillText("急跌 0/1", plot.left + 6, plot.top + (ranges.ATR ? 18 : 4));
   }
 }
 
@@ -1285,7 +1295,8 @@ function recalculateIndicators() {
 
 function calculateIndicatorValues(candles, indicator) {
   const period = Number(indicator.params?.period);
-  if (!Number.isInteger(period) || period < 2) {
+  const minimumPeriod = indicator.indicator_type === "RAPID_DROP" ? 1 : 2;
+  if (!Number.isInteger(period) || period < minimumPeriod) {
     return candles.map(() => null);
   }
   if (indicator.indicator_type === "MA") {
@@ -1308,7 +1319,38 @@ function calculateIndicatorValues(candles, indicator) {
       Number(indicator.params?.epsilon),
     );
   }
+  if (indicator.indicator_type === "RAPID_DROP") {
+    return calculateRapidDropFilter(
+      candles,
+      period,
+      Number(indicator.params?.threshold_percent),
+    );
+  }
   return candles.map(() => null);
+}
+
+function calculateRapidDropFilter(candles, period, thresholdPercent) {
+  const values = candles.map(() => null);
+  if (!Number.isInteger(period) || period < 1 || !Number.isFinite(thresholdPercent) || thresholdPercent <= 0) {
+    return values;
+  }
+  const threshold = -thresholdPercent / 100;
+  for (let rowIndex = period; rowIndex < candles.length; rowIndex += 1) {
+    let triggered = false;
+    let valid = true;
+    for (let currentIndex = rowIndex - period + 1; currentIndex <= rowIndex; currentIndex += 1) {
+      const previousClose = candles[currentIndex - 1].close;
+      if (!Number.isFinite(previousClose) || previousClose <= 0) {
+        valid = false;
+        break;
+      }
+      if (candles[currentIndex].close / previousClose - 1 <= threshold) {
+        triggered = true;
+      }
+    }
+    if (valid) values[rowIndex] = triggered ? 1 : 0;
+  }
+  return values;
 }
 
 function calculateWilderATR(candles, period) {

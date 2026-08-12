@@ -47,9 +47,10 @@ def calculate_indicator_values(
     *,
     half_life: float | None = None,
     epsilon: float = WTME_DEFAULT_EPSILON,
+    threshold_percent: float | None = None,
 ) -> list[float | None]:
     normalized_type = str(indicator_type).strip().upper()
-    if period < 2:
+    if period < (1 if normalized_type == "RAPID_DROP" else 2):
         return [None] * len(rows)
     if normalized_type == "MA":
         return _calculate_ma(rows, period)
@@ -66,6 +67,12 @@ def calculate_indicator_values(
             WTME_DEFAULT_HALF_LIFE if half_life is None else half_life,
             epsilon,
         )
+    if normalized_type == "RAPID_DROP":
+        return calculate_rapid_drop_filter(
+            rows,
+            period,
+            float(threshold_percent) if threshold_percent is not None else 5.0,
+        )
     return [None] * len(rows)
 
 
@@ -81,6 +88,7 @@ def latest_indicator_value(
         period,
         half_life=params.get("half_life"),
         epsilon=float(params.get("epsilon", WTME_DEFAULT_EPSILON)),
+        threshold_percent=params.get("threshold_percent"),
     )
     for index in range(len(values) - 1, -1, -1):
         value = values[index]
@@ -149,6 +157,39 @@ def _calculate_relative_atr_score(
         current_close = float(rows[index]["close"])
         base_close = float(rows[index - period]["close"])
         values[index] = (current_close - base_close) / atr
+    return values
+
+
+def calculate_rapid_drop_filter(
+    rows: list[dict],
+    period: int,
+    threshold_percent: float,
+) -> list[float | None]:
+    """Flag whether any of the latest N close-to-close moves is a rapid drop.
+
+    The value ending at row ``i`` examines exactly ``period`` consecutive
+    changes, including the change into row ``i``.  Callers deliberately pass
+    through an unfinished latest daily bar, so its current close participates
+    in the newest change just like the live event price in the rapid-drop
+    rotation strategies.
+    """
+    values: list[float | None] = [None] * len(rows)
+    if period < 1 or threshold_percent <= 0:
+        return values
+    threshold = -float(threshold_percent) / 100
+    for index in range(period, len(rows)):
+        triggered = False
+        valid = True
+        for current_index in range(index - period + 1, index + 1):
+            previous_close = float(rows[current_index - 1]["close"])
+            if previous_close <= 0:
+                valid = False
+                break
+            current_close = float(rows[current_index]["close"])
+            if current_close / previous_close - 1 <= threshold:
+                triggered = True
+        if valid:
+            values[index] = 1.0 if triggered else 0.0
     return values
 
 

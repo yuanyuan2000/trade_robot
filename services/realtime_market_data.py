@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import threading
-import time
 from zoneinfo import ZoneInfo
 
 from config import ALPACA_API_KEY, ALPACA_SECRET
@@ -22,37 +21,26 @@ def _minute_timestamp(value: datetime) -> datetime:
 
 
 class IEXMarketDataHub:
-    """Shared IEX data owner for realtime decision tasks.
+    """Event-time IEX data owner for formal realtime decisions.
 
-    The free Alpaca plan is deliberately pinned to IEX.  A background polling
-    loop keeps a cheap latest-bar cache warm; event snapshots use a bounded
-    historical request so the evaluator can prove which complete minute was
-    used.  The scheduled REST snapshot remains the source of truth for
-    decisions, while the cache can later be fed by Alpaca's websocket stream.
+    There is intentionally no background polling. Each scheduled action takes
+    an exact REST snapshot, even when market-overview automatic refresh is off.
     """
 
     def __init__(self, *, poll_seconds: float = 15.0):
+        # Retained as a compatibility attribute for callers/tests. It is not
+        # used to schedule network requests.
         self.poll_seconds = max(5.0, float(poll_seconds))
         self._lock = threading.RLock()
         self._symbols: set[str] = set()
         self._latest: dict[str, dict] = {}
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
         self._last_error: str | None = None
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._poll_loop, name="realtime-iex", daemon=True)
-        self._thread.start()
+        return None
 
     def stop(self) -> None:
-        self._stop.set()
-        thread = self._thread
-        if thread and thread.is_alive():
-            thread.join(timeout=2.0)
-        self._thread = None
+        return None
 
     def set_symbols(self, symbols: list[str] | tuple[str, ...] | set[str]) -> None:
         with self._lock:
@@ -71,10 +59,6 @@ class IEXMarketDataHub:
     def last_error(self) -> str | None:
         with self._lock:
             return self._last_error
-
-    def _poll_loop(self) -> None:
-        while not self._stop.wait(self.poll_seconds):
-            self.refresh_latest()
 
     def refresh_latest(self, symbols: list[str] | None = None) -> dict[str, dict]:
         with self._lock:

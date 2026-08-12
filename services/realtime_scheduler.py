@@ -18,6 +18,7 @@ from services.backtest.validation import validate_strategy_payload
 from services.realtime_decision_service import RealtimeDecisionEvaluator
 from services.realtime_mail import MailError, NotificationDispatcher
 from services.realtime_market_data import IEXMarketDataHub
+from services.realtime_panel_script import generate_panel_settings
 
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -203,10 +204,18 @@ class RealtimeTaskManager:
             and task["strategy_snapshot"].get("code_version") == strategy.get("code_version")
         ):
             return task
-        return realtime_repository.update_task(
+        updated = realtime_repository.update_task(
             task["id"], strategy_snapshot=strategy,
             source_strategy_revision=strategy["revision"], source_code_version=strategy.get("code_version"),
         )
+        if (
+            strategy.get("design_mode") == "visual"
+            and not (task.get("panel_settings") or {}).get("customized")
+        ):
+            updated = realtime_repository.update_panel_settings(
+                task["id"], generate_panel_settings(strategy)
+            )
+        return updated
 
     def _sessions_for(self, start: date, end: date) -> list[dict]:
         key = f"{start.isoformat()}:{end.isoformat()}"
@@ -248,8 +257,6 @@ class RealtimeTaskManager:
             strategy = task["strategy_snapshot"]
             realtime_repository.update_run(run_id, status="running", heartbeat_at=datetime.now(UTC).replace(microsecond=0).isoformat())
             realtime_repository.set_task_runtime(task_id, runtime_state="running", heartbeat_at=datetime.now(UTC).replace(microsecond=0).isoformat())
-            symbols = [item["symbol"] for item in strategy["definition"].get("symbols", [])]
-            self.hub.set_symbols(symbols)
             processed: set[str] = set()
             while not state["stop"].is_set():
                 task = realtime_repository.get_task(task_id)

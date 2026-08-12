@@ -30,10 +30,11 @@ def _task_row(row: sqlite3.Row | dict) -> dict:
     for column, key, default in (
         ("strategy_snapshot_json", "strategy_snapshot", {}),
         ("settings_json", "settings", {}),
+        ("panel_settings_json", "panel_settings", {}),
         ("notification_settings_json", "notification_settings", {}),
         ("portfolio_state_json", "portfolio_state", {}),
     ):
-        item[key] = _decode(item.pop(column), default)
+        item[key] = _decode(item.pop(column, None), default)
     return item
 
 
@@ -93,6 +94,7 @@ def create_task(
     settings: dict,
     notification_settings: dict,
     portfolio_state: dict,
+    panel_settings: dict | None = None,
 ) -> dict:
     now = utc_now_iso()
     snapshot = {key: value for key, value in strategy.items() if key != "deleted_at"}
@@ -104,10 +106,10 @@ def create_task(
                     name, strategy_id, follow_strategy,
                     source_strategy_revision, source_code_version,
                     strategy_snapshot_json, settings_json,
-                    notification_settings_json, portfolio_state_json,
+                    panel_settings_json, notification_settings_json, portfolio_state_json,
                     desired_state, runtime_state, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', 'stopped', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', 'stopped', ?, ?)
                 """,
                 (
                     str(name).strip(),
@@ -117,6 +119,7 @@ def create_task(
                     strategy.get("code_version"),
                     _json(snapshot),
                     _json(settings),
+                    _json(panel_settings or {}),
                     _json(notification_settings),
                     _json(portfolio_state),
                     now,
@@ -129,6 +132,56 @@ def create_task(
             raise ValueError("实时决策任务名称已存在。") from exc
         raise
     return get_task(task_id)
+
+
+def seed_task_once(
+    seed_key: str,
+    *,
+    name: str,
+    strategy: dict,
+    follow_strategy: bool,
+    settings: dict,
+    notification_settings: dict,
+    portfolio_state: dict,
+    panel_settings: dict | None = None,
+) -> dict | None:
+    """Create one built-in task once, including across a later soft delete."""
+    with get_connection() as conn:
+        seeded = conn.execute(
+            "SELECT task_id FROM realtime_task_seed_state WHERE seed_key = ?",
+            (str(seed_key),),
+        ).fetchone()
+    if seeded:
+        task_id = seeded["task_id"]
+        if task_id is None:
+            return None
+        try:
+            return get_task(int(task_id), include_deleted=True)
+        except ValueError:
+            return None
+    task = create_task(
+        name=name,
+        strategy=strategy,
+        follow_strategy=follow_strategy,
+        settings=settings,
+        notification_settings=notification_settings,
+        portfolio_state=portfolio_state,
+        panel_settings=panel_settings,
+    )
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO realtime_task_seed_state (seed_key, task_id, seeded_at) VALUES (?, ?, ?)",
+            (str(seed_key), int(task["id"]), utc_now_iso()),
+        )
+    return task
+
+
+def claim_task_seed(seed_key: str, task_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO realtime_task_seed_state (seed_key, task_id, seeded_at) VALUES (?, ?, ?)",
+            (str(seed_key), int(task_id), utc_now_iso()),
+        )
 
 
 def update_task(
@@ -212,6 +265,33 @@ def update_portfolio_state(task_id: int, portfolio_state: dict) -> None:
             "UPDATE realtime_decision_tasks SET portfolio_state_json = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
             (_json(portfolio_state), utc_now_iso(), int(task_id)),
         )
+
+
+def update_panel_settings(
+    task_id: int,
+    panel_settings: dict,
+    *,
+    expected_panel_revision: int | None = None,
+) -> dict:
+    current = get_task(task_id)
+    if (
+        expected_panel_revision is not None
+        and int(current["panel_revision"]) != int(expected_panel_revision)
+    ):
+        raise RuntimeError("面板脚本已在其他位置被修改，请刷新后重试。")
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE realtime_decision_tasks
+            SET panel_settings_json = ?, panel_revision = panel_revision + 1,
+                updated_at = ?
+            WHERE id = ? AND deleted_at IS NULL
+            """,
+            (_json(panel_settings), utc_now_iso(), int(task_id)),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("实时决策任务不存在或已删除。")
+    return get_task(task_id)
 
 
 def soft_delete_task(task_id: int) -> dict:
@@ -570,11 +650,18 @@ def get_notification(notification_id: int) -> dict:
     return dict(row)
 
 
-def list_notifications(task_id: int, *, limit: int = 100) -> list[dict]:
+def list_notifications(
+    task_id: int,
+    *,
+    limit: int = 100,
+    before_id: int | None = None,
+) -> list[dict]:
+    clause = "AND id < ?" if before_id is not None else ""
+    params = [int(task_id)] + ([int(before_id)] if before_id is not None else []) + [int(limit)]
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM realtime_notifications WHERE task_id = ? ORDER BY id DESC LIMIT ?",
-            (int(task_id), int(limit)),
+            f"SELECT * FROM realtime_notifications WHERE task_id = ? {clause} ORDER BY id DESC LIMIT ?",
+            params,
         ).fetchall()
     return [dict(row) for row in rows]
 

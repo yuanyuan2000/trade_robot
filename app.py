@@ -73,6 +73,18 @@ from services.realtime_mail import (
     validate_message_template,
 )
 from services.realtime_scheduler import run_manager as realtime_run_manager
+from services.market_overview_coordinator import market_overview_coordinator
+from services.realtime_dashboard_service import (
+    build_realtime_dashboard,
+    clear_realtime_dashboard_cache,
+    dashboard_recommendations,
+)
+from services.realtime_panel_script import (
+    generate_panel_settings,
+    validate_panel_script,
+    validate_panel_settings,
+)
+from services.realtime_presets import ensure_shipped_realtime_tasks
 
 
 app = Flask(__name__)
@@ -80,13 +92,6 @@ app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 session_lock = threading.Lock()
 last_heartbeat_at: datetime | None = None
 shutdown_pending = False
-overview_sync_lock = threading.Lock()
-overview_sync_state = {
-    "running": False,
-    "last_result": None,
-    "last_error": None,
-    "updated_at": None,
-}
 market_data_update_lock = threading.Lock()
 market_data_update_jobs: dict[str, dict] = {}
 analysis_overview_lock = threading.Lock()
@@ -596,8 +601,8 @@ def market_overview():
             indicator_id = int(raw_value)
             if indicator_id not in requested_ids:
                 requested_ids.append(indicator_id)
-        if len(requested_ids) > 2:
-            raise ValueError("行情总览最多显示 2 个自定义指标。")
+        if len(requested_ids) > 3:
+            raise ValueError("行情总览最多显示 3 个自定义指标。")
 
         favorite_by_id = {
             int(indicator["id"]): indicator
@@ -787,6 +792,27 @@ def market_overview_sync_status():
     return jsonify({"ok": True, **overview_sync_snapshot()})
 
 
+@app.route("/api/market-overview/auto-refresh", methods=["PATCH"])
+def market_overview_auto_refresh():
+    payload = request.get_json(silent=True) or {}
+    if "enabled" not in payload or not isinstance(payload["enabled"], bool):
+        return jsonify({
+            "ok": False,
+            "error": {"code": "INVALID_INPUT", "message": "enabled 必须是布尔值。"},
+        }), 400
+    try:
+        return jsonify({
+            "ok": True,
+            **market_overview_coordinator.set_auto_enabled(bool(payload["enabled"])),
+        })
+    except Exception as exc:
+        app.logger.exception("Unable to update market overview auto refresh")
+        return jsonify({
+            "ok": False,
+            "error": {"code": "AUTO_REFRESH_FAILED", "message": str(exc)},
+        }), 500
+
+
 @app.route("/api/market-overview/refresh-prices", methods=["POST"])
 def market_overview_refresh_prices():
     try:
@@ -833,42 +859,17 @@ def market_overview_refresh_prices():
 
 
 def start_overview_sync() -> bool:
-    with overview_sync_lock:
-        if overview_sync_state["running"]:
-            return False
-        overview_sync_state["running"] = True
-        overview_sync_state["last_error"] = None
-        overview_sync_state["updated_at"] = now_utc().isoformat()
-
-    threading.Thread(target=run_overview_sync, daemon=True).start()
-    return True
+    return market_overview_coordinator.trigger()
 
 
 def run_overview_sync() -> None:
-    try:
-        result = sync_market_overview_daily_prices()
-        with overview_sync_lock:
-            overview_sync_state["last_result"] = result
-            overview_sync_state["last_error"] = None
-            overview_sync_state["updated_at"] = now_utc().isoformat()
-    except Exception as exc:
-        app.logger.exception("Background market overview sync failed")
-        with overview_sync_lock:
-            overview_sync_state["last_error"] = str(exc)
-            overview_sync_state["updated_at"] = now_utc().isoformat()
-    finally:
-        with overview_sync_lock:
-            overview_sync_state["running"] = False
+    # Compatibility entry point used by maintenance/tests; the application
+    # itself schedules refreshes only through the coordinator.
+    sync_market_overview_daily_prices()
 
 
 def overview_sync_snapshot() -> dict:
-    with overview_sync_lock:
-        return {
-            "running": bool(overview_sync_state["running"]),
-            "last_result": overview_sync_state["last_result"],
-            "last_error": overview_sync_state["last_error"],
-            "updated_at": overview_sync_state["updated_at"],
-        }
+    return market_overview_coordinator.snapshot()
 
 
 def save_analysis_overview_snapshot(symbol: str, payload: dict) -> dict:
@@ -1519,6 +1520,18 @@ def realtime_tasks():
         for task in tasks:
             runs = realtime_repository.list_runs(task["id"], limit=1)
             task["latest_run"] = runs[0] if runs else None
+            if task.get("strategy_snapshot", {}).get("selection_mode") == "competition":
+                try:
+                    dashboard = build_realtime_dashboard(task["id"])
+                    task["overview_recommendations"] = dashboard_recommendations(
+                        dashboard, limit=3
+                    )
+                    task["overview_recommendations_calculated_at"] = dashboard.get(
+                        "calculated_at"
+                    )
+                except Exception as exc:
+                    task["overview_recommendations"] = []
+                    task["overview_recommendations_error"] = str(exc)
         return jsonify({"ok": True, "tasks": tasks})
     except Exception as exc:
         return backtest_error_response(exc)
@@ -1545,6 +1558,7 @@ def create_realtime_task():
             settings=settings,
             notification_settings=extras["notification"],
             portfolio_state=extras["portfolio"],
+            panel_settings=generate_panel_settings(strategy),
         )
         return jsonify({"ok": True, "task": task}), 201
     except Exception as exc:
@@ -1556,8 +1570,9 @@ def get_realtime_task(task_id: int):
     try:
         task = realtime_run_manager.status(task_id)
         task["runs"] = realtime_repository.list_runs(task_id, limit=20)
-        task["events"] = realtime_repository.list_events(task_id, limit=50)
-        task["notifications"] = realtime_repository.list_notifications(task_id, limit=50)
+        if str(request.args.get("include_logs") or "").lower() in {"1", "true", "yes"}:
+            task["events"] = realtime_repository.list_events(task_id, limit=50)
+            task["notifications"] = realtime_repository.list_notifications(task_id, limit=50)
         return jsonify({"ok": True, "task": task})
     except Exception as exc:
         return backtest_error_response(exc)
@@ -1589,6 +1604,20 @@ def patch_realtime_task(task_id: int):
             portfolio_state=extras["portfolio"],
             expected_revision=payload.get("revision"),
         )
+        if (
+            snapshot.get("design_mode") == "visual"
+            and not (current.get("panel_settings") or {}).get("customized")
+            and (
+                not (current.get("panel_settings") or {}).get("script")
+                or snapshot.get("definition")
+                != current["strategy_snapshot"].get("definition")
+                or int(snapshot.get("revision") or 0)
+                != int(current["strategy_snapshot"].get("revision") or 0)
+            )
+        ):
+            task = realtime_repository.update_panel_settings(
+                task_id, generate_panel_settings(snapshot)
+            )
         return jsonify({"ok": True, "task": task})
     except Exception as exc:
         return backtest_error_response(exc)
@@ -1625,7 +1654,106 @@ def validate_realtime_task(task_id: int):
     try:
         task = realtime_repository.get_task(task_id)
         strategy = validate_strategy_payload(task["strategy_snapshot"])
-        return jsonify({"ok": True, "events": _events_for_realtime_strategy(strategy), "strategy_revision": strategy["revision"]})
+        return jsonify({
+            "ok": True,
+            "events": _events_for_realtime_strategy(strategy),
+            "strategy_revision": task["source_strategy_revision"],
+        })
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>/dashboard")
+def realtime_task_dashboard(task_id: int):
+    try:
+        force = str(request.args.get("force") or "").lower() in {"1", "true", "yes"}
+        return jsonify({
+            "ok": True,
+            "dashboard": build_realtime_dashboard(task_id, force=force),
+            "overview_refresh": overview_sync_snapshot(),
+        })
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>/panel", methods=["PATCH"])
+def patch_realtime_task_panel(task_id: int):
+    payload = request.get_json(silent=True) or {}
+    try:
+        task = realtime_repository.get_task(task_id)
+        if task["strategy_snapshot"].get("design_mode") != "visual":
+            raise ValueError("代码策略的实时面板必须在对应策略代码中修改。")
+        panel_settings = {
+            **(task.get("panel_settings") or {}),
+            "script": payload.get("script", (task.get("panel_settings") or {}).get("script")),
+            "customized": True,
+        }
+        panel_settings = validate_panel_settings(panel_settings, task["strategy_snapshot"])
+        updated = realtime_repository.update_panel_settings(
+            task_id,
+            panel_settings,
+            expected_panel_revision=payload.get("panel_revision"),
+        )
+        clear_realtime_dashboard_cache(task_id)
+        return jsonify({"ok": True, "task": updated})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>/panel/validate", methods=["POST"])
+def validate_realtime_task_panel(task_id: int):
+    payload = request.get_json(silent=True) or {}
+    try:
+        task = realtime_repository.get_task(task_id)
+        if task["strategy_snapshot"].get("design_mode") != "visual":
+            raise ValueError("代码策略使用内置面板定义，无需编辑面板脚本。")
+        parsed = validate_panel_script(str(payload.get("script") or ""))
+        return jsonify({"ok": True, "parsed": parsed})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>/panel/regenerate", methods=["POST"])
+def regenerate_realtime_task_panel(task_id: int):
+    payload = request.get_json(silent=True) or {}
+    try:
+        task = realtime_repository.get_task(task_id)
+        if task["strategy_snapshot"].get("design_mode") != "visual":
+            raise ValueError("代码策略使用内置面板定义，不能生成 JSON 面板脚本。")
+        generated = generate_panel_settings(task["strategy_snapshot"])
+        updated = realtime_repository.update_panel_settings(
+            task_id,
+            generated,
+            expected_panel_revision=payload.get("panel_revision"),
+        )
+        clear_realtime_dashboard_cache(task_id)
+        return jsonify({"ok": True, "task": updated})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>/logs")
+def realtime_task_logs(task_id: int):
+    try:
+        realtime_repository.get_task(task_id)
+        limit = min(100, max(1, int(request.args.get("limit", 50))))
+        legacy_before = request.args.get("before_id")
+        event_before = request.args.get("before_event_id") or legacy_before
+        notification_before = request.args.get("before_notification_id") or legacy_before
+        event_before_id = int(event_before) if event_before else None
+        notification_before_id = int(notification_before) if notification_before else None
+        kind = str(request.args.get("kind") or "all").lower()
+        if kind not in {"all", "decision", "mail"}:
+            raise ValueError("日志类型必须为 all、decision 或 mail。")
+        events = (
+            realtime_repository.list_events(task_id, limit=limit, before_id=event_before_id)
+            if kind in {"all", "decision"} else []
+        )
+        notifications = (
+            realtime_repository.list_notifications(task_id, limit=limit, before_id=notification_before_id)
+            if kind in {"all", "mail"} else []
+        )
+        return jsonify({"ok": True, "events": events, "notifications": notifications})
     except Exception as exc:
         return backtest_error_response(exc)
 
@@ -1957,6 +2085,7 @@ def shutdown_process() -> None:
 
 
 def terminate_child_processes() -> None:
+    market_overview_coordinator.stop()
     backtest_run_manager.shutdown()
     realtime_run_manager.shutdown()
     terminate_analysis_process_executor()
@@ -2042,11 +2171,12 @@ def main() -> None:
     init_database()
     init_intraday_database()
     ensure_shipped_strategy_presets()
+    ensure_shipped_realtime_tasks()
     bootstrap_env_qq_channel()
     backtest_run_manager.recover_interrupted_runs()
     realtime_run_manager.start_services()
     configure_access_logging()
-    start_overview_sync()
+    market_overview_coordinator.start()
     if AUTO_OPEN_BROWSER:
         threading.Thread(target=open_browser, daemon=True).start()
     app.run(host=FLASK_HOST, port=FLASK_PORT, debug=True, use_reloader=False)

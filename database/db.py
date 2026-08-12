@@ -342,6 +342,37 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    ensure_column(
+        conn,
+        "realtime_decision_tasks",
+        "panel_settings_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )
+    ensure_column(
+        conn,
+        "realtime_decision_tasks",
+        "panel_revision",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS realtime_task_seed_state (
+            seed_key TEXT PRIMARY KEY,
+            task_id INTEGER,
+            seeded_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES realtime_decision_tasks(id) ON DELETE SET NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS system_settings (
+            setting_key TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
 
 
 def ensure_column(

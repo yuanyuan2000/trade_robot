@@ -872,6 +872,7 @@ def seed_default_indicators() -> None:
         {"code": "ATR14", "name": "ATR14", "indicator_type": "ATR", "params": {"period": 14}, "description": "Wilder 绝对 ATR"},
         {"code": "RATR14", "name": "相对ATR14", "indicator_type": "RATR", "params": {"period": 14}, "description": "(当前收盘价 - 14 个交易日前收盘价) / 前一日 Wilder ATR(14)"},
         {"code": "WTME40H15E1e-08", "name": "WTME40(h=15)", "indicator_type": "WTME", "params": {"period": 40, "half_life": 15.0, "epsilon": 1e-8}, "description": "加权真实波幅动量效率"},
+        {"code": "RAPID_DROP5P5", "name": "急跌过滤5日5%", "indicator_type": "RAPID_DROP", "params": {"period": 5, "threshold_percent": 5.0}, "description": "近5个连续变化段任一跌幅不小于5%时输出1，否则输出0"},
     ]
     now = utc_now_iso()
     with get_connection() as conn:
@@ -897,16 +898,33 @@ def seed_default_indicators() -> None:
 
 def validate_indicator(indicator_type: str, params: dict) -> tuple[str, dict]:
     normalized_type = str(indicator_type or "").strip().upper()
-    if normalized_type not in {"MA", "EMA", "ATR", "RATR", "WTME"}:
-        raise ValueError("仅支持 MA、EMA、ATR、相对 ATR 和 WTME 指标。")
+    if normalized_type not in {"MA", "EMA", "ATR", "RATR", "WTME", "RAPID_DROP"}:
+        raise ValueError("仅支持 MA、EMA、ATR、相对 ATR、WTME 和急跌过滤指标。")
 
     try:
         period = int(params.get("period"))
     except (TypeError, ValueError) as exc:
         raise ValueError("指标周期必须是整数。") from exc
 
-    if period < 2 or period > 500:
-        raise ValueError("指标周期必须在 2 到 500 之间。")
+    minimum_period = 1 if normalized_type == "RAPID_DROP" else 2
+    if period < minimum_period or period > 500:
+        raise ValueError(f"指标周期必须在 {minimum_period} 到 500 之间。")
+
+    if normalized_type == "RAPID_DROP":
+        try:
+            threshold_percent = float(params.get("threshold_percent"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("急跌阈值必须是数值。") from exc
+        if (
+            not math.isfinite(threshold_percent)
+            or threshold_percent < 0.1
+            or threshold_percent > 50
+        ):
+            raise ValueError("急跌阈值必须在 0.1% 到 50% 之间。")
+        return normalized_type, {
+            "period": period,
+            "threshold_percent": threshold_percent,
+        }
 
     if normalized_type != "WTME":
         return normalized_type, {"period": period}
@@ -979,6 +997,11 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
             f"WTME{normalized_params['period']}"
             f"(h={normalized_params['half_life']:g})"
         )
+    elif normalized_type == "RAPID_DROP":
+        default_name = (
+            f"急跌过滤{normalized_params['period']}日"
+            f"{normalized_params['threshold_percent']:g}%"
+        )
     else:
         default_name = f"{normalized_type}{normalized_params['period']}"
     code = f"{normalized_type}{normalized_params['period']}"
@@ -986,6 +1009,9 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
         half_life_code = format(normalized_params["half_life"], ".15g")
         epsilon_code = format(normalized_params["epsilon"], ".15g")
         code += f"H{half_life_code}E{epsilon_code}"
+    elif normalized_type == "RAPID_DROP":
+        threshold_code = format(normalized_params["threshold_percent"], ".15g")
+        code += f"P{threshold_code}"
     now = utc_now_iso()
 
     with get_connection() as conn:
@@ -1018,6 +1044,8 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
                     if normalized_type == "RATR"
                     else "加权方向收益 / 加权标准化真实波幅 × 100"
                     if normalized_type == "WTME"
+                    else "近 N 个连续变化段任一跌幅达到阈值时输出 1，否则输出 0"
+                    if normalized_type == "RAPID_DROP"
                     else "用户创建指标"
                 ),
                 now,
@@ -1387,6 +1415,38 @@ def list_tables() -> list[str]:
 
 def quote_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
+
+
+def get_system_setting(setting_key: str, default=None):
+    """Return a small service-level setting stored as JSON."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT value_json FROM system_settings WHERE setting_key = ?",
+            (str(setting_key),),
+        ).fetchone()
+    if not row:
+        return default
+    try:
+        return json.loads(row["value_json"])
+    except (TypeError, ValueError):
+        return default
+
+
+def set_system_setting(setting_key: str, value):
+    now = utc_now_iso()
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO system_settings (setting_key, value_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(setting_key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            """,
+            (str(setting_key), encoded, now),
+        )
+    return value
 
 
 def get_table_page(table_name: str, page: int, page_size: int, search: str = "") -> dict:

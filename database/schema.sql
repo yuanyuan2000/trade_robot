@@ -333,6 +333,8 @@ CREATE TABLE IF NOT EXISTS realtime_decision_tasks (
     source_code_version TEXT,
     strategy_snapshot_json TEXT NOT NULL,
     settings_json TEXT NOT NULL,
+    panel_settings_json TEXT NOT NULL DEFAULT '{}',
+    panel_revision INTEGER NOT NULL DEFAULT 1,
     notification_settings_json TEXT NOT NULL,
     portfolio_state_json TEXT NOT NULL DEFAULT '{}',
     desired_state TEXT NOT NULL DEFAULT 'stopped'
@@ -360,6 +362,19 @@ ON realtime_decision_tasks(deleted_at, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_realtime_tasks_runtime
 ON realtime_decision_tasks(runtime_state, desired_state, next_event_at);
+
+CREATE TABLE IF NOT EXISTS realtime_task_seed_state (
+    seed_key TEXT PRIMARY KEY,
+    task_id INTEGER,
+    seeded_at TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES realtime_decision_tasks(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS system_settings (
+    setting_key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS realtime_decision_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

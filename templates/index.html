@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260804-04') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260813-01') }}">
   </head>
   <body class="theme-dark">
     <aside class="sidebar">
@@ -80,20 +80,6 @@
           <div class="panel-title">
             <h3 id="overview-title">行情总览</h3>
             <div class="overview-title-actions">
-              <div id="overview-indicator-controls" class="overview-indicator-controls" aria-label="行情总览自定义指标列">
-                <label>
-                  <span>指标列 1</span>
-                  <select id="overview-indicator-1" aria-label="行情总览指标列 1">
-                    <option value="">不显示</option>
-                  </select>
-                </label>
-                <label>
-                  <span>指标列 2</span>
-                  <select id="overview-indicator-2" aria-label="行情总览指标列 2">
-                    <option value="">不显示</option>
-                  </select>
-                </label>
-              </div>
               <button id="analysis-refresh-all" class="tool-icon-button" type="button"
                 title="更新全部趋势线分析" aria-label="更新全部趋势线分析" hidden>
                 <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -243,10 +229,12 @@
                 <option value="ATR">绝对 ATR（Wilder）</option>
                 <option value="RATR">相对 ATR 动量评分</option>
                 <option value="WTME">加权真实波幅动量效率（WTME）</option>
+                <option value="RAPID_DROP">急跌过滤（0/1）</option>
               </select>
               <input id="custom-indicator-period" type="number" min="2" max="500" value="20" aria-label="指标周期">
               <input id="custom-indicator-half-life" type="number" min="0.1" max="500" step="0.1" value="15" aria-label="WTME 权重半衰期" title="WTME 权重半衰期 h" hidden>
               <input id="custom-indicator-epsilon" type="number" min="0.000000000001" max="0.01" step="0.000000000001" value="0.00000001" aria-label="WTME epsilon" title="WTME epsilon" hidden>
+              <input id="custom-indicator-threshold" type="number" min="0.1" max="50" step="0.1" value="5" aria-label="急跌阈值百分比" title="单日急跌阈值（%）" hidden>
               <button type="submit">添加</button>
             </form>
           </section>
@@ -282,20 +270,46 @@
 
         <div id="realtime-detail-page" hidden>
           <header class="page-header">
-            <div>
-              <button id="realtime-back" type="button">← 返回任务</button>
-              <h2 id="realtime-detail-title">实时决策任务</h2>
-              <p id="realtime-detail-subtitle"></p>
+            <div class="realtime-detail-heading">
+              <button id="realtime-back" class="realtime-back-icon" type="button" title="返回任务" aria-label="返回任务">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+              </button>
+              <div class="realtime-detail-title-copy">
+                <h2 id="realtime-detail-title">实时决策任务</h2>
+                <p id="realtime-detail-subtitle"></p>
+              </div>
             </div>
             <div class="realtime-detail-actions">
-              <button id="realtime-save" type="button">保存设置</button>
+              <button class="realtime-icon-action is-active" type="button" data-realtime-tab="dashboard" title="实时数据面板" aria-label="实时数据面板">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-7M22 19H2" /></svg>
+              </button>
+              <button class="realtime-icon-action" type="button" data-realtime-tab="parameters" title="策略参数" aria-label="策略参数">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>
+              </button>
+              <button class="realtime-icon-action" type="button" data-realtime-tab="notification" title="通知设置" aria-label="通知设置">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m4 7 8 6 8-6"/></svg>
+              </button>
+              <button class="realtime-icon-action" type="button" data-realtime-tab="logs" title="决策与邮件日志" aria-label="决策与邮件日志">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/></svg>
+              </button>
               <button id="realtime-start" class="primary-action" type="button">运行</button>
               <button id="realtime-stop" class="danger-action" type="button" hidden>终止</button>
             </div>
           </header>
           <div id="realtime-detail-status" class="status neutral">请选择任务</div>
-          <div class="realtime-detail-grid">
-            <section class="panel realtime-strategy-panel">
+          <section class="panel realtime-dashboard-panel" data-realtime-panel="dashboard">
+            <div class="realtime-dashboard-toolbar">
+              <label class="realtime-search"><span class="sr-only">搜索标的</span><input id="realtime-dashboard-search" type="search" placeholder="搜索标的及名称"></label>
+              <select id="realtime-dashboard-status-filter" aria-label="按状态筛选"><option value="all">全部状态</option><option value="eligible">策略通过</option><option value="filtered">已过滤</option><option value="signal">有信号</option><option value="unavailable">不可计算</option></select>
+              <label class="realtime-follow-field realtime-candidate-filter"><input id="realtime-dashboard-candidate-only" type="checkbox"><span>仅看候选池</span></label>
+              <span class="realtime-candidate-legend"><i aria-hidden="true"></i>候选池标的</span>
+              <label class="switch-control realtime-auto-control" title="与行情总览共用同一个服务端自动更新开关"><input id="realtime-overview-auto-toggle" type="checkbox"><span class="switch-track" aria-hidden="true"></span><span class="switch-label">行情自动更新</span></label>
+              <button id="realtime-dashboard-refresh" type="button" title="只重新读取内部数据库并计算，不调用外部 API">重新计算</button>
+            </div>
+            <div id="realtime-dashboard-meta" class="realtime-dashboard-meta">等待读取内部行情数据库</div>
+            <div id="realtime-dashboard-table" class="realtime-dashboard-table-wrap"></div>
+          </section>
+          <section class="panel realtime-strategy-panel" data-realtime-panel="parameters" hidden>
               <div class="panel-title"><h3>策略参数</h3><span id="realtime-revision"></span></div>
               <label class="backtest-field"><span>任务名称</span><input id="realtime-name" maxlength="100"></label>
               <label class="realtime-follow-field"><input id="realtime-follow" type="checkbox"><span>自动跟随源策略（运行中使用当前快照，停止后同步）</span></label>
@@ -303,8 +317,14 @@
               <label class="backtest-field"><span>策略定义 JSON（取消跟随后可编辑）</span><textarea id="realtime-definition-json" rows="12"></textarea></label>
               <label class="backtest-field"><span>模拟初始资金</span><input id="realtime-capital" type="number" min="0.01" step="0.01"></label>
               <label class="backtest-field"><span>整体杠杆</span><input id="realtime-leverage" type="number" min="1" max="10" step="0.1"></label>
-            </section>
-            <section class="panel realtime-notification-panel">
+              <div id="realtime-panel-script-fields" hidden>
+                <label class="backtest-field"><span>实时面板列脚本（受限 JSON，仅影响展示）</span><textarea id="realtime-panel-script" rows="14" spellcheck="false"></textarea></label>
+                <div class="realtime-inline-actions"><button id="realtime-panel-validate" type="button">校验脚本</button><button id="realtime-panel-regenerate" type="button">恢复自动生成</button><button id="realtime-panel-save" class="primary-action" type="button">保存面板脚本</button><span id="realtime-panel-revision"></span></div>
+              </div>
+              <p id="realtime-code-panel-note" class="realtime-panel-note">代码策略的指标列由对应策略代码定义。</p>
+              <div class="realtime-panel-footer"><button id="realtime-save" class="primary-action" type="button">保存策略参数</button></div>
+          </section>
+          <section class="panel realtime-notification-panel" data-realtime-panel="notification" hidden>
               <div class="panel-title"><h3>通知设置</h3><span>每任务普通邮件至少间隔 1 分钟</span></div>
               <label class="realtime-follow-field"><input id="realtime-mail-enabled" type="checkbox"><span>发送提示邮件</span></label>
               <label class="backtest-field"><span>邮件通道（发件身份）</span><select id="realtime-channel"></select></label>
@@ -333,11 +353,12 @@
               <div id="realtime-code-body-preview" class="realtime-template-preview" hidden></div>
               <button id="realtime-new-channel" type="button">新增 QQ/Gmail 通道</button>
               <button id="realtime-test-channel" type="button">发送测试邮件</button>
-            </section>
-          </div>
-          <section class="panel realtime-log-panel">
-            <div class="panel-title"><h3>决策与邮件日志</h3><span id="realtime-log-count">0 条</span></div>
+              <div class="realtime-panel-footer"><button id="realtime-save-mail" class="primary-action" type="button">保存通知设置</button></div>
+          </section>
+          <section class="panel realtime-log-panel" data-realtime-panel="logs" hidden>
+            <div class="panel-title"><h3>决策与邮件日志</h3><div class="realtime-log-actions"><select id="realtime-log-kind"><option value="all">全部日志</option><option value="decision">仅决策</option><option value="mail">仅邮件</option></select><span id="realtime-log-count">0 条</span></div></div>
             <div id="realtime-log-output" class="realtime-log-output"></div>
+            <button id="realtime-log-more" type="button">加载更多</button>
           </section>
         </div>
       </section>
@@ -690,10 +711,10 @@
       </form>
     </dialog>
 
-    <script src="{{ url_for('static', filename='js/chart.js', v='20260804-02') }}"></script>
+    <script src="{{ url_for('static', filename='js/chart.js', v='20260812-01') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260730-02') }}"></script>
     <script src="{{ url_for('static', filename='js/backtest.js', v='20260805-01') }}"></script>
-    <script src="{{ url_for('static', filename='js/realtime.js', v='20260804-05') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260804-03') }}"></script>
+    <script src="{{ url_for('static', filename='js/realtime.js', v='20260812-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260813-01') }}"></script>
   </body>
 </html>

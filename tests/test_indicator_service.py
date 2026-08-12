@@ -11,6 +11,7 @@ from database import repository
 from services.indicator_service import (
     attach_overview_indicator_values,
     calculate_indicator_values,
+    calculate_rapid_drop_filter,
     calculate_wilder_atr,
     calculate_wtme,
     calculate_wtme_components,
@@ -38,6 +39,25 @@ class IndicatorCalculationTests(unittest.TestCase):
             ),
             ("WTME", {"period": 40, "half_life": 15.0, "epsilon": 1e-8}),
         )
+        self.assertEqual(
+            repository.validate_indicator(
+                "rapid_drop",
+                {"period": "5", "threshold_percent": "5"},
+            ),
+            ("RAPID_DROP", {"period": 5, "threshold_percent": 5.0}),
+        )
+
+    def test_rapid_drop_indicator_validates_strategy_compatible_ranges(self) -> None:
+        self.assertEqual(
+            repository.validate_indicator(
+                "RAPID_DROP", {"period": 1, "threshold_percent": 0.1}
+            ),
+            ("RAPID_DROP", {"period": 1, "threshold_percent": 0.1}),
+        )
+        with self.assertRaisesRegex(ValueError, "0.1% 到 50%"):
+            repository.validate_indicator(
+                "RAPID_DROP", {"period": 5, "threshold_percent": 0}
+            )
 
     def test_wtme_matches_weighted_formula(self) -> None:
         rows = sample_rows()[:4]
@@ -101,6 +121,31 @@ class IndicatorCalculationTests(unittest.TestCase):
         self.assertEqual(values[:4], [None, None, None, None])
         self.assertAlmostEqual(values[4], (110 - 101) / 2)
 
+    def test_rapid_drop_filter_checks_n_changes_and_includes_latest_bar(self) -> None:
+        rows = [
+            {"date": "2024-01-01", "close": 100, "is_complete": 1},
+            {"date": "2024-01-02", "close": 98, "is_complete": 1},
+            {"date": "2024-01-03", "close": 93.1, "is_complete": 1},
+            {"date": "2024-01-04", "close": 94, "is_complete": 1},
+            {"date": "2024-01-05", "close": 89.3, "is_complete": 0},
+        ]
+
+        values = calculate_rapid_drop_filter(rows, 2, 5)
+
+        self.assertEqual(values[:2], [None, None])
+        self.assertEqual(values[2], 1.0)  # exactly -5% triggers, matching the strategies
+        self.assertEqual(values[3], 1.0)  # the hit remains in the two-change window
+        self.assertEqual(values[4], 1.0)  # unfinished latest bar is included
+
+    def test_rapid_drop_filter_returns_zero_when_window_has_no_hit(self) -> None:
+        rows = [
+            {"date": "2024-01-01", "close": 100},
+            {"date": "2024-01-02", "close": 96},
+            {"date": "2024-01-03", "close": 94},
+        ]
+
+        self.assertEqual(calculate_rapid_drop_filter(rows, 2, 5)[-1], 0.0)
+
     def test_overview_attaches_latest_value_and_data_date(self) -> None:
         overview = {"items": [{"symbol": "SPY"}]}
         indicator = {
@@ -119,6 +164,26 @@ class IndicatorCalculationTests(unittest.TestCase):
         reading = result["items"][0]["indicator_values"]["7"]
         self.assertAlmostEqual(reading["value"], 4.5)
         self.assertEqual(reading["date"], "2024-01-05")
+
+    def test_overview_rapid_drop_value_uses_unfinished_latest_daily_bar(self) -> None:
+        rows = sample_rows()
+        rows[-1] = {**rows[-1], "close": 100, "is_complete": 0}
+        overview = {"items": [{"symbol": "SPY"}]}
+        indicator = {
+            "id": 8,
+            "name": "急跌过滤2日5%",
+            "indicator_type": "RAPID_DROP",
+            "params": {"period": 2, "threshold_percent": 5},
+        }
+
+        result = attach_overview_indicator_values(
+            overview,
+            [indicator],
+            {"SPY": rows},
+        )
+
+        reading = result["items"][0]["indicator_values"]["8"]
+        self.assertEqual(reading, {"value": 1.0, "date": "2024-01-05"})
 
 
 class IndicatorSeedTests(unittest.TestCase):
@@ -149,6 +214,18 @@ class IndicatorSeedTests(unittest.TestCase):
         stored = repository.get_indicator(relative_atr["id"])
         self.assertFalse(stored["is_favorite"])
 
+    def test_default_rapid_drop_indicator_is_favorite(self) -> None:
+        indicator = next(
+            item for item in repository.list_indicators()
+            if item["code"] == "RAPID_DROP5P5"
+        )
+
+        self.assertTrue(indicator["is_favorite"])
+        self.assertEqual(
+            indicator["params"],
+            {"period": 5, "threshold_percent": 5.0},
+        )
+
 
 class MarketOverviewIndicatorRouteTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -157,7 +234,7 @@ class MarketOverviewIndicatorRouteTests(unittest.TestCase):
     @patch.object(app_module.repository, "get_daily_prices")
     @patch.object(app_module.repository, "list_market_overview")
     @patch.object(app_module.repository, "list_indicators")
-    def test_route_returns_two_requested_favorite_indicator_values(
+    def test_route_returns_requested_favorite_indicator_values(
         self,
         list_indicators,
         list_overview,
@@ -184,21 +261,36 @@ class MarketOverviewIndicatorRouteTests(unittest.TestCase):
         self.assertAlmostEqual(payload["items"][0]["indicator_values"]["2"]["value"], 4.5)
         self.assertAlmostEqual(payload["items"][0]["indicator_values"]["1"]["value"], 8 / 3)
 
-    def test_route_rejects_more_than_two_columns(self) -> None:
+    @patch.object(app_module.repository, "list_market_overview")
+    @patch.object(app_module.repository, "list_indicators")
+    def test_route_accepts_three_columns(self, list_indicators, list_overview) -> None:
+        list_indicators.return_value = [
+            {"id": index, "name": f"MA{index}", "indicator_type": "MA", "params": {"period": index + 1}, "is_favorite": True}
+            for index in range(1, 4)
+        ]
+        list_overview.return_value = {"items": [], "page": 1, "page_size": 100, "total_rows": 0, "total_pages": 1}
+
         response = self.client.get("/api/market-overview?indicator_ids=1,2,3")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.get_json()["selected_indicators"]), 3)
+
+    def test_route_rejects_more_than_three_columns(self) -> None:
+        response = self.client.get("/api/market-overview?indicator_ids=1,2,3,4")
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json()["error"]["code"], "INVALID_INDICATOR")
 
-    def test_market_page_exposes_atr_types_and_two_overview_columns(self) -> None:
+    def test_market_page_moves_overview_indicator_controls_into_table_header(self) -> None:
         html = self.client.get("/").get_data(as_text=True)
 
-        self.assertIn('id="overview-indicator-1"', html)
-        self.assertIn('id="overview-indicator-2"', html)
+        self.assertNotIn('id="overview-indicator-controls"', html)
         self.assertIn('<option value="ATR">', html)
         self.assertIn('<option value="RATR">', html)
         self.assertIn('<option value="WTME">', html)
+        self.assertIn('<option value="RAPID_DROP">', html)
         self.assertIn('id="custom-indicator-half-life"', html)
+        self.assertIn('id="custom-indicator-threshold"', html)
 
 
 if __name__ == "__main__":
