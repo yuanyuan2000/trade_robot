@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import database.db as main_db
 from database import realtime_repository
+import services.realtime_scheduler as scheduler_module
 from services.backtest.service import create_default_strategy
 from services.realtime_mail import render_message, validate_message_template
 from services.realtime_scheduler import RealtimeTaskManager
@@ -296,6 +298,171 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
     def test_runtime_recovery_recognizes_stale_heartbeat(self) -> None:
         self.assertTrue(RealtimeTaskManager._is_stale_runtime({"heartbeat_at": "2020-01-01T00:00:00+00:00"}))
         self.assertTrue(RealtimeTaskManager._is_stale_runtime({"heartbeat_at": None, "run_started_at": None}))
+
+    def test_stop_is_immediate_and_clears_the_next_event(self) -> None:
+        strategy = create_default_strategy(
+            name="立即终止策略", design_mode="visual", selection_mode="single"
+        )
+        task = realtime_repository.create_task(
+            name="立即终止任务", strategy=strategy, follow_strategy=False,
+            settings={}, notification_settings={}, portfolio_state={},
+        )
+        run = realtime_repository.create_run(task)
+        manager = RealtimeTaskManager(max_workers=1)
+        manager._states[task["id"]] = {
+            "run_id": run["id"], "strategy": strategy, "events": ["OPEN"],
+            "processed": set(), "event_in_flight": False,
+            "event_started": False, "event_key": None, "future": None,
+            "stop_requested": False,
+        }
+        realtime_repository.set_task_runtime(
+            task["id"], desired_state="running", runtime_state="running",
+            next_event_at="2026-08-14T13:30:00Z",
+        )
+        realtime_repository.update_run(run["id"], status="running")
+        try:
+            stopped = manager.stop(task["id"])
+            self.assertEqual(stopped["desired_state"], "stopped")
+            self.assertEqual(stopped["runtime_state"], "stopped")
+            self.assertIsNone(stopped["next_event_at"])
+            self.assertNotIn(task["id"], manager._states)
+            self.assertEqual(
+                realtime_repository.get_run(run["id"])["status"], "stopped"
+            )
+        finally:
+            manager._executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_stop_during_event_waits_for_event_to_finish(self) -> None:
+        strategy = create_default_strategy(
+            name="计算中终止策略", design_mode="visual", selection_mode="single"
+        )
+        task = realtime_repository.create_task(
+            name="计算中终止任务", strategy=strategy, follow_strategy=False,
+            settings={}, notification_settings={"enabled": True},
+            portfolio_state={"cash": 100000, "positions": {}},
+        )
+        run = realtime_repository.create_run(task)
+        manager = RealtimeTaskManager(max_workers=1)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def finish_after_release(*_args, **_kwargs):
+            entered.set()
+            release.wait(timeout=2)
+            return {
+                "data_manifest": {},
+                "decision": {
+                    "trading_date": "2026-08-14", "event": "OPEN",
+                    "recommendations": [],
+                },
+                "calculation": {"engine_logs": []},
+                "state": {"portfolio": {"cash": 1, "positions": {}}},
+            }
+
+        manager.evaluator.evaluate = Mock(side_effect=finish_after_release)
+        manager.mail.enqueue_for_event = Mock()
+        state = {
+            "run_id": run["id"], "strategy": strategy, "events": ["OPEN"],
+            "processed": {"event"}, "event_in_flight": True,
+            "event_started": False, "event_key": "event", "future": None,
+            "stop_requested": False,
+        }
+        manager._states[task["id"]] = state
+        realtime_repository.set_task_runtime(
+            task["id"], desired_state="running", runtime_state="running"
+        )
+        realtime_repository.update_run(run["id"], status="running")
+        event_target = datetime.now(timezone.utc)
+        try:
+            future = manager._executor.submit(
+                manager._execute_event, task["id"], state, task,
+                {
+                    "trading_date": "2026-08-14",
+                    "target": event_target,
+                },
+                "OPEN",
+            )
+            self.assertTrue(entered.wait(timeout=2))
+            stopping = manager.stop(task["id"])
+            self.assertEqual(stopping["desired_state"], "stopped")
+            self.assertEqual(stopping["runtime_state"], "stopping")
+            self.assertIn(task["id"], manager._states)
+            release.set()
+            future.result(timeout=2)
+            event = realtime_repository.list_events(task["id"], limit=1)[0]
+            self.assertEqual(event["status"], "completed")
+            self.assertEqual(
+                realtime_repository.get_task(task["id"])["portfolio_state"]["cash"],
+                1,
+            )
+            finished = realtime_repository.get_task(task["id"])
+            self.assertEqual(finished["runtime_state"], "stopped")
+            self.assertNotIn(task["id"], manager._states)
+            manager.mail.enqueue_for_event.assert_called_once()
+        finally:
+            release.set()
+            manager._executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_idle_tasks_are_managed_without_event_worker_submission(self) -> None:
+        strategy = create_default_strategy(
+            name="中央调度策略", design_mode="visual", selection_mode="single"
+        )
+        task = realtime_repository.create_task(
+            name="中央调度任务", strategy=strategy, follow_strategy=False,
+            settings={}, notification_settings={}, portfolio_state={},
+        )
+        run = realtime_repository.create_run(task)
+        manager = RealtimeTaskManager(max_workers=1)
+        state = {
+            "run_id": run["id"], "strategy": strategy, "events": ["OPEN"],
+            "processed": set(), "event_in_flight": False,
+            "event_started": False, "event_key": None, "future": None,
+            "stop_requested": False,
+        }
+        manager._states[task["id"]] = state
+        realtime_repository.set_task_runtime(
+            task["id"], desired_state="running", runtime_state="running"
+        )
+        future_time = datetime(2026, 8, 14, 14, 0, tzinfo=timezone.utc)
+        try:
+            with patch.object(
+                manager, "_next_event",
+                return_value=({"trading_date": "2026-08-14", "target": future_time}, "OPEN"),
+            ), patch.object(manager._executor, "submit") as submit:
+                wait = manager._schedule_once(
+                    now=datetime(2026, 8, 14, 13, 30, tzinfo=timezone.utc)
+                )
+            submit.assert_not_called()
+            self.assertEqual(wait, 30.0)
+            self.assertFalse(state["event_in_flight"])
+        finally:
+            manager._executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_start_registers_task_without_occupying_event_pool(self) -> None:
+        strategy = create_default_strategy(
+            name="启动不占线程策略", design_mode="visual", selection_mode="single"
+        )
+        tasks = [
+            realtime_repository.create_task(
+                name=f"启动不占线程任务 {index}", strategy=strategy,
+                follow_strategy=False, settings={}, notification_settings={},
+                portfolio_state={},
+            )
+            for index in range(5)
+        ]
+        manager = RealtimeTaskManager(max_workers=1)
+        try:
+            with patch.object(
+                scheduler_module, "_validate_local_history", return_value=None
+            ), patch.object(manager._executor, "submit") as submit:
+                started = [manager.start(task["id"]) for task in tasks]
+            self.assertTrue(all(task["runtime_state"] == "running" for task in started))
+            self.assertEqual(set(manager._states), {task["id"] for task in tasks})
+            submit.assert_not_called()
+        finally:
+            for task in tasks:
+                manager.stop(task["id"])
+            manager._executor.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":

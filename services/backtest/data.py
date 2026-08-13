@@ -5,7 +5,6 @@ from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
 import math
-from statistics import fmean
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
@@ -16,6 +15,10 @@ from services.backtest.corporate_actions import (
 )
 from services.backtest.errors import BacktestDataError, BacktestValidationError
 from services.backtest.market_calendar import ensure_market_sessions
+from services.indicator_service import (
+    WTME_DEFAULT_EPSILON,
+    calculate_indicator_values,
+)
 
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -105,7 +108,8 @@ class ExpressionContext:
         self.price = float(price)
         self.position = float(position)
 
-    def resolve_function(self, name: str, period: int) -> float:
+    def resolve_function(self, name: str, *arguments: float | int) -> float:
+        period = int(arguments[0])
         if name in {"open", "high", "low", "close", "volume"}:
             rows = self.dataset.daily_before(self.symbol, self.trading_date)
             if len(rows) < period:
@@ -113,49 +117,62 @@ class ExpressionContext:
                     f"{self.symbol} 在 {self.trading_date} 之前没有足够数据计算 {name}({period})。"
                 )
             return float(rows[-period][name])
-        rows = self.dataset.indicator_history(
-            self.symbol,
-            self.trading_date,
-            include_current=self.event == "CLOSE",
-        )
-        if name == "ma":
-            if len(rows) < period:
-                raise BacktestDataError(
-                    f"{self.symbol} 没有足够数据计算 ma({period})。"
-                )
-            return fmean(float(row["close"]) for row in rows[-period:])
-        if name == "ema":
-            if len(rows) < period:
-                raise BacktestDataError(
-                    f"{self.symbol} 没有足够数据计算 ema({period})。"
-                )
-            alpha = 2.0 / (period + 1.0)
-            value = float(rows[0]["close"])
-            for row in rows[1:]:
-                value = alpha * float(row["close"]) + (1 - alpha) * value
-            return value
-        if name == "atr":
-            if len(rows) < period + 1:
-                raise BacktestDataError(
-                    f"{self.symbol} 没有足够数据计算 atr({period})。"
-                )
-            true_ranges: list[float] = []
-            for previous, current in zip(rows, rows[1:]):
-                high = float(current["high"])
-                low = float(current["low"])
-                previous_close = float(previous["close"])
-                true_ranges.append(
-                    max(
-                        high - low,
-                        abs(high - previous_close),
-                        abs(low - previous_close),
-                    )
-                )
-            atr = fmean(true_ranges[:period])
-            for true_range in true_ranges[period:]:
-                atr = ((period - 1) * atr + true_range) / period
-            return atr
-        raise BacktestValidationError(f"不支持指标函数 {name}。")
+        if name in {"ma", "ema", "atr"}:
+            rows = self.dataset.indicator_history(
+                self.symbol,
+                self.trading_date,
+                include_current=self.event == "CLOSE",
+            )
+            values = calculate_indicator_values(rows, name, period)
+        elif name in {"ratr", "wtme", "rapid_drop"}:
+            rows = self._point_in_time_rows()
+            values = calculate_indicator_values(
+                rows,
+                name,
+                period,
+                half_life=(float(arguments[1]) if name == "wtme" else None),
+                epsilon=(
+                    float(arguments[2])
+                    if name == "wtme" and len(arguments) == 3
+                    else WTME_DEFAULT_EPSILON
+                ),
+                threshold_percent=(
+                    float(arguments[1]) if name == "rapid_drop" else None
+                ),
+            )
+        else:
+            raise BacktestValidationError(f"不支持指标函数 {name}。")
+        value = values[-1] if values else None
+        if value is None:
+            rendered = ",".join(f"{float(item):g}" for item in arguments)
+            raise BacktestDataError(
+                f"{self.symbol} 没有足够数据计算 {name}({rendered})。"
+            )
+        return float(value)
+
+    def _point_in_time_rows(self) -> list[dict]:
+        if self.event == "CLOSE":
+            return self.dataset.indicator_history(
+                self.symbol,
+                self.trading_date,
+                include_current=True,
+            )
+        completed = self.dataset.daily_before(self.symbol, self.trading_date)
+        if not completed:
+            return []
+        previous_close = float(completed[-1]["close"])
+        return [
+            *completed,
+            {
+                "date": self.trading_date,
+                "open": previous_close,
+                "high": max(previous_close, self.price),
+                "low": min(previous_close, self.price),
+                "close": self.price,
+                "volume": 0.0,
+                "is_complete": 0,
+            },
+        ]
 
 
 class HistoricalDataSet:

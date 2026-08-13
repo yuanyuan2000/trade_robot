@@ -314,11 +314,14 @@ def set_task_runtime(
     runtime_state: str | None = None,
     run_started_at: str | None = None,
     stopped_at: str | None = None,
+    clear_stopped_at: bool = False,
     heartbeat_at: str | None = None,
     next_event_at: str | None = None,
+    clear_next_event: bool = False,
     last_event_at: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    clear_error: bool = False,
     successful_notification_count: int | None = None,
     next_allowed_normal_send_at: str | None = None,
 ) -> dict:
@@ -327,12 +330,20 @@ def set_task_runtime(
         "desired_state": desired_state or current["desired_state"],
         "runtime_state": runtime_state or current["runtime_state"],
         "run_started_at": run_started_at if run_started_at is not None else current["run_started_at"],
-        "stopped_at": stopped_at if stopped_at is not None else current["stopped_at"],
+        "stopped_at": None if clear_stopped_at else (
+            stopped_at if stopped_at is not None else current["stopped_at"]
+        ),
         "heartbeat_at": heartbeat_at if heartbeat_at is not None else current["heartbeat_at"],
-        "next_event_at": next_event_at if next_event_at is not None else current["next_event_at"],
+        "next_event_at": None if clear_next_event else (
+            next_event_at if next_event_at is not None else current["next_event_at"]
+        ),
         "last_event_at": last_event_at if last_event_at is not None else current["last_event_at"],
-        "error_code": error_code if error_code is not None else current["last_error_code"],
-        "error_message": error_message if error_message is not None else current["last_error_message"],
+        "error_code": None if clear_error else (
+            error_code if error_code is not None else current["last_error_code"]
+        ),
+        "error_message": None if clear_error else (
+            error_message if error_message is not None else current["last_error_message"]
+        ),
         "count": successful_notification_count if successful_notification_count is not None else current["successful_notification_count"],
         "next_allowed": next_allowed_normal_send_at if next_allowed_normal_send_at is not None else current["next_allowed_normal_send_at"],
     }

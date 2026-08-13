@@ -122,6 +122,44 @@ class DslSafetyTests(unittest.TestCase):
             {"position": 0.25, "ema(8)": 101.5, "ema(13)": 99.25},
         )
 
+    def test_expression_supports_all_shared_indicator_functions(self) -> None:
+        expression = compile_expression(
+            "ratr(14) > 0 AND wtme(40, 15, 0.00000001) >= 0 "
+            "AND rapid_drop(5, 5) = 0"
+        )
+        context = SimpleNamespace(
+            price=100.0,
+            position=0.0,
+            resolve_function=lambda name, *arguments: {
+                ("ratr", 14): 1.25,
+                ("wtme", 40, 15, 1e-8): 22.5,
+                ("rapid_drop", 5, 5): 0.0,
+            }[(name, *arguments)],
+        )
+
+        self.assertTrue(expression.evaluate(context))
+        self.assertEqual(expression.max_lookback, 40)
+        self.assertEqual(
+            expression.resolve_inputs(context),
+            {
+                "ratr(14)": 1.25,
+                "wtme(40,15,1e-08)": 22.5,
+                "rapid_drop(5,5)": 0.0,
+            },
+        )
+
+    def test_expression_rejects_invalid_extended_indicator_parameters(self) -> None:
+        for expression in (
+            "wtme(1, 15)",
+            "wtme(40, 0)",
+            "wtme(40, 15, 1)",
+            "rapid_drop(5)",
+            "rapid_drop(5, 0)",
+        ):
+            with self.subTest(expression=expression):
+                with self.assertRaises(BacktestValidationError):
+                    compile_expression(expression)
+
     def test_expression_rejects_zero_lookback_and_arbitrary_code(self) -> None:
         with self.assertRaises(BacktestValidationError):
             compile_expression("close(0) > 1")
@@ -920,6 +958,62 @@ class StrategyModeTests(unittest.TestCase):
             result.trades[2]["event_time"],
             result.trades[1]["event_time"],
         )
+
+    def test_competition_accepts_no_optional_rules_and_enforces_minimum_score(self) -> None:
+        strategy = {
+            "name": "无普通规则的竞争策略",
+            "design_mode": "visual",
+            "selection_mode": "competition",
+            "definition": {
+                "symbols": [
+                    {"symbol": "SPY", "max_weight": 100},
+                    {"symbol": "GLD", "max_weight": 100},
+                ],
+                "rules": [],
+                "competition": {
+                    "eligibility": "true",
+                    "score": "-1",
+                    "minimum_score": 0,
+                    "target_weight": 100,
+                    "cash_when_none": True,
+                    "when": "OPEN",
+                },
+            },
+            "default_settings": {},
+        }
+        validated = validate_strategy_payload(strategy)
+        dataset = HistoricalDataSet(
+            daily={
+                "SPY": daily_rows(self.dates, [10.0] * len(self.dates)),
+                "GLD": daily_rows(self.dates, [20.0] * len(self.dates)),
+            },
+            sessions=self.run_dates,
+        )
+
+        result = BacktestEngine(
+            validated,
+            settings(self.run_dates[0], self.run_dates[-1]),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(validated["definition"]["rules"], [])
+        self.assertEqual(result.trades, [])
+        score_logs = [
+            log for log in result.logs
+            if log["event_type"] == "COMPETITION_SCORE"
+        ]
+        self.assertTrue(score_logs)
+        self.assertTrue(all(
+            not log["context"]["passes_minimum_score"]
+            for log in score_logs
+        ))
+
+    def test_noncompetition_visual_strategy_still_requires_an_enabled_rule(self) -> None:
+        strategy = visual_strategy(rule={})
+        strategy["definition"]["rules"] = []
+
+        with self.assertRaisesRegex(BacktestValidationError, "至少需要一条启用的规则"):
+            validate_strategy_payload(strategy)
 
     def test_competition_does_not_override_partial_risk_sell(self) -> None:
         spy_closes = [10.0] * 10 + [30.0, 30.0]

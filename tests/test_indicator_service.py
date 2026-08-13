@@ -8,6 +8,7 @@ from unittest.mock import patch
 import app as app_module
 import database.db as main_db
 from database import repository
+from services.backtest.data import HistoricalDataSet
 from services.indicator_service import (
     attach_overview_indicator_values,
     calculate_indicator_values,
@@ -120,6 +121,55 @@ class IndicatorCalculationTests(unittest.TestCase):
 
         self.assertEqual(values[:4], [None, None, None, None])
         self.assertAlmostEqual(values[4], (110 - 101) / 2)
+
+    def test_visual_expression_context_reuses_indicator_system_values(self) -> None:
+        rows = sample_rows()
+        trading_date = rows[-1]["date"]
+        dataset = HistoricalDataSet(
+            daily={"SPY": rows},
+            sessions=[trading_date],
+        )
+        context = dataset.expression_context(
+            symbol="SPY",
+            trading_date=trading_date,
+            event="CLOSE",
+            price=float(rows[-1]["close"]),
+            position=0,
+        )
+        cases = (
+            ("ma", (3,), "MA", {"period": 3}),
+            ("ema", (3,), "EMA", {"period": 3}),
+            ("atr", (3,), "ATR", {"period": 3}),
+            ("ratr", (3,), "RATR", {"period": 3}),
+            (
+                "wtme",
+                (3, 2, 1e-8),
+                "WTME",
+                {"period": 3, "half_life": 2, "epsilon": 1e-8},
+            ),
+            (
+                "rapid_drop",
+                (2, 5),
+                "RAPID_DROP",
+                {"period": 2, "threshold_percent": 5},
+            ),
+        )
+        for function_name, arguments, indicator_type, params in cases:
+            with self.subTest(function=function_name):
+                expected = calculate_indicator_values(
+                    rows,
+                    indicator_type,
+                    params["period"],
+                    half_life=params.get("half_life"),
+                    epsilon=params.get("epsilon", 1e-8),
+                    threshold_percent=params.get("threshold_percent"),
+                )[-1]
+                self.assertIsNotNone(expected)
+                self.assertAlmostEqual(
+                    context.resolve_function(function_name, *arguments),
+                    expected,
+                    places=12,
+                )
 
     def test_rapid_drop_filter_checks_n_changes_and_includes_latest_bar(self) -> None:
         rows = [

@@ -159,8 +159,8 @@ def _validate_symbols(definition: dict, selection_mode: str) -> list[dict]:
     return symbols
 
 
-def _validate_rules(definition: dict) -> list[dict]:
-    raw_rules = definition.get("rules")
+def _validate_rules(definition: dict, *, require_enabled: bool = True) -> list[dict]:
+    raw_rules = definition.get("rules", [])
     if not isinstance(raw_rules, list):
         raise BacktestValidationError("可视化策略规则必须是数组。")
     rules: list[dict] = []
@@ -218,9 +218,18 @@ def _validate_rules(definition: dict) -> list[dict]:
                 "_max_lookback": compiled.max_lookback,
             }
         )
-    if not any(rule["enabled"] for rule in rules):
+    if require_enabled and not any(rule["enabled"] for rule in rules):
         raise BacktestValidationError("至少需要一条启用的规则。")
     return rules
+
+
+def _schedule_minute(schedule: str) -> int:
+    if schedule == "OPEN":
+        return 9 * 60 + 30
+    if schedule == "CLOSE":
+        return 16 * 60
+    hour, minute = schedule.split(":", 1)
+    return int(hour) * 60 + int(minute)
 
 
 def validate_strategy_payload(payload: dict, *, creating: bool = False) -> dict:
@@ -243,7 +252,10 @@ def validate_strategy_payload(payload: dict, *, creating: bool = False) -> dict:
     if design_mode == "visual":
         if code_key:
             raise BacktestValidationError("非代码策略不能设置 code_key。")
-        definition["rules"] = _validate_rules(definition)
+        definition["rules"] = _validate_rules(
+            definition,
+            require_enabled=selection_mode != "competition",
+        )
         if selection_mode == "competition":
             if any(
                 rule["enabled"] and rule["action"] == "BUY"
@@ -259,6 +271,26 @@ def validate_strategy_payload(payload: dict, *, creating: bool = False) -> dict:
                 raise BacktestValidationError("competition 模式必须设置评分公式。")
             compile_expression(eligibility)
             compile_expression(score)
+            when = normalize_schedule(competition.get("when", "OPEN"))
+            eligibility_when = normalize_schedule(
+                competition.get("eligibility_when", when)
+            )
+            if _schedule_minute(eligibility_when) > _schedule_minute(when):
+                raise BacktestValidationError(
+                    "候选条件检查时间不能晚于竞争评分时间。"
+                )
+            raw_minimum_score = competition.get("minimum_score")
+            if raw_minimum_score is None or raw_minimum_score == "":
+                minimum_score = None
+            else:
+                if isinstance(raw_minimum_score, bool):
+                    raise BacktestValidationError("最低可入选评分必须是数值。")
+                try:
+                    minimum_score = float(raw_minimum_score)
+                except (TypeError, ValueError) as exc:
+                    raise BacktestValidationError("最低可入选评分必须是数值。") from exc
+                if not math.isfinite(minimum_score):
+                    raise BacktestValidationError("最低可入选评分必须是有限数值。")
             raw_target_weight = competition.get("target_weight", 100)
             if isinstance(raw_target_weight, bool):
                 raise BacktestValidationError("竞争胜出标的目标仓位不能是布尔值。")
@@ -279,12 +311,18 @@ def validate_strategy_payload(payload: dict, *, creating: bool = False) -> dict:
             cash_when_none = competition.get("cash_when_none", True)
             if not isinstance(cash_when_none, bool):
                 raise BacktestValidationError("cash_when_none 必须是布尔值。")
+            rebalance_existing = competition.get("rebalance_existing", True)
+            if not isinstance(rebalance_existing, bool):
+                raise BacktestValidationError("rebalance_existing 必须是布尔值。")
             definition["competition"] = {
                 "eligibility": eligibility,
                 "score": score,
+                "minimum_score": minimum_score,
                 "target_weight": target_weight,
                 "cash_when_none": cash_when_none,
-                "when": normalize_schedule(competition.get("when", "OPEN")),
+                "rebalance_existing": rebalance_existing,
+                "eligibility_when": eligibility_when,
+                "when": when,
             }
         code_key = None
         code_version = None
@@ -360,7 +398,7 @@ def default_strategy_payload(
         },
     ]
     if selection_mode == "competition":
-        standard_rules = [standard_rules[1]]
+        standard_rules = []
     definition: dict[str, Any] = {
         "symbols": symbols,
         "rules": standard_rules,
@@ -369,8 +407,11 @@ def default_strategy_payload(
         definition["competition"] = {
             "eligibility": "price > ma(20)",
             "score": "(price - close(5)) / atr(5)",
+            "minimum_score": None,
             "target_weight": 100,
             "cash_when_none": True,
+            "rebalance_existing": True,
+            "eligibility_when": "OPEN",
             "when": "OPEN",
         }
     if design_mode == "code":

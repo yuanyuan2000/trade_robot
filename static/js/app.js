@@ -84,6 +84,22 @@ let analysisIndicatorLegendVisible = false;
 let overviewLoadInFlight;
 const overviewIndicatorStorageKey = "trade-overview-indicator-columns";
 
+function applyOverviewAutoRefreshState(enabled) {
+  marketOverviewAutoUpdate = Boolean(enabled);
+  overviewLiveToggle.checked = marketOverviewAutoUpdate;
+}
+
+function publishOverviewAutoRefreshState(enabled) {
+  applyOverviewAutoRefreshState(enabled);
+  window.dispatchEvent(new CustomEvent("market-overview-auto-refresh-changed", {
+    detail: { enabled: marketOverviewAutoUpdate },
+  }));
+}
+
+window.addEventListener("market-overview-auto-refresh-changed", (event) => {
+  applyOverviewAutoRefreshState(event.detail?.enabled);
+});
+
 function applyTheme(theme) {
   const nextTheme = theme === "light" ? "light" : "dark";
   document.body.classList.toggle("theme-dark", nextTheme === "dark");
@@ -928,8 +944,7 @@ async function setOverviewLiveRefresh(enabled) {
     });
     const payload = await parseJsonResponse(response);
     if (!payload.ok) throw new Error(payload.error?.message || "自动更新设置失败。");
-    marketOverviewAutoUpdate = Boolean(payload.auto_enabled);
-    overviewLiveToggle.checked = marketOverviewAutoUpdate;
+    publishOverviewAutoRefreshState(payload.auto_enabled);
     setStatus(
       marketOverviewAutoUpdate
         ? "总览自动更新已开启，由服务端每5分钟统一更新一次。"
@@ -947,8 +962,7 @@ async function loadOverviewRefreshPreference() {
     const response = await fetch("/api/market-overview/sync-status");
     const payload = await parseJsonResponse(response);
     if (!payload.ok) return;
-    marketOverviewAutoUpdate = Boolean(payload.auto_enabled);
-    overviewLiveToggle.checked = marketOverviewAutoUpdate;
+    publishOverviewAutoRefreshState(payload.auto_enabled);
   } catch (_error) {
     // Keep the existing switch value when the coordinator is unavailable.
   }

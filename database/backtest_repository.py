@@ -666,6 +666,22 @@ def update_run(run_id: int, **fields: Any) -> dict:
     return get_run(run_id)
 
 
+def request_run_cancellation(run_id: int) -> dict:
+    """Mark a live run as cancelling without overwriting a terminal status."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE backtest_runs
+            SET status = 'cancelling'
+            WHERE id = ?
+              AND deleted_at IS NULL
+              AND status IN ('queued', 'validating', 'running', 'cancelling')
+            """,
+            (int(run_id),),
+        )
+    return get_run(run_id)
+
+
 def replace_run_output(
     run_id: int,
     *,

@@ -269,6 +269,12 @@ function renderBacktestEditor() {
     competition: "多个标的在同一数据截面评分，只持有最高分合格标的。",
   };
   document.getElementById("backtest-selection-help").textContent = help[strategy.selection_mode];
+  document.getElementById("backtest-rules-title").textContent = strategy.selection_mode === "competition"
+    ? "风险/退出规则（可选）"
+    : "交易规则";
+  document.getElementById("backtest-rules-help").textContent = strategy.selection_mode === "competition"
+    ? "竞争买入由候选条件和评分公式自动完成；此处可留空，仅在需要盘中风控、退出或 HOLD 阻断时添加。"
+    : "具体时间使用美东时间；信号读取上一根完整分钟，并按目标分钟开盘价成交。";
   renderBacktestSymbols();
   btVisualEditor.hidden = strategy.design_mode !== "visual";
   btCodeEditor.hidden = strategy.design_mode !== "code";
@@ -333,9 +339,12 @@ function renderBacktestCompetition() {
   const config = bt.current.definition.competition || {};
   document.getElementById("backtest-competition-eligibility").value = config.eligibility || "true";
   document.getElementById("backtest-competition-score").value = config.score || "(price - close(5)) / atr(5)";
+  document.getElementById("backtest-competition-eligibility-when").value = config.eligibility_when || config.when || "OPEN";
   document.getElementById("backtest-competition-when").value = config.when || "OPEN";
+  document.getElementById("backtest-competition-minimum-score").value = config.minimum_score ?? "";
   document.getElementById("backtest-competition-weight").value = Number(config.target_weight ?? 100);
   document.getElementById("backtest-competition-cash").checked = config.cash_when_none !== false;
+  document.getElementById("backtest-competition-rebalance").checked = config.rebalance_existing !== false;
 }
 
 function renderBacktestCodeParameters() {
@@ -426,12 +435,16 @@ function collectBacktestStrategy() {
       condition: row.querySelector(".bt-rule-condition").value.trim() || "true",
     }));
     if (strategy.selection_mode === "competition") {
+      const minimumScore = document.getElementById("backtest-competition-minimum-score").value.trim();
       strategy.definition.competition = {
         eligibility: document.getElementById("backtest-competition-eligibility").value.trim() || "true",
         score: document.getElementById("backtest-competition-score").value.trim(),
+        eligibility_when: document.getElementById("backtest-competition-eligibility-when").value.trim().toUpperCase(),
         when: document.getElementById("backtest-competition-when").value.trim().toUpperCase(),
+        minimum_score: minimumScore === "" ? null : Number(minimumScore),
         target_weight: Number(document.getElementById("backtest-competition-weight").value),
         cash_when_none: document.getElementById("backtest-competition-cash").checked,
+        rebalance_existing: document.getElementById("backtest-competition-rebalance").checked,
       };
     }
   } else {

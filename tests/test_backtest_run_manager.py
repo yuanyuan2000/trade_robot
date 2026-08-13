@@ -300,6 +300,50 @@ class BacktestRunManagerTests(unittest.TestCase):
 
         self.assertEqual(status["status"], "cancelled")
 
+    @patch("services.backtest.service.BacktestEngine", CancellableEngine)
+    def test_cancel_request_cannot_overwrite_cancelled_terminal_status(self) -> None:
+        run = self.manager.start(
+            self.strategy["id"],
+            {
+                **self.strategy["default_settings"],
+                "start_date": "2024-01-02",
+                "end_date": "2024-01-02",
+                "initial_capital": 100,
+                "benchmark": "none",
+            },
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if self.manager.run_status(run["id"])["status"] == "running":
+                break
+            time.sleep(0.005)
+
+        original_request = backtest_repository.request_run_cancellation
+
+        def request_after_worker_finishes(run_id: int) -> dict:
+            deadline = time.monotonic() + 2
+            status = backtest_repository.get_run(run_id)["status"]
+            while time.monotonic() < deadline:
+                status = backtest_repository.get_run(run_id)["status"]
+                if status == "cancelled":
+                    break
+                time.sleep(0.005)
+            self.assertEqual(status, "cancelled")
+            return original_request(run_id)
+
+        with patch.object(
+            backtest_repository,
+            "request_run_cancellation",
+            side_effect=request_after_worker_finishes,
+        ):
+            cancelled = self.manager.cancel(run["id"])
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(
+            backtest_repository.get_run(run["id"])["status"],
+            "cancelled",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

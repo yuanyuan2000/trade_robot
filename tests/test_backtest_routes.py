@@ -207,6 +207,14 @@ class BacktestRouteTests(unittest.TestCase):
             [item["max_weight"] for item in competition["definition"]["symbols"]],
             [100, 100],
         )
+        self.assertEqual(competition["definition"]["rules"], [])
+        self.assertIsNone(
+            competition["definition"]["competition"]["minimum_score"]
+        )
+        self.assertEqual(
+            competition["definition"]["competition"]["eligibility_when"],
+            "OPEN",
+        )
 
     def test_run_overview_readonly_detail_and_soft_delete_routes(self) -> None:
         created = self.client.post(

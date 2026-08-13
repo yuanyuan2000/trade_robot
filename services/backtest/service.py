@@ -176,9 +176,20 @@ def build_run_configuration_summary(strategy: dict, settings: dict) -> str:
             )
         competition = strategy["definition"].get("competition")
         if competition:
+            eligibility_timing = (
+                f"{competition['eligibility_when']}检查候选“{competition['eligibility']}”，"
+                if competition.get("eligibility_when", competition["when"])
+                != competition["when"]
+                else f"候选“{competition['eligibility']}”，"
+            )
+            minimum_score = (
+                f"，最低评分{_compact_number(competition['minimum_score'])}（含）"
+                if competition.get("minimum_score") is not None
+                else ""
+            )
             rules.append(
-                f"{competition['when']}按“{competition['score']}”竞争选标，"
-                f"目标{_compact_number(competition['target_weight'])}%"
+                f"{eligibility_timing}{competition['when']}按“{competition['score']}”竞争选标"
+                f"{minimum_score}，目标{_compact_number(competition['target_weight'])}%"
             )
         detail = f"{strategy['selection_mode']}模式，标的{symbols}；{'；'.join(rules)}"
     return f"{common}；{detail}。"
@@ -418,7 +429,7 @@ class BacktestRunManager:
             if state:
                 state["cancel"].set()
                 state["version"] += 1
-        return backtest_repository.update_run(run_id, status="cancelling")
+        return backtest_repository.request_run_cancellation(run_id)
 
     def run_status(self, run_id: int) -> dict:
         run = backtest_repository.get_run(run_id, include_snapshot=False)

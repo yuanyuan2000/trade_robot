@@ -460,22 +460,23 @@
                 <section id="backtest-visual-editor" class="backtest-editor-section">
                   <div class="backtest-section-title">
                     <h4 class="field-label-with-help">
-                      交易规则
+                      <span id="backtest-rules-title">交易规则</span>
                       <span class="syntax-help">
                         <button class="syntax-help-icon" type="button" aria-label="查看非代码策略规则语法">?</button>
                         <span class="syntax-help-popover" role="tooltip">
                           <strong>条件公式语法</strong>
                           <span>变量：<code>price</code> 决策价，<code>position</code> 当前仓位比例，<code>true</code>/<code>false</code>。</span>
-                          <span>函数：<code>open(n)</code>、<code>high(n)</code>、<code>low(n)</code>、<code>close(n)</code>、<code>volume(n)</code>、<code>ma(n)</code>、<code>ema(n)</code>、<code>atr(n)</code>，n 为 1～500。</span>
+                          <span>行情/基础指标：<code>open(n)</code>、<code>high(n)</code>、<code>low(n)</code>、<code>close(n)</code>、<code>volume(n)</code>、<code>ma(n)</code>、<code>ema(n)</code>、<code>atr(n)</code>、<code>ratr(n)</code>。</span>
+                          <span>扩展指标：<code>wtme(n, h)</code> 或 <code>wtme(n, h, epsilon)</code>；<code>rapid_drop(n, threshold_percent)</code> 命中急跌返回 1，否则返回 0。</span>
                           <span>运算：<code>+ - * /</code>，比较 <code>&gt; &gt;= &lt; &lt;= = !=</code>，逻辑 <code>AND OR NOT</code>，可使用括号。</span>
                           <span>时间可填 <code>OPEN</code>、<code>CLOSE</code> 或美东时间 <code>HH:MM</code>。</span>
-                          <span class="syntax-help-example">示例：<code>ema(8) &gt; ema(13) AND position &lt; 0.5</code><br><code>price &lt; close(1) - 2 * atr(14)</code></span>
+                          <span class="syntax-help-example">示例：<code>wtme(40, 15) &gt;= 0 AND rapid_drop(5, 5) = 0</code><br><code>price &lt; close(1) - 2 * atr(14)</code></span>
                         </span>
                       </span>
                     </h4>
                     <button id="backtest-add-rule" type="button">添加规则</button>
                   </div>
-                  <p class="backtest-help">具体时间使用美东时间；信号读取上一根完整分钟，并按目标分钟开盘价成交。</p>
+                  <p id="backtest-rules-help" class="backtest-help">具体时间使用美东时间；信号读取上一根完整分钟，并按目标分钟开盘价成交。</p>
                   <div id="backtest-rules" class="backtest-stack"></div>
                 </section>
 
@@ -491,8 +492,16 @@
                   </label>
                   <div class="backtest-inline-fields">
                     <label class="backtest-field">
-                      <span>检查时间</span>
+                      <span>候选条件检查时间</span>
+                      <input id="backtest-competition-eligibility-when" type="text" value="OPEN">
+                    </label>
+                    <label class="backtest-field">
+                      <span>评分与选标时间</span>
                       <input id="backtest-competition-when" type="text" value="OPEN">
+                    </label>
+                    <label class="backtest-field">
+                      <span>最低可入选评分（含）</span>
+                      <input id="backtest-competition-minimum-score" type="number" step="any" placeholder="不限制">
                     </label>
                     <label class="backtest-field">
                       <span>胜出仓位 %</span>
@@ -501,6 +510,10 @@
                     <label class="backtest-check-field">
                       <input id="backtest-competition-cash" type="checkbox">
                       <span>无合格标的时空仓</span>
+                    </label>
+                    <label class="backtest-check-field">
+                      <input id="backtest-competition-rebalance" type="checkbox">
+                      <span>胜出标的不变时再平衡</span>
                     </label>
                   </div>
                 </section>

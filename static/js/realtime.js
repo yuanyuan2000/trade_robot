@@ -96,7 +96,8 @@ function renderRealtimeCards() {
     return;
   }
   rtCards.innerHTML = rt.tasks.map((task) => {
-    const running = ["starting", "running", "degraded", "stopping"].includes(task.runtime_state);
+    const running = ["starting", "running", "degraded"].includes(task.runtime_state);
+    const stopping = task.runtime_state === "stopping";
     const competition = task.strategy_snapshot?.selection_mode === "competition";
     const recommendations = task.overview_recommendations || [];
     const recommendationHtml = competition ? `<div class="realtime-card-recommendations">
@@ -114,7 +115,7 @@ function renderRealtimeCards() {
         <div class="realtime-card-metric"><span>下次触发</span><strong>${task.next_event_at ? rtDate(task.next_event_at) : "—"}</strong></div>
       </div>
       <div class="realtime-card-actions">
-        <button type="button" data-rt-action="${running ? "stop" : "start"}">${running ? "终止" : "运行"}</button>
+        <button type="button" data-rt-action="${running ? "stop" : "start"}"${stopping ? " disabled" : ""}>${stopping ? "终止中" : running ? "终止" : "运行"}</button>
         <button type="button" data-rt-action="delete">删除</button>
       </div>
     </article>`;
@@ -142,8 +143,9 @@ function refreshRealtimeDetailStatus(task) {
   document.getElementById("realtime-detail-title").textContent = `#${task.id} ${task.name}`;
   document.getElementById("realtime-detail-subtitle").textContent = `${task.strategy_snapshot?.name || "策略"} · ${rtStateLabel(task.runtime_state)}`;
   document.getElementById("realtime-revision").textContent = `任务 revision ${task.revision} · 策略 revision ${task.source_strategy_revision}`;
-  const running = ["starting", "running", "degraded", "stopping"].includes(task.runtime_state);
-  document.getElementById("realtime-start").hidden = running;
+  const running = ["starting", "running", "degraded"].includes(task.runtime_state);
+  const stopping = task.runtime_state === "stopping";
+  document.getElementById("realtime-start").hidden = running || stopping;
   document.getElementById("realtime-stop").hidden = !running;
 }
 
@@ -433,6 +435,9 @@ async function createRealtimeChannel(event) {
 }
 
 function initRealtime() {
+  window.addEventListener("market-overview-auto-refresh-changed", (event) => {
+    document.getElementById("realtime-overview-auto-toggle").checked = Boolean(event.detail?.enabled);
+  });
   document.getElementById("realtime-new-task").addEventListener("click", async () => { await loadRealtimeStrategies(); rtCreateDialog.showModal(); });
   document.getElementById("realtime-create-form").addEventListener("submit", createRealtimeTask);
   document.getElementById("realtime-channel-form").addEventListener("submit", createRealtimeChannel);
@@ -449,8 +454,7 @@ function initRealtime() {
     try {
       const payload = await rtJson(await fetch("/api/market-overview/auto-refresh", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: event.target.checked }) }));
       event.target.checked = Boolean(payload.auto_enabled);
-      const overviewToggle = document.getElementById("overview-live-toggle");
-      if (overviewToggle) overviewToggle.checked = Boolean(payload.auto_enabled);
+      window.dispatchEvent(new CustomEvent("market-overview-auto-refresh-changed", { detail: { enabled: Boolean(payload.auto_enabled) } }));
       rtSetStatus(payload.auto_enabled ? "行情总览自动更新已开启。" : "行情总览自动更新已关闭；正式决策仍会独立取数。", "success", true);
     } catch (error) { event.target.checked = !event.target.checked; rtSetStatus(error.message, "error", true); }
   });
@@ -486,11 +490,49 @@ function initRealtime() {
   });
   document.getElementById("realtime-back").addEventListener("click", async () => { window.clearInterval(rt.dashboardTimer); rtDetailPage.hidden = true; rtListPage.hidden = false; rt.current = null; await loadRealtimeTasks(); });
   document.getElementById("realtime-start").addEventListener("click", async () => { try { rt.current = (await rtJson(await fetch(`/api/realtime/tasks/${rt.current.id}/start`, { method: "POST" }))).task; renderRealtimeDetail(); await loadRealtimeTasks({ silent: true }); } catch (error) { rtSetStatus(error.message, "error", true); } });
-  document.getElementById("realtime-stop").addEventListener("click", async () => { if (!confirm("终止当前实时决策任务？")) return; try { rt.current = (await rtJson(await fetch(`/api/realtime/tasks/${rt.current.id}/stop`, { method: "POST" }))).task; renderRealtimeDetail(); await loadRealtimeTasks({ silent: true }); } catch (error) { rtSetStatus(error.message, "error", true); } });
+  document.getElementById("realtime-stop").addEventListener("click", async (event) => {
+    if (!confirm("终止当前实时决策任务？")) return;
+    event.currentTarget.disabled = true;
+    try {
+      rt.current = (await rtJson(await fetch(`/api/realtime/tasks/${rt.current.id}/stop`, { method: "POST" }))).task;
+      renderRealtimeDetail();
+      rtSetStatus(
+        rt.current.runtime_state === "stopping"
+          ? "当前关键事件正在处理；完成本次决策与通知提交后将自动停止。"
+          : "任务已终止。",
+        rt.current.runtime_state === "stopping" ? "neutral" : "success",
+        true,
+      );
+      loadRealtimeTasks({ silent: true });
+    } catch (error) {
+      event.currentTarget.disabled = false;
+      rtSetStatus(error.message, "error", true);
+    }
+  });
   rtCards.addEventListener("click", async (event) => {
     const card = event.target.closest("[data-rt-task-id]"); if (!card) return;
     const id = Number(card.dataset.rtTaskId); const action = event.target.closest("[data-rt-action]")?.dataset.rtAction;
-    if (action === "start" || action === "stop") { try { await rtJson(await fetch(`/api/realtime/tasks/${id}/${action}`, { method: "POST" })); await loadRealtimeTasks(); } catch (error) { rtSetStatus(error.message, "error"); } return; }
+    if (action === "start" || action === "stop") {
+      const button = event.target.closest("[data-rt-action]");
+      button.disabled = true;
+      try {
+        const payload = await rtJson(await fetch(`/api/realtime/tasks/${id}/${action}`, { method: "POST" }));
+        rt.tasks = rt.tasks.map((item) => item.id === id ? { ...item, ...payload.task } : item);
+        renderRealtimeCards();
+        const stopping = payload.task.runtime_state === "stopping";
+        rtSetStatus(
+          action === "stop"
+            ? stopping ? "当前关键事件完成后将自动停止。" : "任务已终止。"
+            : "任务正在启动。",
+          stopping ? "neutral" : "success",
+        );
+        loadRealtimeTasks({ silent: true });
+      } catch (error) {
+        button.disabled = false;
+        rtSetStatus(error.message, "error");
+      }
+      return;
+    }
     if (action === "delete") { if (!confirm("删除任务？历史决策和邮件审计将保留。")) return; try { await rtJson(await fetch(`/api/realtime/tasks/${id}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true }) })); await loadRealtimeTasks(); } catch (error) { rtSetStatus(error.message, "error"); } return; }
     await openRealtimeTask(id);
   });

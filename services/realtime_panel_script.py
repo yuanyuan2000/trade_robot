@@ -21,7 +21,8 @@ def _expression_calls(expression: str) -> list[str]:
     for node in ast.walk(compiled.tree):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
             continue
-        value = f"{node.func.id.lower()}({int(node.args[0].value)})"
+        arguments = ",".join(f"{float(arg.value):g}" for arg in node.args)
+        value = f"{node.func.id.lower()}({arguments})"
         if value not in calls:
             calls.append(value)
     return calls
@@ -38,7 +39,11 @@ def _indicator_column(expression: str) -> dict:
         "key": _column_key("indicator", expression),
         "label": expression.upper(),
         "expression": expression,
-        "format": "price" if name != "VOLUME" else "number",
+        "format": (
+            "boolean" if name == "RAPID_DROP"
+            else "price" if name in {"OPEN", "HIGH", "LOW", "CLOSE", "MA", "EMA", "ATR"}
+            else "number"
+        ),
         "help": f"策略公式使用的 {name} 历史值。",
     }
 
@@ -65,7 +70,9 @@ def generate_panel_settings(strategy: dict) -> dict:
                 "expression": eligibility,
                 "format": "boolean",
                 "help": "是否满足策略的竞争候选条件。",
-                "event": competition.get("when", "OPEN"),
+                "event": competition.get(
+                    "eligibility_when", competition.get("when", "OPEN")
+                ),
             },
             {
                 "key": "score",

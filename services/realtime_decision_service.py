@@ -193,7 +193,11 @@ class RealtimeDecisionEvaluator:
             "strict_data": True,
         }
         engine = BacktestEngine(strategy, settings, dataset=dataset)
-        _restore_strategy_state(engine.code_strategy, (run.get("state") or {}).get("strategy_state"))
+        saved_strategy_state = (run.get("state") or {}).get("strategy_state")
+        if engine.code_strategy is not None:
+            _restore_strategy_state(engine.code_strategy, saved_strategy_state)
+        else:
+            engine.restore_visual_strategy_state(saved_strategy_state)
         _restore_portfolio(engine.portfolio, (run.get("state") or {}).get("portfolio"))
         event_prices: dict[str, EventPrice] = {}
         for symbol, item in payload["symbols"].items():
@@ -256,7 +260,11 @@ class RealtimeDecisionEvaluator:
                 }
                 for symbol, value in payload["symbols"].items()
             },
-            "strategy_state": _strategy_state(engine.code_strategy) if engine.code_strategy is not None else {},
+            "strategy_state": (
+                _strategy_state(engine.code_strategy)
+                if engine.code_strategy is not None
+                else engine.visual_strategy_state()
+            ),
         }
         state = {
             "strategy_state": calculation["strategy_state"],

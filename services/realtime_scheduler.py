@@ -3,7 +3,6 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 import threading
-import time
 from zoneinfo import ZoneInfo
 
 from config import (
@@ -13,17 +12,18 @@ from config import (
 )
 from database import backtest_repository, realtime_repository, repository
 from services.backtest.code_strategies import get_code_strategy
+from services.backtest.dsl import compile_expression
 from services.backtest.market_calendar import ensure_market_sessions
 from services.backtest.validation import validate_strategy_payload
 from services.realtime_decision_service import RealtimeDecisionEvaluator
-from services.realtime_mail import MailError, NotificationDispatcher
+from services.realtime_mail import NotificationDispatcher
 from services.realtime_market_data import IEXMarketDataHub
 from services.realtime_panel_script import generate_panel_settings
 
 
 NEW_YORK = ZoneInfo("America/New_York")
 UTC = timezone.utc
-TERMINAL_RUNTIME = {"stopped", "error"}
+SCHEDULER_FALLBACK_SECONDS = 30.0
 
 
 def _event_order(event: str) -> tuple[int, str]:
@@ -42,7 +42,9 @@ def _events_for_strategy(strategy: dict) -> list[str]:
             if rule.get("enabled"):
                 events.add(rule["when"])
         if strategy["selection_mode"] == "competition":
-            events.add(definition["competition"]["when"])
+            competition = definition["competition"]
+            events.add(competition["when"])
+            events.add(competition.get("eligibility_when", competition["when"]))
     else:
         strategy_type = get_code_strategy(strategy["code_key"])
         events.update(strategy_type.required_events(definition.get("params", {})))
@@ -56,7 +58,23 @@ def _validate_local_history(strategy: dict) -> None:
     symbols = list(candidate_symbols)
     auxiliary_symbols: list[str] = []
     minimum = 2
-    if strategy["design_mode"] == "code":
+    if strategy["design_mode"] == "visual":
+        expressions = [
+            str(rule.get("condition") or "true")
+            for rule in definition.get("rules", [])
+            if rule.get("enabled", True)
+        ]
+        if strategy["selection_mode"] == "competition":
+            competition = definition["competition"]
+            expressions.extend((competition["eligibility"], competition["score"]))
+        minimum = max(
+            minimum,
+            max(
+                (compile_expression(expression).max_lookback for expression in expressions),
+                default=1,
+            ) + 1,
+        )
+    else:
         strategy_type = get_code_strategy(strategy["code_key"])
         params = strategy_type.validate_params(definition.get("params", {}))
         auxiliary_symbols = list(strategy_type.additional_symbols(params))
@@ -85,6 +103,9 @@ class RealtimeTaskManager:
         self._executor = ThreadPoolExecutor(max_workers=max(1, int(max_workers)), thread_name_prefix="realtime-task")
         self._states: dict[int, dict] = {}
         self._session_cache: dict[str, list[dict]] = {}
+        self._wake = threading.Event()
+        self._shutdown = threading.Event()
+        self._scheduler_thread: threading.Thread | None = None
         self.hub = IEXMarketDataHub()
         self.mail = NotificationDispatcher()
         self.evaluator = RealtimeDecisionEvaluator(self.hub)
@@ -92,31 +113,56 @@ class RealtimeTaskManager:
     def start_services(self) -> None:
         self.hub.start()
         self.mail.start()
+        self._shutdown.clear()
+        with self._lock:
+            if not self._scheduler_thread or not self._scheduler_thread.is_alive():
+                self._scheduler_thread = threading.Thread(
+                    target=self._scheduler_loop,
+                    name="realtime-scheduler",
+                    daemon=True,
+                )
+                self._scheduler_thread.start()
         self.recover_desired_tasks()
+        self._wake.set()
 
     def shutdown(self) -> None:
-        with self._lock:
-            states = list(self._states.values())
-            for state in states:
-                state["stop"].set()
+        self._shutdown.set()
+        self._wake.set()
         # A normal application shutdown must not leave a desired-running flag
         # behind. Otherwise the next process would interpret it as an
         # intentional recovery and start the task again.
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         with self._lock:
-            active_ids = set(self._states)
+            states = list(self._states.items())
+            for _task_id, state in states:
+                state["stop_requested"] = True
+        state_by_task = dict(states)
         for task in realtime_repository.list_tasks():
             if task["desired_state"] == "running":
                 try:
+                    state = state_by_task.get(task["id"])
+                    in_flight = bool(state and state.get("event_started"))
                     realtime_repository.set_task_runtime(
                         task["id"], desired_state="stopped",
-                        runtime_state="stopping" if task["id"] in active_ids else "stopped",
-                        stopped_at=None if task["id"] in active_ids else now,
+                        runtime_state="stopping" if in_flight else "stopped",
+                        stopped_at=None if in_flight else now,
                         heartbeat_at=now,
+                        clear_next_event=True,
                     )
+                    if state and not in_flight:
+                        realtime_repository.update_run(
+                            state["run_id"], status="stopped", stopped_at=now,
+                            heartbeat_at=now,
+                        )
                 except ValueError:
                     pass
+        thread = self._scheduler_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._scheduler_thread = None
         self._executor.shutdown(wait=True, cancel_futures=True)
+        with self._lock:
+            self._states.clear()
         self.mail.stop()
         self.hub.stop()
 
@@ -158,34 +204,82 @@ class RealtimeTaskManager:
         events = _events_for_strategy(strategy)
         if not events:
             raise ValueError("策略没有可执行的实时事件。")
-        if task["runtime_state"] in {"starting", "running", "degraded", "stopping"}:
+        with self._lock:
+            if int(task_id) in self._states:
+                return task
+        if (
+            not recovering
+            and task["runtime_state"] in {"starting", "running", "degraded", "stopping"}
+        ):
             return task
         run = realtime_repository.create_run(task)
-        stop = threading.Event()
-        with self._lock:
-            self._states[int(task_id)] = {"stop": stop, "run_id": run["id"], "last_event_key": None}
+        state = {
+            "run_id": int(run["id"]),
+            "strategy": strategy,
+            "events": events,
+            "processed": set(),
+            "event_in_flight": False,
+            "event_started": False,
+            "event_key": None,
+            "future": None,
+            "stop_requested": False,
+        }
         now = datetime.now(UTC).replace(microsecond=0).isoformat()
         realtime_repository.set_task_runtime(
-            task_id, desired_state="running", runtime_state="starting", run_started_at=now,
-            stopped_at=None, heartbeat_at=now, error_code=None, error_message=None,
+            task_id, desired_state="running", runtime_state="running",
+            run_started_at=now, clear_stopped_at=True, heartbeat_at=now,
+            clear_error=True,
         )
-        realtime_repository.update_run(run["id"], status="starting", heartbeat_at=now)
-        self._executor.submit(self._execute, int(task_id), int(run["id"]), events)
+        realtime_repository.update_run(run["id"], status="running", heartbeat_at=now)
+        with self._lock:
+            self._states[int(task_id)] = state
+        self._wake.set()
         return realtime_repository.get_task(task_id)
 
     def stop(self, task_id: int) -> dict:
         task = realtime_repository.get_task(task_id)
+        state = None
+        graceful = False
         with self._lock:
             state = self._states.get(int(task_id))
             if state:
-                state["stop"].set()
-        stopped_at = datetime.now(UTC).replace(microsecond=0).isoformat()
-        realtime_repository.set_task_runtime(
-            task_id,
-            desired_state="stopped",
-            runtime_state="stopping" if state else "stopped",
-            stopped_at=None if state else stopped_at,
-        )
+                state["stop_requested"] = True
+                graceful = bool(state.get("event_started"))
+                if not graceful:
+                    future = state.get("future")
+                    if future is not None:
+                        future.cancel()
+                    self._states.pop(int(task_id), None)
+        now = datetime.now(UTC).replace(microsecond=0).isoformat()
+        if graceful:
+            realtime_repository.set_task_runtime(
+                task_id, desired_state="stopped", runtime_state="stopping",
+                clear_stopped_at=True, heartbeat_at=now, clear_next_event=True,
+            )
+            try:
+                realtime_repository.update_run(
+                    state["run_id"], status="stopping", heartbeat_at=now,
+                )
+            except ValueError:
+                pass
+        else:
+            realtime_repository.set_task_runtime(
+                task_id, desired_state="stopped", runtime_state="stopped",
+                stopped_at=now, heartbeat_at=now, clear_next_event=True,
+            )
+            run_id = state.get("run_id") if state else None
+            if run_id is None:
+                runs = realtime_repository.list_runs(task["id"], limit=1)
+                run_id = runs[0]["id"] if runs else None
+            if run_id is not None:
+                try:
+                    realtime_repository.update_run(
+                        run_id, status="stopped", stopped_at=now,
+                        heartbeat_at=now,
+                    )
+                except ValueError:
+                    pass
+        self._wake.set()
         return realtime_repository.get_task(task_id)
 
     def status(self, task_id: int) -> dict:
@@ -250,52 +344,149 @@ class RealtimeTaskManager:
                     return {"trading_date": trading_date, "target": target, "session": session}, event
         return None
 
-    def _execute(self, task_id: int, run_id: int, events: list[str]) -> None:
-        state = self._states[task_id]
-        try:
-            task = realtime_repository.get_task(task_id)
-            strategy = task["strategy_snapshot"]
-            realtime_repository.update_run(run_id, status="running", heartbeat_at=datetime.now(UTC).replace(microsecond=0).isoformat())
-            realtime_repository.set_task_runtime(task_id, runtime_state="running", heartbeat_at=datetime.now(UTC).replace(microsecond=0).isoformat())
-            processed: set[str] = set()
-            while not state["stop"].is_set():
+    def _scheduler_loop(self) -> None:
+        """Maintain all idle tasks with one wakeable scheduler thread."""
+        while not self._shutdown.is_set():
+            self._wake.clear()
+            wait_seconds = self._schedule_once()
+            self._wake.wait(timeout=max(0.05, wait_seconds))
+
+    def _schedule_once(self, *, now: datetime | None = None) -> float:
+        current = now or datetime.now(UTC)
+        wait_seconds = SCHEDULER_FALLBACK_SECONDS
+        with self._lock:
+            scheduled = list(self._states.items())
+        for task_id, state in scheduled:
+            with self._lock:
+                if self._states.get(task_id) is not state:
+                    continue
+                if state["stop_requested"] or state["event_in_flight"]:
+                    continue
+            try:
                 task = realtime_repository.get_task(task_id)
                 if task["desired_state"] != "running":
-                    break
-                next_item = self._next_event(strategy, datetime.now(UTC))
+                    self._finish_stopped(task_id, state)
+                    continue
+                next_item = self._next_event(state["strategy"], current)
                 if next_item is None:
-                    state["stop"].wait(30)
                     continue
                 info, event = next_item
                 key = f"{info['trading_date']}|{event}|{info['target'].isoformat()}"
-                realtime_repository.set_task_runtime(task_id, next_event_at=info["target"].isoformat().replace("+00:00", "Z"), heartbeat_at=datetime.now(UTC).replace(microsecond=0).isoformat())
-                wait = (info["target"] - datetime.now(UTC)).total_seconds()
-                if wait > 0:
-                    state["stop"].wait(min(wait, 5.0))
-                    continue
-                if key in processed:
-                    state["stop"].wait(1)
-                    continue
-                processed.add(key)
-                lateness = max(0.0, (datetime.now(UTC) - info["target"]).total_seconds())
-                self._run_event(task, run_id, info["trading_date"], event, info["target"], lateness)
-                state["last_event_key"] = key
+                heartbeat = datetime.now(UTC).replace(microsecond=0).isoformat()
+                with self._lock:
+                    if self._states.get(task_id) is not state or state["stop_requested"]:
+                        continue
+                    realtime_repository.set_task_runtime(
+                        task_id,
+                        next_event_at=info["target"].isoformat().replace("+00:00", "Z"),
+                        heartbeat_at=heartbeat,
+                    )
+                    delay = (info["target"] - current).total_seconds()
+                    if delay > 0:
+                        wait_seconds = min(wait_seconds, delay)
+                        continue
+                    if key in state["processed"]:
+                        wait_seconds = min(wait_seconds, 1.0)
+                        continue
+                    state["processed"].add(key)
+                    state["event_in_flight"] = True
+                    state["event_started"] = False
+                    state["event_key"] = key
+                    future = self._executor.submit(
+                        self._execute_event, task_id, state, task, info, event,
+                    )
+                    if state["event_in_flight"] and state["event_key"] == key:
+                        state["future"] = future
+            except Exception as exc:
+                self._fail_scheduled_task(task_id, state, exc)
+        return wait_seconds
+
+    def _execute_event(
+        self, task_id: int, state: dict, task: dict, info: dict,
+        event: str,
+    ) -> None:
+        with self._lock:
+            if self._states.get(task_id) is not state:
+                return
+            if state["stop_requested"]:
+                self._finish_stopped(task_id, state)
+                return
+            state["event_started"] = True
+        unexpected_error: Exception | None = None
+        try:
+            lateness = max(
+                0.0, (datetime.now(UTC) - info["target"]).total_seconds()
+            )
+            self._run_event(
+                task, state["run_id"], info["trading_date"], event,
+                info["target"], lateness,
+            )
         except Exception as exc:
-            realtime_repository.update_run(run_id, status="failed", error_code="TASK_FAILED", error_message=str(exc), stopped_at=datetime.now(UTC).replace(microsecond=0).isoformat())
-            realtime_repository.set_task_runtime(task_id, runtime_state="error", error_code="TASK_FAILED", error_message=str(exc), stopped_at=datetime.now(UTC).replace(microsecond=0).isoformat())
+            unexpected_error = exc
         finally:
             with self._lock:
-                self._states.pop(task_id, None)
-            task = realtime_repository.get_task(task_id)
-            if task["desired_state"] == "stopped" and task["runtime_state"] != "error":
-                now = datetime.now(UTC).replace(microsecond=0).isoformat()
-                realtime_repository.set_task_runtime(task_id, runtime_state="stopped", stopped_at=now)
-                try:
-                    realtime_repository.update_run(run_id, status="stopped", stopped_at=now, heartbeat_at=now)
-                except ValueError:
-                    pass
+                if self._states.get(task_id) is not state:
+                    return
+                state["event_in_flight"] = False
+                state["event_started"] = False
+                state["future"] = None
+                should_stop = state["stop_requested"]
+            if should_stop:
+                self._finish_stopped(task_id, state)
+            else:
+                if unexpected_error is not None:
+                    try:
+                        realtime_repository.set_task_runtime(
+                            task_id, runtime_state="degraded",
+                            error_code="DECISION_FAILED",
+                            error_message=str(unexpected_error),
+                        )
+                    except ValueError:
+                        pass
+                self._wake.set()
 
-    def _run_event(self, task: dict, run_id: int, trading_date: str, event: str, scheduled_at: datetime, lateness: float) -> None:
+    def _finish_stopped(self, task_id: int, state: dict) -> None:
+        with self._lock:
+            if self._states.get(task_id) is not state:
+                return
+            self._states.pop(task_id, None)
+        now = datetime.now(UTC).replace(microsecond=0).isoformat()
+        try:
+            realtime_repository.set_task_runtime(
+                task_id, desired_state="stopped", runtime_state="stopped",
+                stopped_at=now, heartbeat_at=now, clear_next_event=True,
+            )
+            realtime_repository.update_run(
+                state["run_id"], status="stopped", stopped_at=now,
+                heartbeat_at=now,
+            )
+        except ValueError:
+            pass
+        self._wake.set()
+
+    def _fail_scheduled_task(self, task_id: int, state: dict, exc: Exception) -> None:
+        with self._lock:
+            if self._states.get(task_id) is not state:
+                return
+            self._states.pop(task_id, None)
+        stopped_at = datetime.now(UTC).replace(microsecond=0).isoformat()
+        try:
+            realtime_repository.update_run(
+                state["run_id"], status="failed", error_code="TASK_FAILED",
+                error_message=str(exc), stopped_at=stopped_at,
+            )
+            realtime_repository.set_task_runtime(
+                task_id, desired_state="stopped", runtime_state="error",
+                error_code="TASK_FAILED", error_message=str(exc),
+                stopped_at=stopped_at, clear_next_event=True,
+            )
+        except ValueError:
+            pass
+
+    def _run_event(
+        self, task: dict, run_id: int, trading_date: str, event: str,
+        scheduled_at: datetime, lateness: float,
+    ) -> None:
         dedupe = f"task:{task['id']}:run:{run_id}:{trading_date}:{event}:{scheduled_at.isoformat()}"
         decision_event = realtime_repository.create_event(
             run_id=run_id, task_id=task["id"], dedupe_key=dedupe,

@@ -11,7 +11,7 @@ from services.backtest.errors import BacktestValidationError
 
 ALLOWED_NAMES = {"price", "position", "true", "false"}
 HISTORY_FUNCTIONS = {"open", "high", "low", "close", "volume"}
-INDICATOR_FUNCTIONS = {"ma", "ema", "atr"}
+INDICATOR_FUNCTIONS = {"ma", "ema", "atr", "ratr", "wtme", "rapid_drop"}
 ALLOWED_FUNCTIONS = HISTORY_FUNCTIONS | INDICATOR_FUNCTIONS
 _EQUALITY = re.compile(r"(?<![<>=!])=(?!=)")
 _BOOLEAN_WORD = re.compile(r"\b(AND|OR|NOT|TRUE|FALSE)\b", re.IGNORECASE)
@@ -40,6 +40,66 @@ def _node_error(node: ast.AST, message: str) -> BacktestValidationError:
         f"规则公式不合法：{message}",
         detail={"node": type(node).__name__},
     )
+
+
+def _numeric_constant(node: ast.AST) -> float | int | None:
+    if (
+        isinstance(node, ast.Constant)
+        and not isinstance(node.value, bool)
+        and isinstance(node.value, (int, float))
+        and math.isfinite(float(node.value))
+    ):
+        return node.value
+    return None
+
+
+def _validate_function_call(node: ast.Call) -> None:
+    name = node.func.id.lower()
+    if node.keywords:
+        raise _node_error(node, "指标函数不支持命名参数。")
+    expected = {
+        "wtme": {2, 3},
+        "rapid_drop": {2},
+    }.get(name, {1})
+    if len(node.args) not in expected:
+        signatures = {
+            "wtme": "wtme(周期, 半衰期[, epsilon])",
+            "rapid_drop": "rapid_drop(观察段数, 跌幅阈值%)",
+        }
+        signature = signatures.get(name, f"{name}(周期)")
+        raise _node_error(node, f"函数参数数量错误，应使用 {signature}。")
+
+    period = _numeric_constant(node.args[0])
+    if not isinstance(period, int) or not 1 <= period <= 500:
+        raise _node_error(node, "周期 n 必须是 1 至 500 的整数，禁止使用 0。")
+    if name == "wtme":
+        if period < 2:
+            raise _node_error(node, "WTME 周期必须是 2 至 500 的整数。")
+        half_life = _numeric_constant(node.args[1])
+        if half_life is None or not 0.1 <= float(half_life) <= 500:
+            raise _node_error(node, "WTME 半衰期必须在 0.1 至 500 之间。")
+        if len(node.args) == 3:
+            epsilon = _numeric_constant(node.args[2])
+            if epsilon is None or not 1e-12 <= float(epsilon) <= 0.01:
+                raise _node_error(node, "WTME epsilon 必须在 1e-12 至 0.01 之间。")
+    elif name == "rapid_drop":
+        threshold = _numeric_constant(node.args[1])
+        if threshold is None or not 0.1 <= float(threshold) <= 50:
+            raise _node_error(node, "急跌阈值必须在 0.1% 至 50% 之间。")
+
+
+def _call_arguments(node: ast.Call) -> tuple[float | int, ...]:
+    return tuple(_numeric_constant(argument) for argument in node.args)
+
+
+def _format_argument(value: float | int) -> str:
+    return str(value) if isinstance(value, int) else f"{float(value):g}"
+
+
+def _call_lookback(node: ast.Call) -> int:
+    name = node.func.id.lower()
+    period = int(_call_arguments(node)[0])
+    return period + 1 if name in {"atr", "ratr"} else period
 
 
 def _validate_node(node: ast.AST) -> None:
@@ -89,16 +149,7 @@ def _validate_node(node: ast.AST) -> None:
             or node.func.id.lower() not in ALLOWED_FUNCTIONS
         ):
             raise _node_error(node, "调用了不支持的函数。")
-        if node.keywords or len(node.args) != 1:
-            raise _node_error(node, "历史函数必须且只能有一个周期参数。")
-        argument = node.args[0]
-        if (
-            not isinstance(argument, ast.Constant)
-            or isinstance(argument.value, bool)
-            or not isinstance(argument.value, int)
-            or not 1 <= argument.value <= 500
-        ):
-            raise _node_error(node, "周期 n 必须是 1 至 500 的整数，禁止使用 0。")
+        _validate_function_call(node)
         return
     raise _node_error(node, "包含不支持的语法。")
 
@@ -131,10 +182,10 @@ class CompiledExpression:
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
                 continue
             name = node.func.id.lower()
-            period = int(node.args[0].value)
-            key = f"{name}({period})"
+            arguments = _call_arguments(node)
+            key = f"{name}({','.join(_format_argument(value) for value in arguments)})"
             if key not in values:
-                values[key] = float(context.resolve_function(name, period))
+                values[key] = float(context.resolve_function(name, *arguments))
         return values
 
 
@@ -149,8 +200,7 @@ def compile_expression(expression: str) -> CompiledExpression:
         ) from exc
     _validate_node(tree)
     lookbacks = [
-        int(node.args[0].value)
-        + (1 if isinstance(node.func, ast.Name) and node.func.id.lower() == "atr" else 0)
+        _call_lookback(node)
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
     ]
@@ -222,6 +272,5 @@ def _evaluate_node(node: ast.AST, context):
         return True
     if isinstance(node, ast.Call):
         name = node.func.id.lower()
-        period = int(node.args[0].value)
-        return float(context.resolve_function(name, period))
+        return float(context.resolve_function(name, *_call_arguments(node)))
     raise BacktestValidationError("规则公式包含无法执行的节点。")

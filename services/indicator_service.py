@@ -50,7 +50,8 @@ def calculate_indicator_values(
     threshold_percent: float | None = None,
 ) -> list[float | None]:
     normalized_type = str(indicator_type).strip().upper()
-    if period < (1 if normalized_type == "RAPID_DROP" else 2):
+    minimum_period = 2 if normalized_type == "WTME" else 1
+    if period < minimum_period:
         return [None] * len(rows)
     if normalized_type == "MA":
         return _calculate_ma(rows, period)

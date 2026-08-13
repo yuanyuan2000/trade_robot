@@ -160,6 +160,7 @@ class BacktestEngine:
         self._compiled_rules: list[tuple[dict, CompiledExpression]] = []
         self._competition_eligibility: CompiledExpression | None = None
         self._competition_score: CompiledExpression | None = None
+        self._competition_eligible_by_date: dict[str, set[str]] = {}
         self.code_strategy = None
         self.auxiliary_symbols: list[str] = []
         self.early_close_offsets: dict[str, int] = {}
@@ -253,6 +254,7 @@ class BacktestEngine:
                 )
                 self._competition_score = compile_expression(competition["score"])
                 events.add(competition["when"])
+                events.add(competition["eligibility_when"])
                 lookback = max(
                     lookback,
                     self._competition_eligibility.max_lookback,
@@ -932,6 +934,21 @@ class BacktestEngine:
             if intent:
                 risk_intents.append(intent)
         competition = self.definition["competition"]
+        if event == competition["eligibility_when"]:
+            eligible: set[str] = set()
+            for symbol in active_candidates:
+                if symbol in blocked:
+                    continue
+                context = self.dataset.expression_context(
+                    symbol=symbol,
+                    trading_date=trading_date,
+                    event=event,
+                    price=event_prices[symbol].signal_price,
+                    position=float(self.portfolio.weight(symbol, marks)),
+                )
+                if bool(self._competition_eligibility.evaluate(context)):
+                    eligible.add(symbol)
+            self._competition_eligible_by_date[trading_date] = eligible
         if event != competition["when"]:
             return risk_intents
         # A matched ordinary rule on the current holding has precedence.
@@ -941,8 +958,10 @@ class BacktestEngine:
             return risk_intents
 
         scores: list[tuple[float, str]] = []
+        eligible = self._competition_eligible_by_date.get(trading_date, set())
+        minimum_score = competition.get("minimum_score")
         for symbol in active_candidates:
-            if symbol in blocked:
+            if symbol in blocked or symbol not in eligible:
                 continue
             context = self.dataset.expression_context(
                 symbol=symbol,
@@ -951,17 +970,26 @@ class BacktestEngine:
                 price=event_prices[symbol].signal_price,
                 position=float(self.portfolio.weight(symbol, marks)),
             )
-            if bool(self._competition_eligibility.evaluate(context)):
-                score = float(self._competition_score.evaluate(context))
+            score = float(self._competition_score.evaluate(context))
+            passes_minimum = minimum_score is None or score >= minimum_score
+            if passes_minimum:
                 scores.append((score, symbol))
-                self._log(
-                    "DEBUG",
-                    "COMPETITION_SCORE",
-                    f"{symbol} 竞争评分 {score:.8f}。",
-                    event_time=f"{trading_date} {event}",
-                    symbol=symbol,
-                    context={"score": score},
-                )
+            self._log(
+                "DEBUG",
+                "COMPETITION_SCORE",
+                (
+                    f"{symbol} 竞争评分 {score:.8f}。"
+                    if passes_minimum
+                    else f"{symbol} 竞争评分 {score:.8f}，低于最低可入选评分 {minimum_score:g}。"
+                ),
+                event_time=f"{trading_date} {event}",
+                symbol=symbol,
+                context={
+                    "score": score,
+                    "minimum_score": minimum_score,
+                    "passes_minimum_score": passes_minimum,
+                },
+            )
         winner = sorted(scores, key=lambda item: (-item[0], item[1]))[0][1] if scores else None
         selection_intents = [
             OrderIntent(
@@ -975,18 +1003,40 @@ class BacktestEngine:
             if symbol != winner and self.portfolio.quantity(symbol) > 0
         ]
         if winner:
-            selection_intents.append(
-                OrderIntent(
-                    symbol=winner,
-                    action="BUY",
-                    sizing_mode="TARGET",
-                    value_percent=competition["target_weight"],
-                    reason=f"竞争评分最高：{winner}",
+            if (
+                competition.get("rebalance_existing", True)
+                or self.portfolio.quantity(winner) <= 0
+            ):
+                selection_intents.append(
+                    OrderIntent(
+                        symbol=winner,
+                        action="BUY",
+                        sizing_mode="TARGET",
+                        value_percent=competition["target_weight"],
+                        reason=f"竞争评分最高：{winner}",
+                    )
                 )
-            )
         elif not competition["cash_when_none"]:
             selection_intents = []
         return [*risk_intents, *selection_intents]
+
+    def visual_strategy_state(self) -> dict:
+        return {
+            "competition_eligible_by_date": {
+                day: sorted(symbols)
+                for day, symbols in self._competition_eligible_by_date.items()
+            }
+        }
+
+    def restore_visual_strategy_state(self, state: dict | None) -> None:
+        if not state:
+            return
+        self._competition_eligible_by_date = {
+            str(day): set(symbols)
+            for day, symbols in (
+                state.get("competition_eligible_by_date") or {}
+            ).items()
+        }
 
     def _execute_intents(
         self,

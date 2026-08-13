@@ -428,18 +428,46 @@ def _visual_row(
     score = None
     if strategy.get("selection_mode") == "competition":
         competition = definition["competition"]
-        context = dataset.expression_context(
+        eligibility_context = dataset.expression_context(
+            symbol=symbol, trading_date=trading_date,
+            event=competition.get("eligibility_when", competition["when"]),
+            price=event_prices[symbol].signal_price, position=0,
+        )
+        score_context = dataset.expression_context(
             symbol=symbol, trading_date=trading_date,
             event=competition["when"],
             price=event_prices[symbol].signal_price, position=0,
         )
-        eligible = bool(compile_expression(competition["eligibility"]).evaluate(context))
-        score = _finite(compile_expression(competition["score"]).evaluate(context))
-        details["competition"] = {"eligible": eligible, "score": score}
+        eligible = bool(
+            compile_expression(competition["eligibility"]).evaluate(
+                eligibility_context
+            )
+        )
+        score = _finite(
+            compile_expression(competition["score"]).evaluate(score_context)
+        )
+        minimum_score = competition.get("minimum_score")
+        passes_minimum = (
+            score is not None
+            and (minimum_score is None or score >= float(minimum_score))
+        )
+        details["competition"] = {
+            "eligible": eligible,
+            "score": score,
+            "minimum_score": minimum_score,
+            "passes_minimum_score": passes_minimum,
+        }
+        eligible = eligible and passes_minimum
     if strategy.get("selection_mode") == "competition":
         reasons = list(matched_risk)
         if not eligible:
-            reasons.append("不满足候选条件")
+            competition_detail = details["competition"]
+            reasons.append(
+                "评分低于最低可入选评分"
+                if competition_detail["eligible"]
+                and not competition_detail["passes_minimum_score"]
+                else "不满足候选条件"
+            )
         effective_eligible = eligible and not matched_risk
         status = "通过" if effective_eligible else "已过滤"
     else:
