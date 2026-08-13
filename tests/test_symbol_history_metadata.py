@@ -45,6 +45,26 @@ class SymbolHistoryMetadataTests(unittest.TestCase):
             "2021-01-01",
         )
 
+    def test_overview_snapshot_exposes_latest_bar_provenance_and_completion(self) -> None:
+        repository.upsert_symbol("SPY")
+        repository.upsert_daily_prices(
+            "SPY",
+            [
+                {"date": "2026-08-13", "open": 100, "high": 101, "low": 99, "close": 100, "volume": 10, "is_complete": 1, "price_basis": "raw"},
+                {"date": "2026-08-14", "open": 100, "high": 102, "low": 99, "close": 101, "volume": 12, "is_complete": 0, "price_basis": "raw"},
+            ],
+            source_provider="alpaca",
+            source_timeframe="1Day",
+        )
+
+        snapshot = repository.get_symbol_price_snapshot("SPY")
+
+        self.assertFalse(snapshot["latest_price_is_complete"])
+        self.assertTrue(snapshot["latest_price_is_provisional"])
+        self.assertEqual(snapshot["latest_price_basis"], "raw")
+        self.assertEqual(snapshot["latest_price_source"], "alpaca")
+        self.assertEqual(snapshot["latest_price_timeframe"], "1Day")
+
 
 if __name__ == "__main__":
     unittest.main()

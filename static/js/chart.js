@@ -74,6 +74,9 @@ function renderCandles(rows) {
     low: Number(row.low),
     close: Number(row.close),
     volume: Number(row.volume || 0),
+    is_complete: row.is_complete !== false && Number(row.is_complete ?? 1) !== 0,
+    updated_at: row.updated_at,
+    price_basis: row.price_basis,
   }));
   rebuildPeriodCandles();
   resetViewportToFullRange();
@@ -1289,175 +1292,26 @@ function positionChartTooltip(element, offsetX, offsetY) {
 function recalculateIndicators() {
   chartState.indicatorSeries = chartState.indicators.map((indicator) => ({
     ...indicator,
-    values: calculateIndicatorValues(chartState.candles, indicator),
+    values: alignIndicatorPoints(chartState.candles, indicator.points || []),
   }));
 }
 
-function calculateIndicatorValues(candles, indicator) {
-  const period = Number(indicator.params?.period);
-  const minimumPeriod = indicator.indicator_type === "RAPID_DROP" ? 1 : 2;
-  if (!Number.isInteger(period) || period < minimumPeriod) {
-    return candles.map(() => null);
-  }
-  if (indicator.indicator_type === "MA") {
-    return calculateMA(candles, period);
-  }
-  if (indicator.indicator_type === "EMA") {
-    return calculateEMA(candles, period);
-  }
-  if (indicator.indicator_type === "ATR") {
-    return calculateWilderATR(candles, period);
-  }
-  if (indicator.indicator_type === "RATR") {
-    return calculateRelativeATR(candles, period);
-  }
-  if (indicator.indicator_type === "WTME") {
-    return calculateWTME(
-      candles,
-      period,
-      Number(indicator.params?.half_life),
-      Number(indicator.params?.epsilon),
-    );
-  }
-  if (indicator.indicator_type === "RAPID_DROP") {
-    return calculateRapidDropFilter(
-      candles,
-      period,
-      Number(indicator.params?.threshold_percent),
-    );
-  }
-  return candles.map(() => null);
+function indicatorBarKey(item) {
+  return `${item?.date || ""}|${item?.endDate || ""}`;
 }
 
-function calculateRapidDropFilter(candles, period, thresholdPercent) {
-  const values = candles.map(() => null);
-  if (!Number.isInteger(period) || period < 1 || !Number.isFinite(thresholdPercent) || thresholdPercent <= 0) {
-    return values;
-  }
-  const threshold = -thresholdPercent / 100;
-  for (let rowIndex = period; rowIndex < candles.length; rowIndex += 1) {
-    let triggered = false;
-    let valid = true;
-    for (let currentIndex = rowIndex - period + 1; currentIndex <= rowIndex; currentIndex += 1) {
-      const previousClose = candles[currentIndex - 1].close;
-      if (!Number.isFinite(previousClose) || previousClose <= 0) {
-        valid = false;
-        break;
-      }
-      if (candles[currentIndex].close / previousClose - 1 <= threshold) {
-        triggered = true;
-      }
-    }
-    if (valid) values[rowIndex] = triggered ? 1 : 0;
-  }
-  return values;
+function alignIndicatorPoints(candles, points) {
+  const byBar = new Map(points.map((point) => [indicatorBarKey(point), point.value]));
+  return candles.map((candle) => byBar.get(indicatorBarKey(candle)) ?? null);
 }
 
-function calculateWilderATR(candles, period) {
-  const values = candles.map(() => null);
-  const trueRanges = [];
-  for (let index = 1; index < candles.length; index += 1) {
-    const current = candles[index];
-    const previousClose = candles[index - 1].close;
-    trueRanges.push(Math.max(
-      current.high - current.low,
-      Math.abs(current.high - previousClose),
-      Math.abs(current.low - previousClose),
-    ));
-  }
-  if (trueRanges.length < period) return values;
-
-  let atr = trueRanges.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
-  values[period] = atr;
-  for (let rowIndex = period + 1; rowIndex < candles.length; rowIndex += 1) {
-    atr = (atr * (period - 1) + trueRanges[rowIndex - 1]) / period;
-    values[rowIndex] = atr;
-  }
-  return values;
-}
-
-function calculateRelativeATR(candles, period) {
-  const values = candles.map(() => null);
-  const atrValues = calculateWilderATR(candles, period);
-  for (let index = period + 1; index < candles.length; index += 1) {
-    const atr = atrValues[index - 1];
-    if (atr !== null && atr > 0) {
-      values[index] = (candles[index].close - candles[index - period].close) / atr;
-    }
-  }
-  return values;
-}
-
-function calculateWTME(candles, period, halfLife, epsilon) {
-  const values = candles.map(() => null);
-  if (!Number.isFinite(halfLife) || halfLife <= 0 || !Number.isFinite(epsilon) || epsilon <= 0) {
-    return values;
-  }
-  const rawWeights = Array.from(
-    { length: period },
-    (_, index) => 2 ** (-(period - 1 - index) / halfLife),
-  );
-  const weightTotal = rawWeights.reduce((sum, value) => sum + value, 0);
-  const weights = rawWeights.map((value) => value / weightTotal);
-  for (let rowIndex = period; rowIndex < candles.length; rowIndex += 1) {
-    let weightedReturn = 0;
-    let weightedTrueRange = 0;
-    let valid = true;
-    for (let offset = 0; offset < period; offset += 1) {
-      const previous = candles[rowIndex - period + offset];
-      const current = candles[rowIndex - period + offset + 1];
-      if (!Number.isFinite(previous.close) || previous.close <= 0) {
-        valid = false;
-        break;
-      }
-      const trueRange = Math.max(
-        current.high - current.low,
-        Math.abs(current.high - previous.close),
-        Math.abs(current.low - previous.close),
-      );
-      weightedReturn += weights[offset] * ((current.close - previous.close) / previous.close);
-      weightedTrueRange += weights[offset] * (trueRange / previous.close);
-    }
-    if (valid) {
-      values[rowIndex] = 100 * weightedReturn / (weightedTrueRange + epsilon);
-    }
-  }
-  return values;
-}
-
-function calculateMA(candles, period) {
-  const values = [];
-  let sum = 0;
-  for (let index = 0; index < candles.length; index += 1) {
-    sum += candles[index].close;
-    if (index >= period) {
-      sum -= candles[index - period].close;
-    }
-    values.push(index >= period - 1 ? sum / period : null);
-  }
-  return values;
-}
-
-function calculateEMA(candles, period) {
-  const values = candles.map(() => null);
-  if (candles.length < period) {
-    return values;
-  }
-
-  let sum = 0;
-  for (let index = 0; index < period; index += 1) {
-    sum += candles[index].close;
-  }
-
-  const multiplier = 2 / (period + 1);
-  let previous = sum / period;
-  values[period - 1] = previous;
-
-  for (let index = period; index < candles.length; index += 1) {
-    previous = candles[index].close * multiplier + previous * (1 - multiplier);
-    values[index] = previous;
-  }
-  return values;
+function indicatorPriceBasisLabel(priceBasis) {
+  return {
+    all_adjusted: "前复权",
+    all: "前复权",
+    split: "仅拆股复权",
+    raw: "原始价",
+  }[priceBasis] || priceBasis || "";
 }
 
 function renderIndicatorLegend() {
@@ -1475,6 +1329,8 @@ function renderIndicatorLegend() {
     const value = series.values[valueIndex];
     const visibilityClass = series.visible ? "" : " is-hidden";
     const favoriteClass = series.is_favorite ? " is-favorite" : "";
+    const basis = indicatorPriceBasisLabel(series.price_basis);
+    const state = series.is_provisional ? "盘中值" : "已收线";
     return `
       <div class="legend-row${visibilityClass}" data-symbol-indicator-id="${series.id}" data-indicator-id="${series.indicator_id}">
         <button class="legend-button${visibilityClass}" type="button" data-action="toggle-visible" title="${series.visible ? "隐藏" : "显示"}">
@@ -1484,7 +1340,7 @@ function renderIndicatorLegend() {
         <button class="legend-button${favoriteClass}" type="button" data-action="toggle-favorite" title="${series.is_favorite ? "取消收藏" : "收藏"}">
           ${starIcon(series.is_favorite)}
         </button>
-        <span class="legend-name">${escapeHtml(series.name)}</span>
+        <span class="legend-name" title="服务端统一计算 · ${escapeHtml(basis)} · ${state}">${escapeHtml(series.name)}<small>${escapeHtml(basis)}${series.is_provisional ? " · 盘中" : ""}</small></span>
         <span class="legend-value">${value == null ? "-" : formatPrice(value)}</span>
         <button class="legend-button legend-remove" type="button" data-action="remove" title="移除">×</button>
       </div>

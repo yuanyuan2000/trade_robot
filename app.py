@@ -40,7 +40,13 @@ from services.market_data_service import (
     update_full_market_data,
 )
 from services.intraday_bar_service import get_chart_bars
-from services.indicator_service import attach_overview_indicator_values
+from services.indicator_service import (
+    attach_overview_indicator_values,
+    build_indicator_series,
+)
+from services.corporate_action_adjustment_service import (
+    stored_adjusted_daily_payload,
+)
 from services.analysis_overview_service import (
     build_trendline_overview_summary,
     merge_analysis_overview,
@@ -614,15 +620,37 @@ def market_overview():
             if indicator_id in favorite_by_id
         ]
         overview = repository.list_market_overview(page, page_size)
+        overview["indicator_standard_price_basis"] = "all_adjusted"
+        overview["indicator_action_source"] = "stored_only"
         if selected_indicators:
-            daily_rows_by_symbol = {
-                item["symbol"]: repository.get_daily_prices(item["symbol"])
-                for item in overview["items"]
-            }
+            daily_rows_by_symbol: dict[str, list[dict]] = {}
+            indicator_metadata: dict[str, dict] = {}
+            for item in overview["items"]:
+                symbol = item["symbol"]
+                rows = repository.get_daily_prices(symbol, include_metadata=True)
+                settings = repository.get_symbol(symbol)
+                adjusted = stored_adjusted_daily_payload(
+                    symbol,
+                    rows,
+                    settings,
+                    mode="all",
+                )
+                daily_rows_by_symbol[symbol] = adjusted["rows"]
+                item["indicator_adjustment_warning"] = adjusted.get("warning")
+                indicator_metadata[symbol] = {
+                    "price_basis": (
+                        "all_adjusted"
+                        if adjusted["adjustment"] == "all"
+                        else adjusted["adjustment"]
+                    ),
+                    "as_of": item.get("latest_price_updated_at"),
+                    "action_source": adjusted.get("action_source"),
+                }
             attach_overview_indicator_values(
                 overview,
                 selected_indicators,
                 daily_rows_by_symbol,
+                indicator_metadata,
             )
         else:
             overview["selected_indicators"] = []
@@ -1975,10 +2003,48 @@ def patch_symbol_settings(symbol: str):
 def symbol_view_indicators(symbol: str, view_code: str):
     try:
         normalized = symbol.strip().upper()
+        indicators = repository.list_symbol_indicators(normalized, view_code)
+        if request.args.get("with_values") not in {"1", "true", "yes"}:
+            return jsonify({"ok": True, "indicators": indicators})
+
+        adjustment = request.args.get("adjustment", "all")
+        limit = int(request.args.get("limit", "2000"))
+        bars_payload = get_chart_bars(
+            normalized,
+            view_code,
+            limit,
+            adjustment,
+        )
+        rows = list(bars_payload.get("data") or [])
+        settings = bars_payload.get("symbol_settings") or {}
+        if not settings.get("show_weekend_data", True):
+            rows = [
+                row for row in rows
+                if datetime.strptime(str(row["date"])[:10], "%Y-%m-%d").weekday() < 5
+            ]
+        latest = rows[-1] if rows else {}
+        price_basis = (
+            "all_adjusted"
+            if bars_payload.get("adjustment") == "all"
+            else str(bars_payload.get("adjustment") or "raw")
+        )
         return jsonify(
             {
                 "ok": True,
-                "indicators": repository.list_symbol_indicators(normalized, view_code),
+                "bars": rows,
+                "indicators": build_indicator_series(
+                    rows,
+                    indicators,
+                    price_basis=price_basis,
+                    as_of=latest.get("updated_at") or latest.get("date"),
+                ),
+                "calculation": {
+                    "price_basis": price_basis,
+                    "as_of": latest.get("updated_at") or latest.get("date"),
+                    "is_provisional": not bool(latest.get("is_complete", True)) if rows else False,
+                    "source": bars_payload.get("source"),
+                    "period": bars_payload.get("period") or view_code,
+                },
             }
         )
     except ValueError as exc:

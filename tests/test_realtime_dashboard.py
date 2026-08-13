@@ -71,8 +71,14 @@ class RealtimeDashboardTests(unittest.TestCase):
         self.assertTrue(rows["SPY"]["is_candidate"])
         self.assertTrue(rows["GLD"]["is_candidate"])
         self.assertFalse(rows["OUTSIDE"]["is_candidate"])
+        self.assertEqual(rows["SPY"]["price_source"], "alpaca")
+        self.assertEqual(rows["SPY"]["price_timeframe"], "1Day")
+        self.assertEqual(rows["SPY"]["price_basis"], "raw")
         self.assertEqual(payload["source"], "market_overview_database")
         self.assertFalse(payload["external_api_called"])
+        self.assertEqual(payload["observation_mode"], "strategy_latest_simulation")
+        self.assertFalse(payload["formal_decision"])
+        self.assertIn("不是正式决策", payload["observation_note"])
         self.assertEqual(payload["default_sort"], {"key": "score", "direction": "desc"})
         recommendations = dashboard_recommendations(payload)
         self.assertLessEqual(len(recommendations), 3)
@@ -129,6 +135,8 @@ class RealtimeDashboardTests(unittest.TestCase):
         payload = build_realtime_dashboard(task["id"], force=True)
         params = task["strategy_snapshot"]["definition"]["params"]
         help_by_key = {column["key"]: column["help"] for column in payload["columns"]}
+        label_by_key = {column["key"]: column["label"] for column in payload["columns"]}
+        self.assertTrue(all("策略" in label for label in label_by_key.values()))
         self.assertIn(f'{params["lookback_days"] + 1} 个点', help_by_key["annualized_returns"])
         self.assertIn(f'第 {params["short_lookback_days"]} 个完整交易日', help_by_key["short_annualized"])
         self.assertIn(f'{params["min_score_threshold"]:g}', help_by_key["score"])
@@ -160,17 +168,20 @@ class RealtimeDashboardTests(unittest.TestCase):
             payload = build_realtime_dashboard(task["id"], force=True)
             params = strategy["definition"]["params"]
             help_by_key = {column["key"]: column["help"] for column in payload["columns"]}
+            label_by_key = {column["key"]: column["label"] for column in payload["columns"]}
             row = next(item for item in payload["rows"] if item["symbol"] == "SPY")
             self.assertNotEqual(row["status"], "不可计算")
             if code_key == "rapid_drop_atr_rotation":
+                self.assertEqual(label_by_key["score"], "策略 ATR 评分")
                 self.assertIn(f'{params["momentum_lookback_sessions"]} 日价格位移', help_by_key["score"])
-                self.assertIn(f'{params["atr_period"]} 日 ATR', help_by_key["score"])
+                self.assertIn(f'{params["atr_period"]} 日策略 ATR', help_by_key["score"])
                 self.assertAlmostEqual(
                     row["metrics"]["score"],
                     row["metrics"]["price_displacement"] / row["metrics"]["atr"],
                     places=10,
                 )
             else:
+                self.assertEqual(label_by_key["score"], "策略 WTME 评分")
                 self.assertIn(f'最近 {params["wtme_period"]} 个收益观测', help_by_key["weighted_return"])
                 self.assertIn(f'{params["wtme_half_life"]:g} 个交易日', help_by_key["weighted_return"])
                 epsilon = strategy["definition"]["params"]["wtme_epsilon"]
@@ -276,6 +287,8 @@ class RealtimeDashboardTests(unittest.TestCase):
         self.assertIn('data-realtime-tab="parameters"', html)
         self.assertNotIn('class="realtime-dashboard-summary"', html)
         self.assertIn('class="realtime-back-icon"', html)
+        self.assertIn("按任务策略模拟最新时点，非正式决策", html)
+        self.assertIn("IEX 与 SIP 数据源暂不统一", html)
         script = (Path(__file__).parents[1] / "static" / "js" / "realtime.js").read_text(encoding="utf-8")
         self.assertNotIn("任务快照候选池 · 每 60 秒轮询内部数据", script)
         self.assertIn('`已过滤 ${summary.filtered ?? 0}`', script)

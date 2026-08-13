@@ -306,7 +306,11 @@
               <label class="switch-control realtime-auto-control" title="与行情总览共用同一个服务端自动更新开关"><input id="realtime-overview-auto-toggle" type="checkbox"><span class="switch-track" aria-hidden="true"></span><span class="switch-label">行情自动更新</span></label>
               <button id="realtime-dashboard-refresh" type="button" title="只重新读取内部数据库并计算，不调用外部 API">重新计算</button>
             </div>
-            <div id="realtime-dashboard-meta" class="realtime-dashboard-meta">等待读取内部行情数据库</div>
+            <div class="realtime-dashboard-meta-row">
+              <div id="realtime-dashboard-meta" class="realtime-dashboard-meta">等待读取内部行情数据库</div>
+              <span class="realtime-observation-note">按任务策略模拟最新时点，非正式决策；数值可能与行情页标准指标不同。</span>
+              <span class="realtime-metric-help" title="行情页使用标准指标及所选 K 线价格口径；本面板按任务策略定义的观测构造、参数、过滤和排名方式，使用行情总览内部数据库的最新数据模拟当前时点。策略可使用完整日线、盘中价或自行构造观测，因此两处数值可能不同。正式任务仍只在策略预定时点执行。IEX 与 SIP 数据源暂不统一。" aria-label="观察口径说明">?</span>
+            </div>
             <div id="realtime-dashboard-table" class="realtime-dashboard-table-wrap"></div>
           </section>
           <section class="panel realtime-strategy-panel" data-realtime-panel="parameters" hidden>

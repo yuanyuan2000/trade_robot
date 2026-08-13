@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 import re
 from zoneinfo import ZoneInfo
 
@@ -97,13 +97,25 @@ def _merge_group(rows: list[dict], label: str, end_label: str | None = None) -> 
         "low": min(row["low"] for row in rows),
         "close": last["close"],
         "volume": sum(float(row.get("volume") or 0) for row in rows),
+        "is_complete": all(bool(row.get("is_complete", True)) for row in rows),
     }
+    updated_values = [str(row["updated_at"]) for row in rows if row.get("updated_at")]
+    if updated_values:
+        result["updated_at"] = max(updated_values)
+    bases = {str(row.get("price_basis")) for row in rows if row.get("price_basis")}
+    if len(bases) == 1:
+        result["price_basis"] = bases.pop()
     if end_label and end_label != label:
         result["endDate"] = end_label
     return result
 
 
-def aggregate_intraday_rows(rows: Iterable[dict], interval_minutes: int) -> list[dict]:
+def aggregate_intraday_rows(
+    rows: Iterable[dict],
+    interval_minutes: int,
+    *,
+    now: datetime | None = None,
+) -> list[dict]:
     groups: dict[tuple[str, int], list[dict]] = {}
     labels: dict[tuple[str, int], str] = {}
     for row in rows:
@@ -119,10 +131,27 @@ def aggregate_intraday_rows(rows: Iterable[dict], interval_minutes: int) -> list
             f"{local_dt.date().isoformat()} "
             f"{bucket_minute // 60:02d}:{bucket_minute % 60:02d}"
         )
-    return [
-        _merge_group(groups[key], labels[key])
-        for key in sorted(groups)
-    ]
+    current = (now or datetime.now(timezone.utc)).astimezone(NEW_YORK)
+    result = []
+    for key in sorted(groups):
+        session_date, bucket = key
+        bar = _merge_group(groups[key], labels[key])
+        bucket_end_minute = min(
+            REGULAR_OPEN_MINUTE + (bucket + 1) * interval_minutes,
+            REGULAR_CLOSE_MINUTE,
+        )
+        bucket_end = datetime.combine(
+            datetime.fromisoformat(session_date).date(),
+            time(bucket_end_minute // 60, bucket_end_minute % 60),
+            tzinfo=NEW_YORK,
+        )
+        # Allow one minute for the final source bar to settle. Historical
+        # buckets remain complete; only the live aggregate is provisional.
+        bar["is_complete"] = bool(bar["is_complete"]) and current >= (
+            bucket_end + timedelta(minutes=1)
+        )
+        result.append(bar)
+    return result
 
 
 def aggregate_daily_rows(rows: list[dict], spec: dict) -> list[dict]:

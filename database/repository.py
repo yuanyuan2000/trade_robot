@@ -411,7 +411,9 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
     with get_connection() as conn:
         latest_rows = conn.execute(
             """
-            SELECT date, open, high, low, close, volume, COALESCE(updated_at, created_at) AS price_updated_at
+            SELECT date, open, high, low, close, volume,
+                   COALESCE(updated_at, created_at) AS price_updated_at,
+                   source_provider, source_timeframe, price_basis, is_complete
             FROM daily_prices
             WHERE symbol = ?
             ORDER BY date DESC
@@ -493,6 +495,11 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
             else None
         ),
         "latest_price_updated_at": latest["price_updated_at"] if latest else None,
+        "latest_price_is_complete": bool(latest["is_complete"]) if latest else None,
+        "latest_price_is_provisional": not bool(latest["is_complete"]) if latest else None,
+        "latest_price_basis": latest["price_basis"] if latest else None,
+        "latest_price_source": latest["source_provider"] if latest else None,
+        "latest_price_timeframe": latest["source_timeframe"] if latest else None,
         "latest_price": latest_price,
         "previous_close": previous_close,
         "daily_change": daily_change,

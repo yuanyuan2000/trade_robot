@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -123,6 +123,26 @@ class CodeStrategy:
 
     def on_event(self, context) -> list[OrderIntent]:
         raise NotImplementedError
+
+    def observation_columns(self) -> list[dict]:
+        """Describe the strategy-owned latest-data observation panel."""
+        return []
+
+    def observe_latest(
+        self,
+        context_factory: Callable[[str], Any],
+        logs: list[dict],
+    ) -> dict | None:
+        """Simulate this strategy with the latest observation data.
+
+        This is deliberately separate from standard indicators: a code
+        strategy is free to construct observations and expose intermediate
+        values in whatever way matches its decision design.
+        """
+        return None
+
+    def observation_target_count(self) -> int:
+        return 1
 
     def describe_run(self, definition: dict) -> str:
         """Return the immutable one-line strategy description stored with a run."""
@@ -317,6 +337,75 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
             f"{self.params['holdings_num']}只，总目标仓位"
             f"{self.params['target_weight']:g}%（目标不变时不重复再平衡）"
         )
+
+    def observation_columns(self) -> list[dict]:
+        momentum = int(self.params["momentum_lookback_sessions"])
+        atr_period = int(self.params["atr_period"])
+        weighting = {
+            "wilder": "Wilder 平滑",
+            "ema": "EMA 加权",
+            "linear": "线性加权",
+            "simple": "简单平均",
+        }.get(self.params["atr_weighting"], str(self.params["atr_weighting"]))
+        filters = []
+        if self.params["enable_percent_drop_filter"]:
+            filters.append(f"单日跌幅达到 {float(self.params['drop_threshold_percent']):g}%")
+        if self.params["enable_atr_drop_filter"]:
+            filters.append(f"单日下跌达到 {float(self.params['drop_threshold_atr']):g} 倍 ATR")
+        filter_text = "、".join(filters) or "未启用急跌过滤"
+        return [
+            {
+                "key": "price_displacement", "label": "N 日价格位移", "format": "price",
+                "help": (
+                    f"当前价格减去此前第 {momentum} 个完整交易日的收盘价，单位与价格相同；"
+                    "正值表示观察窗口内上涨，负值表示下跌。"
+                ),
+            },
+            {
+                "key": "atr", "label": "策略 ATR", "format": "price",
+                "help": (
+                    f"按本策略口径，基于截至上一完整交易日的真实波幅 TR，以 {atr_period} 日"
+                    f"周期和{weighting}计算；不使用当日尚未完成的最高价或最低价。"
+                ),
+            },
+            {
+                "key": "score", "label": "策略 ATR 评分", "format": "number",
+                "help": (
+                    f"本策略评分 = {momentum} 日价格位移 ÷ {atr_period} 日策略 ATR。"
+                    f"策略另检查最近 {int(self.params['drop_lookback_sessions'])} 个交易日："
+                    f"{filter_text}；过滤后按评分排序并取前 {int(self.params['holdings_num'])} 只。"
+                ),
+            },
+        ]
+
+    def observe_latest(
+        self,
+        context_factory: Callable[[str], Any],
+        logs: list[dict],
+    ) -> dict:
+        self._risk_check(context_factory(self.params["risk_check_time"]))
+        self._select(context_factory(self.params["selection_time"]))
+        evaluation = next(
+            item["context"] for item in reversed(logs)
+            if item["event_type"] == "RAPID_DROP_ATR_DAILY_SCORE"
+        )
+        return {
+            "eligible": not bool(evaluation.get("filter_codes")),
+            "reasons": list(evaluation.get("filter_reasons") or []),
+            "score": evaluation.get("score"),
+            "metrics": {
+                "price_displacement": (
+                    float(evaluation["current_price"])
+                    - float(evaluation["base_price"])
+                ),
+                "atr": evaluation.get("atr"),
+                "score": evaluation.get("score"),
+            },
+            "details": evaluation,
+        }
+
+    def observation_target_count(self) -> int:
+        return int(self.params["holdings_num"])
 
     def on_event(self, context) -> list[OrderIntent]:
         trading_date = context.trading_date
@@ -693,6 +782,63 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             f"epsilon={self.params['wtme_epsilon']:g}) 选择最高分标的，"
             f"目标仓位{self.params['target_weight']:g}%（目标不变时不重复再平衡）"
         )
+
+    def observation_columns(self) -> list[dict]:
+        period = int(self.params["wtme_period"])
+        half_life = float(self.params["wtme_half_life"])
+        epsilon = float(self.params["wtme_epsilon"])
+        filter_text = (
+            f"最近 {int(self.params['drop_lookback_sessions'])} 个交易日内，单日跌幅达到 "
+            f"{float(self.params['drop_threshold_percent']):g}% 时过滤"
+            if self.params["enable_percent_drop_filter"]
+            else "当前未启用百分比急跌过滤"
+        )
+        return [
+            {
+                "key": "weighted_return", "label": "策略加权收益 Rw", "format": "number",
+                "help": (
+                    f"按本策略口径取最近 {period} 个收益观测（包含由当前价格构造的最新观测），"
+                    f"以半衰期 {half_life:g} 个交易日的指数衰减权重计算收益率均值。"
+                ),
+            },
+            {
+                "key": "weighted_true_range", "label": "策略加权波幅 Aw", "format": "number",
+                "help": (
+                    f"按本策略当前观测构造方式计算与 Rw 相同的 {period} 个标准化真实波幅，"
+                    f"再使用半衰期 {half_life:g} 的相同权重求均值。"
+                ),
+            },
+            {
+                "key": "score", "label": "策略 WTME 评分", "format": "number",
+                "help": (
+                    f"本策略 WTME = 100 × Rw ÷ (Aw + {epsilon:g})；{filter_text}，"
+                    "过滤后选择评分最高的标的。策略对当前观测的构造可能与行情页标准指标不同。"
+                ),
+            },
+        ]
+
+    def observe_latest(
+        self,
+        context_factory: Callable[[str], Any],
+        logs: list[dict],
+    ) -> dict:
+        self._risk_check(context_factory(self.params["risk_check_time"]))
+        self._select(context_factory(self.params["selection_time"]))
+        evaluation = next(
+            item["context"] for item in reversed(logs)
+            if item["event_type"] == "RAPID_DROP_WTME_DAILY_SCORE"
+        )
+        return {
+            "eligible": not bool(evaluation.get("filter_codes")),
+            "reasons": list(evaluation.get("filter_reasons") or []),
+            "score": evaluation.get("score"),
+            "metrics": {
+                "weighted_return": evaluation.get("weighted_return"),
+                "weighted_true_range": evaluation.get("weighted_true_range"),
+                "score": evaluation.get("score"),
+            },
+            "details": evaluation,
+        }
 
     def on_event(self, context) -> list[OrderIntent]:
         if context.event == self.params["risk_check_time"]:
@@ -1130,6 +1276,88 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
             f"持有前{self.params['holdings_num']}只，无候选时转入"
             f"{self.params['defensive_symbol']}"
         )
+
+    def observation_columns(self) -> list[dict]:
+        lookback = int(self.params["lookback_days"])
+        short = int(self.params["short_lookback_days"])
+        volume_days = int(self.params["volume_lookback_days"])
+        formula_mode = (
+            "一致加权 R²（回归、均值和离差均使用 w² 权重）"
+            if self.params["trend_formula_mode"] == "consistent_w2"
+            else "历史 v1.0.0 兼容口径（回归与 R² 使用不同权重）"
+        )
+        columns = [
+            {
+                "key": "annualized_returns", "label": "策略长期年化趋势",
+                "format": "percent",
+                "help": (
+                    f"按本策略口径取此前 {lookback} 个完整交易日收盘价并加入当前价格，"
+                    f"共 {lookback + 1} 个点；对数价格按越近权重越高的线性回归求斜率，"
+                    "再用 expm1(斜率×250) 折算年化趋势。"
+                ),
+            },
+            {
+                "key": "r_squared", "label": "策略 R²", "format": "number",
+                "help": (
+                    f"使用与长期趋势相同的 {lookback + 1} 个价格点计算拟合优度；"
+                    f"当前采用{formula_mode}。越接近 1 表示价格走势越能被趋势线解释。"
+                ),
+            },
+            {
+                "key": "short_annualized", "label": "策略短动量",
+                "format": "percent",
+                "help": (
+                    f"当前价格相对此前第 {short} 个完整交易日的收盘价计算简单收益，"
+                    f"再按 250/{short} 次方折算年化；低于 "
+                    f"{float(self.params['short_momentum_threshold_percent']):g}% 时命中"
+                    "短期动量过滤（若该过滤已启用）。"
+                ),
+            },
+        ]
+        if self.params["enable_volume_check"]:
+            columns.append({
+                "key": "volume_ratio", "label": "策略量比", "format": "number",
+                "help": (
+                    f"当前数据库最新成交量 ÷ 此前 {volume_days} 个完整交易日平均成交量。"
+                    f"量比大于 {float(self.params['volume_ratio_threshold']):g}，且长期年化趋势"
+                    f"大于 {float(self.params['volume_return_limit_percent']):g}% 时命中放量过热过滤。"
+                ),
+            })
+        columns.append({
+            "key": "score", "label": "策略最终评分", "format": "number",
+            "help": (
+                "本策略最终评分 = 长期年化趋势 × R²。只有通过全部过滤且评分严格位于 "
+                f"({float(self.params['min_score_threshold']):g}, "
+                f"{float(self.params['max_score_threshold']):g}) 之间的标的才参与排名，"
+                f"面板取前 {int(self.params['holdings_num'])} 只作为观察目标。"
+            ),
+        })
+        return columns
+
+    def observe_latest(
+        self,
+        context_factory: Callable[[str], Any],
+        logs: list[dict],
+    ) -> dict:
+        context = context_factory(self.params["sell_time"])
+        symbol = context.universe[0]
+        metrics = self._metrics(context, symbol)
+        return {
+            "eligible": bool(metrics["eligible"]),
+            "reasons": list(metrics.get("filter_reasons") or []),
+            "score": metrics.get("score"),
+            "metrics": {
+                key: metrics.get(key)
+                for key in (
+                    "annualized_returns", "r_squared", "short_annualized",
+                    "volume_ratio", "score",
+                )
+            },
+            "details": dict(metrics),
+        }
+
+    def observation_target_count(self) -> int:
+        return int(self.params["holdings_num"])
 
     def on_event(self, context) -> list[OrderIntent]:
         if (

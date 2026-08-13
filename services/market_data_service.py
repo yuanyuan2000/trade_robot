@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from config import FULL_HISTORY_START_DATE
 from database import repository
@@ -28,6 +29,18 @@ from services.yahoo_finance_client import (
 OVERVIEW_DAILY_REFRESH_LOOKBACK_DAYS = 5
 INTRADAY_REFRESH_LOOKBACK_DAYS = 5
 TWELVEDATA_FREE_BATCH_SYMBOL_LIMIT = 8
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def _daily_bar_is_complete(date_text: str, *, now: datetime | None = None) -> bool:
+    """Return whether a US-equity daily bar is safely past its close delay."""
+    current = (now or datetime.now(timezone.utc)).astimezone(NEW_YORK)
+    bar_date = date.fromisoformat(str(date_text)[:10])
+    if bar_date < current.date():
+        return True
+    if bar_date > current.date():
+        return False
+    return (current.hour, current.minute) >= (16, 20)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -62,6 +75,7 @@ def _fetch_alpaca_daily_prices(symbol: str, start_date: date) -> list[dict]:
         limit=10_000,
         max_pages=2,
     )
+    now = datetime.now(timezone.utc)
     return [
         {
             "date": row["timestamp"][:10],
@@ -72,7 +86,7 @@ def _fetch_alpaca_daily_prices(symbol: str, start_date: date) -> list[dict]:
             "volume": row["volume"],
             "source_provider": "alpaca",
             "source_timeframe": "1Day",
-            "is_complete": True,
+            "is_complete": _daily_bar_is_complete(row["timestamp"][:10], now=now),
         }
         for row in payload["data"]
     ]
@@ -111,6 +125,18 @@ def _fetch_daily_prices_with_fallback(alias: dict, start_date: date) -> tuple[li
             continue
         try:
             rows = fetcher(provider_symbol, start_date=start_date)
+            if "/" not in normalized:
+                rows = [
+                    {
+                        **row,
+                        "is_complete": (
+                            row["is_complete"]
+                            if "is_complete" in row
+                            else _daily_bar_is_complete(str(row["date"]))
+                        ),
+                    }
+                    for row in rows
+                ]
             repository.log_api_request(
                 provider=provider,
                 status="success",

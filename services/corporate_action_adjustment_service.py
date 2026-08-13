@@ -3,7 +3,10 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Iterable
 
-from services.backtest.corporate_actions import ensure_corporate_actions
+from services.backtest.corporate_actions import (
+    ensure_corporate_actions,
+    get_stored_corporate_actions,
+)
 
 
 ADJUSTMENT_MODES = {"raw", "split", "all"}
@@ -154,4 +157,63 @@ def adjusted_daily_payload(
         "actions": [_public_action(action) for action in actions],
         "adjustment": normalized_mode,
         "warning": None,
+    }
+
+
+def stored_adjusted_daily_payload(
+    symbol: str,
+    rows: list[dict],
+    symbol_settings: dict,
+    *,
+    mode: str = "all",
+) -> dict:
+    """Adjust display rows using only company actions already in SQLite.
+
+    The market overview is a read-only database view and must not refresh an
+    external corporate-action cache as a side effect.  Missing cached events
+    simply mean there are no locally known adjustments; the response records
+    that it used the stored-only contract for auditability.
+    """
+    normalized_mode = str(mode or "all").lower()
+    if normalized_mode not in ADJUSTMENT_MODES:
+        raise ValueError("复权模式必须为 raw、split 或 all。")
+    if not rows or normalized_mode == "raw" or symbol_settings.get("asset_class") != "us_equity":
+        return {
+            "rows": [dict(row) for row in rows],
+            "actions": [],
+            "adjustment": "raw",
+            "warning": None,
+            "action_source": "stored_only",
+        }
+
+    bases = {
+        str(row.get("price_basis") or "unknown").lower()
+        for row in rows
+    }
+    if bases != {"raw"}:
+        return {
+            "rows": [dict(row) for row in rows],
+            "actions": [],
+            "adjustment": "raw",
+            "warning": (
+                f"{symbol} 行情价格口径为 {', '.join(sorted(bases))}，"
+                "为避免二次复权，行情总览指标使用原始入库数据。"
+            ),
+            "action_source": "stored_only",
+        }
+
+    start_date = _row_date(rows[0])
+    actions = get_stored_corporate_actions(
+        [symbol],
+        start_date=start_date,
+        end_date=_row_date(rows[-1]),
+        symbol_starts={symbol: start_date},
+    )
+    adjusted = adjust_price_rows(rows, actions, mode=normalized_mode)
+    return {
+        "rows": adjusted,
+        "actions": [_public_action(action) for action in actions],
+        "adjustment": normalized_mode,
+        "warning": None,
+        "action_source": "stored_only",
     }

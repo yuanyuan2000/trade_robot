@@ -11,6 +11,7 @@ from database import repository
 from services.backtest.data import HistoricalDataSet
 from services.indicator_service import (
     attach_overview_indicator_values,
+    build_indicator_series,
     calculate_indicator_values,
     calculate_rapid_drop_filter,
     calculate_wilder_atr,
@@ -233,7 +234,45 @@ class IndicatorCalculationTests(unittest.TestCase):
         )
 
         reading = result["items"][0]["indicator_values"]["8"]
-        self.assertEqual(reading, {"value": 1.0, "date": "2024-01-05"})
+        self.assertEqual(reading["value"], 1.0)
+        self.assertEqual(reading["date"], "2024-01-05")
+        self.assertTrue(reading["is_provisional"])
+        self.assertEqual(reading["price_basis"], "raw")
+        self.assertEqual(reading["indicator_contract_version"], 1)
+
+    def test_chart_series_and_overview_use_the_same_backend_result(self) -> None:
+        rows = sample_rows()
+        rows[-1] = {
+            **rows[-1],
+            "is_complete": 0,
+            "updated_at": "2024-01-05T15:00:00-05:00",
+        }
+        indicators = [
+            {"id": 1, "indicator_type": "MA", "params": {"period": 3}},
+            {"id": 2, "indicator_type": "EMA", "params": {"period": 3}},
+            {"id": 3, "indicator_type": "ATR", "params": {"period": 3}},
+            {"id": 4, "indicator_type": "RATR", "params": {"period": 3}},
+            {"id": 5, "indicator_type": "WTME", "params": {"period": 3, "half_life": 2, "epsilon": 1e-8}},
+        ]
+        overview = attach_overview_indicator_values(
+            {"items": [{"symbol": "SPY"}]},
+            indicators,
+            {"SPY": rows},
+            {"SPY": {"price_basis": "all_adjusted"}},
+        )
+        series = build_indicator_series(
+            rows,
+            indicators,
+            price_basis="all_adjusted",
+        )
+
+        overview_values = overview["items"][0]["indicator_values"]
+        for item in series:
+            with self.subTest(indicator=item["indicator_type"]):
+                self.assertEqual(item["points"][-1]["value"], overview_values[str(item["id"])]["value"])
+                self.assertEqual(item["price_basis"], "all_adjusted")
+                self.assertTrue(item["is_provisional"])
+                self.assertEqual(item["indicator_contract_version"], 1)
 
 
 class IndicatorSeedTests(unittest.TestCase):
@@ -281,6 +320,8 @@ class MarketOverviewIndicatorRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = app_module.app.test_client()
 
+    @patch.object(app_module, "stored_adjusted_daily_payload")
+    @patch.object(app_module.repository, "get_symbol")
     @patch.object(app_module.repository, "get_daily_prices")
     @patch.object(app_module.repository, "list_market_overview")
     @patch.object(app_module.repository, "list_indicators")
@@ -289,6 +330,8 @@ class MarketOverviewIndicatorRouteTests(unittest.TestCase):
         list_indicators,
         list_overview,
         get_daily_prices,
+        get_symbol,
+        stored_adjusted,
     ) -> None:
         list_indicators.return_value = [
             {"id": 1, "name": "ATR3", "indicator_type": "ATR", "params": {"period": 3}, "is_favorite": True},
@@ -302,6 +345,14 @@ class MarketOverviewIndicatorRouteTests(unittest.TestCase):
             "total_pages": 1,
         }
         get_daily_prices.return_value = sample_rows()
+        get_symbol.return_value = {"asset_class": "us_equity"}
+        stored_adjusted.return_value = {
+            "rows": sample_rows(),
+            "actions": [],
+            "adjustment": "all",
+            "warning": None,
+            "action_source": "stored_only",
+        }
 
         response = self.client.get("/api/market-overview?indicator_ids=2,1")
 
@@ -310,6 +361,58 @@ class MarketOverviewIndicatorRouteTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in payload["selected_indicators"]], [2, 1])
         self.assertAlmostEqual(payload["items"][0]["indicator_values"]["2"]["value"], 4.5)
         self.assertAlmostEqual(payload["items"][0]["indicator_values"]["1"]["value"], 8 / 3)
+        self.assertEqual(payload["indicator_standard_price_basis"], "all_adjusted")
+        self.assertEqual(payload["indicator_action_source"], "stored_only")
+        self.assertEqual(payload["items"][0]["indicator_values"]["1"]["price_basis"], "all_adjusted")
+        get_daily_prices.assert_called_once_with("SPY", include_metadata=True)
+        stored_adjusted.assert_called_once_with(
+            "SPY", get_daily_prices.return_value, get_symbol.return_value, mode="all"
+        )
+
+    @patch.object(app_module, "get_chart_bars")
+    @patch.object(app_module.repository, "list_symbol_indicators")
+    def test_detail_indicator_route_returns_server_series_for_selected_basis(
+        self,
+        list_symbol_indicators,
+        get_chart_bars,
+    ) -> None:
+        indicators = [
+            {"id": 7, "name": "WTME3", "indicator_type": "WTME", "params": {"period": 3, "half_life": 2, "epsilon": 1e-8}},
+        ]
+        rows = sample_rows()
+        rows[-1] = {**rows[-1], "is_complete": 0, "updated_at": "2024-01-05T15:00:00-05:00"}
+        list_symbol_indicators.return_value = indicators
+        get_chart_bars.return_value = {
+            "data": rows,
+            "adjustment": "all",
+            "source": "database",
+            "period": "1D",
+            "symbol_settings": {"show_weekend_data": True},
+        }
+
+        response = self.client.get(
+            "/api/symbols/SPY/chart-views/1D/indicators?with_values=1&adjustment=all"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        expected = calculate_wtme(rows, 3, 2, 1e-8)[-1]
+        self.assertEqual(payload["bars"], rows)
+        self.assertAlmostEqual(payload["indicators"][0]["points"][-1]["value"], expected)
+        self.assertEqual(payload["calculation"]["price_basis"], "all_adjusted")
+        self.assertTrue(payload["calculation"]["is_provisional"])
+        get_chart_bars.assert_called_once_with("SPY", "1D", 2000, "all")
+
+    def test_browser_only_aligns_server_calculated_indicator_points(self) -> None:
+        chart_script = (
+            Path(__file__).parents[1] / "static" / "js" / "chart.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("alignIndicatorPoints", chart_script)
+        self.assertNotIn("function calculateWTME", chart_script)
+        self.assertNotIn("function calculateMA", chart_script)
+        self.assertNotIn("function calculateEMA", chart_script)
+        self.assertNotIn("function calculateWilderATR", chart_script)
 
     @patch.object(app_module.repository, "list_market_overview")
     @patch.object(app_module.repository, "list_indicators")

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +15,20 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
             "yahoo_symbol": "GLD",
             "twelvedata_symbol": "GLD",
         }
+
+    def test_daily_bar_completion_uses_new_york_close_delay(self) -> None:
+        before_delay = datetime(2026, 8, 14, 20, 19, tzinfo=timezone.utc)
+        after_delay = datetime(2026, 8, 14, 20, 20, tzinfo=timezone.utc)
+
+        self.assertFalse(
+            service._daily_bar_is_complete("2026-08-14", now=before_delay)
+        )
+        self.assertTrue(
+            service._daily_bar_is_complete("2026-08-14", now=after_delay)
+        )
+        self.assertTrue(
+            service._daily_bar_is_complete("2026-08-13", now=before_delay)
+        )
 
     @patch.object(service.repository, "log_api_request")
     @patch.object(service, "_fetch_alpaca_daily_prices")
@@ -36,7 +50,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
             date(2024, 1, 1),
         )
 
-        self.assertEqual(rows, [{"date": "2024-01-02"}])
+        self.assertEqual(rows, [{"date": "2024-01-02", "is_complete": True}])
         self.assertEqual(provider, "alpaca")
         self.assertEqual(provider_symbol, "GLD")
 

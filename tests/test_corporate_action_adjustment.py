@@ -12,6 +12,7 @@ from services.backtest.data import HistoricalDataSet
 from services.corporate_action_adjustment_service import (
     adjust_price_rows,
     adjusted_daily_payload,
+    stored_adjusted_daily_payload,
 )
 
 
@@ -193,6 +194,40 @@ class CorporateActionAdjustmentTests(unittest.TestCase):
         self.assertEqual(payload["adjustment"], "raw")
         self.assertEqual(payload["rows"][0]["close"], 31.5)
         self.assertIn("避免二次复权", payload["warning"])
+
+    @patch(
+        "services.corporate_action_adjustment_service.ensure_corporate_actions"
+    )
+    @patch(
+        "services.corporate_action_adjustment_service.get_stored_corporate_actions"
+    )
+    def test_overview_adjustment_uses_only_stored_actions(
+        self,
+        get_stored,
+        ensure,
+    ) -> None:
+        rows = [
+            {"date": "2024-01-02", "open": 100, "high": 100, "low": 100, "close": 100, "volume": 10, "price_basis": "raw"},
+            {"date": "2024-01-03", "open": 50, "high": 50, "low": 50, "close": 50, "volume": 20, "price_basis": "raw"},
+        ]
+        get_stored.return_value = [
+            {"symbol": "SPY", "action_type": "forward_split", "effective_date": "2024-01-03", "old_rate": 1, "new_rate": 2, "affects_position": True},
+        ]
+
+        payload = stored_adjusted_daily_payload(
+            "SPY", rows, {"asset_class": "us_equity"}, mode="all"
+        )
+
+        ensure.assert_not_called()
+        get_stored.assert_called_once_with(
+            ["SPY"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            symbol_starts={"SPY": "2024-01-02"},
+        )
+        self.assertEqual(payload["action_source"], "stored_only")
+        self.assertEqual(payload["adjustment"], "all")
+        self.assertAlmostEqual(payload["rows"][0]["close"], 50)
 
 
 if __name__ == "__main__":

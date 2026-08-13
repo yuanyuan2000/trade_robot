@@ -5,6 +5,7 @@ from typing import Iterable
 
 WTME_DEFAULT_HALF_LIFE = 15.0
 WTME_DEFAULT_EPSILON = 1e-8
+INDICATOR_CONTRACT_VERSION = 1
 
 
 def calculate_wilder_atr(
@@ -80,6 +81,9 @@ def calculate_indicator_values(
 def latest_indicator_value(
     rows: list[dict],
     indicator: dict,
+    *,
+    price_basis: str | None = None,
+    as_of: str | None = None,
 ) -> dict:
     params = indicator.get("params") or {}
     period = int(params.get("period"))
@@ -94,24 +98,92 @@ def latest_indicator_value(
     for index in range(len(values) - 1, -1, -1):
         value = values[index]
         if value is not None:
-            return {"value": float(value), "date": rows[index].get("date")}
-    return {"value": None, "date": rows[-1].get("date") if rows else None}
+            row = rows[index]
+            return {
+                "value": float(value),
+                "date": row.get("date"),
+                "as_of": as_of or row.get("updated_at") or row.get("date"),
+                "is_provisional": not bool(row.get("is_complete", True)),
+                "price_basis": price_basis or row.get("price_basis") or "raw",
+                "indicator_contract_version": INDICATOR_CONTRACT_VERSION,
+            }
+    latest = rows[-1] if rows else {}
+    return {
+        "value": None,
+        "date": latest.get("date"),
+        "as_of": as_of or latest.get("updated_at") or latest.get("date"),
+        "is_provisional": not bool(latest.get("is_complete", True)) if rows else False,
+        "price_basis": price_basis or latest.get("price_basis") or "raw",
+        "indicator_contract_version": INDICATOR_CONTRACT_VERSION,
+    }
 
 
 def attach_overview_indicator_values(
     overview: dict,
     indicators: Iterable[dict],
     daily_rows_by_symbol: dict[str, list[dict]],
+    calculation_metadata_by_symbol: dict[str, dict] | None = None,
 ) -> dict:
     selected = list(indicators)
+    calculation_metadata_by_symbol = calculation_metadata_by_symbol or {}
     for item in overview.get("items", []):
         rows = daily_rows_by_symbol.get(item["symbol"], [])
+        metadata = calculation_metadata_by_symbol.get(item["symbol"], {})
         item["indicator_values"] = {
-            str(indicator["id"]): latest_indicator_value(rows, indicator)
+            str(indicator["id"]): latest_indicator_value(
+                rows,
+                indicator,
+                price_basis=metadata.get("price_basis"),
+                as_of=metadata.get("as_of"),
+            )
             for indicator in selected
         }
     overview["selected_indicators"] = selected
     return overview
+
+
+def build_indicator_series(
+    rows: list[dict],
+    indicators: Iterable[dict],
+    *,
+    price_basis: str,
+    as_of: str | None = None,
+) -> list[dict]:
+    """Calculate chart-ready indicator points with the canonical backend.
+
+    Points carry bar keys rather than relying on array position so the browser
+    can safely align them after a concurrent refresh or a weekend filter.
+    """
+    result: list[dict] = []
+    for indicator in indicators:
+        params = indicator.get("params") or {}
+        values = calculate_indicator_values(
+            rows,
+            indicator.get("indicator_type", ""),
+            int(params.get("period")),
+            half_life=params.get("half_life"),
+            epsilon=float(params.get("epsilon", WTME_DEFAULT_EPSILON)),
+            threshold_percent=params.get("threshold_percent"),
+        )
+        points = []
+        for row, value in zip(rows, values):
+            points.append({
+                "date": row.get("date"),
+                "endDate": row.get("endDate"),
+                "value": float(value) if value is not None else None,
+                "is_provisional": not bool(row.get("is_complete", True)),
+                "as_of": row.get("updated_at") or as_of or row.get("date"),
+            })
+        latest = points[-1] if points else {}
+        result.append({
+            **indicator,
+            "points": points,
+            "price_basis": price_basis,
+            "as_of": latest.get("as_of") or as_of,
+            "is_provisional": bool(latest.get("is_provisional", False)),
+            "indicator_contract_version": INDICATOR_CONTRACT_VERSION,
+        })
+    return result
 
 
 def _calculate_ma(rows: list[dict], period: int) -> list[float | None]:

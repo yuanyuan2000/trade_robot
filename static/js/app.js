@@ -61,6 +61,7 @@ let currentSymbolIndicators = [];
 let indicatorCatalog = [];
 let overviewIndicatorIds = ["", "", ""];
 let overviewSelectedIndicators = [];
+let overviewIndicatorPriceBasis = "all_adjusted";
 let currentRawMarketData = [];
 let currentSymbolSettings = { show_weekend_data: true };
 let currentIntradaySync = { status: "not_initialized", row_count: 0 };
@@ -326,6 +327,7 @@ async function loadMarketData(symbol, { includeIntraday = false } = {}) {
     }
     if (getChartPeriod() !== "1D") {
       await loadPeriodMarketData(getChartPeriod(), { silent: true });
+      await loadSymbolIndicators();
     }
   } catch (error) {
     if (requestId !== marketLoadRequestId) return;
@@ -416,6 +418,7 @@ async function fetchAndRenderMarketOverview(options = {}) {
   overviewTotalPages = payload.total_pages;
   marketOverviewItems = payload.items || [];
   overviewSelectedIndicators = payload.selected_indicators || [];
+  overviewIndicatorPriceBasis = payload.indicator_standard_price_basis || "all_adjusted";
   if (currentWorkspaceMode === "market" && !currentSymbol) {
     renderCachedMarketOverview(payload.total_rows);
 
@@ -698,6 +701,10 @@ function renderMarketOverviewTable(items) {
       }
       const reading = item.indicator_values?.[String(indicator.id)] || {};
       const value = reading.value;
+      const basisLabel = reading.price_basis === "all_adjusted" ? "前复权"
+        : reading.price_basis === "split_adjusted" ? "拆股复权"
+          : reading.price_basis === "raw" ? "原始价格" : "价格口径未知";
+      const provisional = Boolean(reading.is_provisional);
       const formula = indicator.indicator_type === "RATR"
         ? `（收盘价 - ${indicator.params.period} 个交易日前收盘价）/ 前一日 Wilder ATR(${indicator.params.period})`
         : indicator.indicator_type === "WTME"
@@ -707,7 +714,10 @@ function renderMarketOverviewTable(items) {
             : indicator.indicator_type === "ATR"
               ? `Wilder ATR(${indicator.params.period})`
               : `${indicator.indicator_type}(${indicator.params.period})`;
-      return `<td class="number-neutral overview-indicator-value" title="${escapeHtml(`${formula}；数据日 ${reading.date || "-"}`)}">${formatOverviewIndicator(value, indicator)}</td>`;
+      const title = `${formula}；${basisLabel}；数据日 ${reading.date || "-"}`
+        + `${reading.as_of ? `；截至 ${reading.as_of}` : ""}`
+        + `${provisional ? "；包含未收线 K 线，数值会变化" : ""}`;
+      return `<td class="number-neutral overview-indicator-value" title="${escapeHtml(title)}"><span>${formatOverviewIndicator(value, indicator)}</span>${provisional ? '<small class="overview-indicator-state">盘中</small>' : ""}</td>`;
     }).join("");
     return `
       <tr class="overview-row" draggable="true" data-symbol="${escapeHtml(item.symbol)}">
@@ -1267,6 +1277,7 @@ async function updateCurrentMarketData() {
     updateDetailActions();
     if (getChartPeriod() !== "1D") {
       await loadPeriodMarketData(getChartPeriod(), { silent: true });
+      await loadSymbolIndicators();
     }
 
     const firstDate = payload.data[0]?.date || "-";
@@ -1618,7 +1629,6 @@ async function saveSymbolSettings() {
   };
   currentSymbolSettings = { ...currentSymbolSettings, ...nextSettings };
   renderCurrentMarketData();
-  await loadSymbolIndicators();
 
   try {
     const response = await fetch(`/api/symbols/${encodeURIComponent(currentSymbol)}/settings`, {
@@ -1633,6 +1643,7 @@ async function saveSymbolSettings() {
     }
     currentSymbolSettings = payload.symbol_settings;
     showWeekendData.checked = Boolean(currentSymbolSettings.show_weekend_data);
+    await loadSymbolIndicators();
     const weekendText = currentSymbolSettings.show_weekend_data ? "显示" : "隐藏";
     setStatus(`已保存 ${currentSymbol} 设置：${weekendText}周末 K 线。`, "success");
   } catch (error) {
@@ -1740,7 +1751,7 @@ function renderOverviewIndicatorHeader(index, indicator) {
   const isActive = Boolean(sortKey) && overviewSort.key === sortKey;
   const direction = isActive ? overviewSort.direction : "";
   const sortTitle = indicator
-    ? `${indicator.name}${isActive ? (direction === "asc" ? " 升序" : " 降序") : ""}`
+    ? `${indicator.name} · ${overviewIndicatorPriceBasis === "all_adjusted" ? "标准指标，前复权" : "标准指标"}${isActive ? (direction === "asc" ? " 升序" : " 降序") : ""}`
     : "请先选择指标";
   return `
     <th class="overview-indicator-column">
@@ -1795,14 +1806,25 @@ async function loadSymbolIndicators() {
   }
 
   currentViewCode = getChartPeriod();
+  const intradayPeriod = /^(?:[1-9]\d{0,2}m|[1-9]\d?h)$/.test(currentViewCode);
+  const params = new URLSearchParams({
+    with_values: "1",
+    adjustment: priceAdjustmentMode.value,
+    limit: intradayPeriod ? "300" : "2000",
+  });
   const response = await fetch(
-    `/api/symbols/${encodeURIComponent(currentSymbol)}/chart-views/${encodeURIComponent(currentViewCode)}/indicators`,
+    `/api/symbols/${encodeURIComponent(currentSymbol)}/chart-views/${encodeURIComponent(currentViewCode)}/indicators?${params}`,
   );
   const payload = await parseJsonResponse(response);
   if (!payload.ok) {
     setStatus(payload.error?.message || "指标配置加载失败。", "warning");
     setChartIndicators([]);
     return;
+  }
+
+  if (Array.isArray(payload.bars)) {
+    currentRawMarketData = payload.bars;
+    renderCurrentMarketData();
   }
 
   currentSymbolIndicators = currentWorkspaceMode === "analysis"
@@ -1844,8 +1866,7 @@ async function addIndicatorToCurrentView(indicatorId) {
     return;
   }
 
-  currentSymbolIndicators = payload.symbol_indicators;
-  setChartIndicators(currentSymbolIndicators);
+  await loadSymbolIndicators();
   setStatus(`已添加指标到 ${currentSymbol} ${getChartPeriodLabel()}。`, "success");
 }
 
@@ -1890,8 +1911,7 @@ async function createAndAddIndicator(event) {
     return;
   }
 
-  currentSymbolIndicators = payload.symbol_indicators;
-  setChartIndicators(currentSymbolIndicators);
+  await loadSymbolIndicators();
   await loadIndicatorCatalog();
   setStatus(`已添加 ${displayName}。`, "success");
 }
@@ -1957,7 +1977,7 @@ async function patchSymbolIndicator(symbolIndicatorId, payload) {
     return;
   }
   currentSymbolIndicators = result.symbol_indicators;
-  setChartIndicators(currentSymbolIndicators);
+  await loadSymbolIndicators();
 }
 
 async function patchIndicator(indicatorId, payload) {
@@ -1983,7 +2003,7 @@ async function removeSymbolIndicator(symbolIndicatorId) {
     return;
   }
   currentSymbolIndicators = result.symbol_indicators;
-  setChartIndicators(currentSymbolIndicators);
+  await loadSymbolIndicators();
 }
 
 function bindNavigation() {

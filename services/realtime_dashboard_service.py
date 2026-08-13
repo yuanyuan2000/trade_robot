@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
 import math
 import threading
 import time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from database import backtest_repository, realtime_repository, repository
 from services.backtest.code_strategies import get_code_strategy
@@ -18,135 +19,9 @@ from services.realtime_panel_script import validate_panel_script
 
 
 _CACHE_SECONDS = 30.0
+_NEW_YORK = ZoneInfo("America/New_York")
 _cache_lock = threading.RLock()
 _cache: dict[int, tuple[float, str, dict]] = {}
-
-
-def _code_columns(code_key: str, params: dict) -> list[dict]:
-    """Build concise column metadata with the task's effective parameters."""
-    if code_key == "sevenstar_etf_rotation":
-        lookback = int(params["lookback_days"])
-        short = int(params["short_lookback_days"])
-        volume_days = int(params["volume_lookback_days"])
-        formula_mode = (
-            "一致加权 R²（回归、均值和离差均使用 w² 权重）"
-            if params["trend_formula_mode"] == "consistent_w2"
-            else "历史 v1.0.0 兼容口径（回归与 R² 使用不同权重）"
-        )
-        return [
-            {
-                "key": "annualized_returns", "label": "长期年化趋势", "format": "percent",
-                "help": (
-                    f"取此前 {lookback} 个完整交易日收盘价并加入当前价格，共 {lookback + 1} 个点；"
-                    "对数价格按越近权重越高的线性回归求斜率，再用 expm1(斜率×250) 折算年化趋势。"
-                ),
-            },
-            {
-                "key": "r_squared", "label": "R²", "format": "number",
-                "help": (
-                    f"使用与长期趋势相同的 {lookback + 1} 个价格点计算拟合优度；当前采用{formula_mode}。"
-                    "越接近 1 表示价格走势越能被这条趋势线解释。"
-                ),
-            },
-            {
-                "key": "short_annualized", "label": "短动量", "format": "percent",
-                "help": (
-                    f"当前价格相对此前第 {short} 个完整交易日的收盘价计算简单收益，"
-                    f"再按 250/{short} 次方折算年化；低于 {float(params['short_momentum_threshold_percent']):g}%"
-                    "时会命中短期动量过滤（若该过滤已启用）。"
-                ),
-            },
-            {
-                "key": "volume_ratio", "label": "量比", "format": "number",
-                "help": (
-                    f"当前数据库最新成交量 ÷ 此前 {volume_days} 个完整交易日平均成交量。"
-                    f"量比大于 {float(params['volume_ratio_threshold']):g}，且长期年化趋势大于 "
-                    f"{float(params['volume_return_limit_percent']):g}% 时命中放量过热过滤。"
-                ),
-                "conditional": "enable_volume_check",
-            },
-            {
-                "key": "score", "label": "最终评分", "format": "number",
-                "help": (
-                    "最终评分 = 长期年化趋势 × R²。只有通过全部过滤且评分严格位于 "
-                    f"({float(params['min_score_threshold']):g}, {float(params['max_score_threshold']):g}) "
-                    f"之间的标的才参与排名，面板取前 {int(params['holdings_num'])} 只作为观察目标。"
-                ),
-            },
-        ]
-    if code_key == "rapid_drop_atr_rotation":
-        momentum = int(params["momentum_lookback_sessions"])
-        atr_period = int(params["atr_period"])
-        weighting = {
-            "wilder": "Wilder 平滑",
-            "ema": "EMA 加权",
-            "linear": "线性加权",
-            "simple": "简单平均",
-        }.get(params["atr_weighting"], str(params["atr_weighting"]))
-        filters = []
-        if params["enable_percent_drop_filter"]:
-            filters.append(f"单日跌幅达到 {float(params['drop_threshold_percent']):g}%")
-        if params["enable_atr_drop_filter"]:
-            filters.append(f"单日下跌达到 {float(params['drop_threshold_atr']):g} 倍 ATR")
-        filter_text = "、".join(filters) or "未启用急跌过滤"
-        return [
-            {
-                "key": "price_displacement", "label": "N 日价格位移", "format": "price",
-                "help": (
-                    f"当前价格减去此前第 {momentum} 个完整交易日的收盘价，单位与价格相同；"
-                    "正值表示观察窗口内上涨，负值表示下跌。"
-                ),
-            },
-            {
-                "key": "atr", "label": "ATR", "format": "price",
-                "help": (
-                    f"基于截至上一完整交易日的真实波幅 TR，按 {atr_period} 日周期和{weighting}计算；"
-                    "不使用当日尚未完成的最高价或最低价。"
-                ),
-            },
-            {
-                "key": "score", "label": "ATR 评分", "format": "number",
-                "help": (
-                    f"ATR 评分 = {momentum} 日价格位移 ÷ {atr_period} 日 ATR。"
-                    f"策略另检查最近 {int(params['drop_lookback_sessions'])} 个交易日：{filter_text}；"
-                    f"过滤后按评分排序并取前 {int(params['holdings_num'])} 只。"
-                ),
-            },
-        ]
-    if code_key == "rapid_drop_wtme_rotation":
-        period = int(params["wtme_period"])
-        half_life = float(params["wtme_half_life"])
-        epsilon = float(params["wtme_epsilon"])
-        filter_text = (
-            f"最近 {int(params['drop_lookback_sessions'])} 个交易日内，单日跌幅达到 "
-            f"{float(params['drop_threshold_percent']):g}% 时过滤"
-            if params["enable_percent_drop_filter"]
-            else "当前未启用百分比急跌过滤"
-        )
-        return [
-            {
-                "key": "weighted_return", "label": "加权收益 Rw", "format": "number",
-                "help": (
-                    f"取最近 {period} 个收益观测（包含当前价格形成的最新观测），"
-                    f"按指数衰减权重计算收益率均值；半衰期为 {half_life:g} 个交易日，越近权重越高。"
-                ),
-            },
-            {
-                "key": "weighted_true_range", "label": "加权波幅 Aw", "format": "number",
-                "help": (
-                    f"对与 Rw 相同的 {period} 个观测计算标准化真实波幅，再使用半衰期 "
-                    f"{half_life:g} 的相同权重求均值；用于衡量取得这些收益所经历的价格波动。"
-                ),
-            },
-            {
-                "key": "score", "label": "WTME 评分", "format": "number",
-                "help": (
-                    f"WTME = 100 × Rw ÷ (Aw + {epsilon:g})。方向收益越高且路径波动越小，评分越高；"
-                    f"{filter_text}，过滤后选择评分最高的标的。"
-                ),
-            },
-        ]
-    return []
 
 
 def _finite(value: Any) -> float | bool | str | None:
@@ -185,7 +60,7 @@ def _cache_signature(
 
 
 def _dataset_for_overview(overview: dict) -> tuple[HistoricalDataSet, dict, str]:
-    current_date = date.today().isoformat()
+    current_date = datetime.now(timezone.utc).astimezone(_NEW_YORK).date().isoformat()
     daily: dict[str, list[dict]] = {}
     event_prices: dict[str, EventPrice] = {}
     cumulative: dict[str, dict[str, float]] = {}
@@ -218,14 +93,17 @@ def _dataset_for_overview(overview: dict) -> tuple[HistoricalDataSet, dict, str]
         )
         volume = float(latest_row.get("volume") or 0)
         cumulative[symbol] = {
-            f"{current_date}|14:00": volume,
+            f"{current_date}|LATEST": volume,
         }
         symbols.append(symbol)
     actions = []
     if symbols:
         actions = backtest_repository.get_corporate_actions(
             symbols,
-            start_date=(date.today() - timedelta(days=550)).isoformat(),
+            start_date=(
+                datetime.now(timezone.utc).astimezone(_NEW_YORK).date()
+                - timedelta(days=550)
+            ).isoformat(),
             end_date=current_date,
         )
     dataset = HistoricalDataSet(
@@ -249,6 +127,13 @@ def _context(
 ) -> CodeEventContext:
     price = event_prices[symbol].signal_price
     portfolio = Portfolio(100_000)
+    latest_volume = dataset.cumulative_volumes.get(symbol, {}).get(
+        f"{trading_date}|LATEST"
+    )
+    if latest_volume is not None:
+        dataset.cumulative_volumes.setdefault(symbol, {}).setdefault(
+            f"{trading_date}|{event}", latest_volume
+        )
 
     def capture(level, event_type, message, **kwargs):
         logs.append({
@@ -283,84 +168,26 @@ def _code_row(
     strategy_type = get_code_strategy(code_key)
     instance = strategy_type(strategy["definition"].get("params", {}))
     logs: list[dict] = []
-    if code_key == "sevenstar_etf_rotation":
-        event = instance.params["sell_time"]
-        dataset.cumulative_volumes.setdefault(symbol, {})[
-            f"{trading_date}|{event}"
-        ] = dataset.cumulative_volumes.get(symbol, {}).get(
-            f"{trading_date}|14:00", 0.0
+
+    def context_factory(event: str) -> CodeEventContext:
+        return _context(
+            dataset, event_prices, trading_date, symbol, event, logs
         )
-        context = _context(dataset, event_prices, trading_date, symbol, event, logs)
-        metrics = instance._metrics(context, symbol)
-        details = dict(metrics)
-        return {
-            "eligible": bool(metrics["eligible"]),
-            "reasons": list(metrics.get("filter_reasons") or []),
-            "score": _finite(metrics.get("score")),
-            "metrics": {
-                key: _finite(metrics.get(key))
-                for key in (
-                    "annualized_returns", "r_squared", "short_annualized",
-                    "volume_ratio", "score",
-                )
-            },
-            "details": details,
-        }
-    if code_key == "rapid_drop_atr_rotation":
-        risk = _context(
-            dataset, event_prices, trading_date, symbol,
-            instance.params["risk_check_time"], logs,
-        )
-        instance._risk_check(risk)
-        selection = _context(
-            dataset, event_prices, trading_date, symbol,
-            instance.params["selection_time"], logs,
-        )
-        instance._select(selection)
-        evaluation = next(
-            item["context"] for item in reversed(logs)
-            if item["event_type"] == "RAPID_DROP_ATR_DAILY_SCORE"
-        )
-        return {
-            "eligible": not bool(evaluation.get("filter_codes")),
-            "reasons": list(evaluation.get("filter_reasons") or []),
-            "score": _finite(evaluation.get("score")),
-            "metrics": {
-                "price_displacement": _finite(
-                    float(evaluation["current_price"]) - float(evaluation["base_price"])
-                ),
-                "atr": _finite(evaluation.get("atr")),
-                "score": _finite(evaluation.get("score")),
-            },
-            "details": evaluation,
-        }
-    if code_key == "rapid_drop_wtme_rotation":
-        risk = _context(
-            dataset, event_prices, trading_date, symbol,
-            instance.params["risk_check_time"], logs,
-        )
-        instance._risk_check(risk)
-        selection = _context(
-            dataset, event_prices, trading_date, symbol,
-            instance.params["selection_time"], logs,
-        )
-        instance._select(selection)
-        evaluation = next(
-            item["context"] for item in reversed(logs)
-            if item["event_type"] == "RAPID_DROP_WTME_DAILY_SCORE"
-        )
-        return {
-            "eligible": not bool(evaluation.get("filter_codes")),
-            "reasons": list(evaluation.get("filter_reasons") or []),
-            "score": _finite(evaluation.get("score")),
-            "metrics": {
-                "weighted_return": _finite(evaluation.get("weighted_return")),
-                "weighted_true_range": _finite(evaluation.get("weighted_true_range")),
-                "score": _finite(evaluation.get("score")),
-            },
-            "details": evaluation,
-        }
-    raise ValueError(f"代码策略 {code_key} 尚未定义实时面板。")
+
+    result = instance.observe_latest(context_factory, logs)
+    if result is None:
+        raise ValueError(f"代码策略 {code_key} 未提供最新行情观察。")
+    return {
+        **result,
+        "eligible": bool(result.get("eligible")),
+        "reasons": list(result.get("reasons") or []),
+        "score": _finite(result.get("score")),
+        "metrics": {
+            key: _finite(value)
+            for key, value in dict(result.get("metrics") or {}).items()
+        },
+        "details": dict(result.get("details") or {}),
+    }
 
 
 def _visual_columns(task: dict) -> tuple[list[dict], dict]:
@@ -503,13 +330,11 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
         str(item["symbol"]).upper()
         for item in strategy["definition"].get("symbols", [])
     }
+    code_observer = None
     if strategy["design_mode"] == "code":
         params = strategy["definition"].get("params", {})
-        columns = [
-            dict(column)
-            for column in _code_columns(strategy["code_key"], params)
-            if not column.get("conditional") or params.get(column["conditional"])
-        ]
+        code_observer = get_code_strategy(strategy["code_key"])(params)
+        columns = [dict(column) for column in code_observer.observation_columns()]
         default_sort = {"key": "score", "direction": "desc"}
     else:
         columns, default_sort = _visual_columns(task)
@@ -525,6 +350,10 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
             "name": item.get("name"),
             "latest_price": _finite(item.get("latest_price")),
             "price_updated_at": item.get("latest_price_updated_at"),
+            "price_is_provisional": item.get("latest_price_is_provisional"),
+            "price_source": item.get("latest_price_source"),
+            "price_timeframe": item.get("latest_price_timeframe"),
+            "price_basis": item.get("latest_price_basis"),
             "data_date": item.get("latest_date"),
             "is_candidate": symbol in candidates,
             "eligible": False,
@@ -565,10 +394,8 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
         row["rank"] = index
     target_count = 0
     if strategy["selection_mode"] == "competition":
-        if strategy["design_mode"] == "code" and strategy["code_key"] in {
-            "sevenstar_etf_rotation", "rapid_drop_atr_rotation",
-        }:
-            target_count = int(strategy["definition"].get("params", {}).get("holdings_num", 1))
+        if code_observer is not None:
+            target_count = max(0, int(code_observer.observation_target_count()))
         else:
             target_count = 1
     for row in ranked[:target_count]:
@@ -578,6 +405,12 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
         "task_id": int(task_id),
         "source": "market_overview_database",
         "external_api_called": False,
+        "observation_mode": "strategy_latest_simulation",
+        "formal_decision": False,
+        "observation_note": (
+            "按任务策略定义使用内部数据库最新行情模拟当前时点；"
+            "不是正式决策，可能与行情页标准指标不同。"
+        ),
         "calculated_at": repository.utc_now_iso(),
         "strategy_name": strategy.get("name"),
         "design_mode": strategy["design_mode"],

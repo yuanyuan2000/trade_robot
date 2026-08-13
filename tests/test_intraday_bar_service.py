@@ -44,6 +44,23 @@ class IntradayBarServiceTests(unittest.TestCase):
         self.assertEqual(bars[1]["date"], "2024-01-02 13:30")
         self.assertEqual(bars[1]["open"], 120)
 
+    def test_live_intraday_bucket_is_marked_provisional_until_settled(self) -> None:
+        rows = [minute_row("2026-08-14T13:30:00Z", 100)]  # 09:30 EDT
+
+        live = service.aggregate_intraday_rows(
+            rows,
+            15,
+            now=datetime(2026, 8, 14, 13, 40, tzinfo=timezone.utc),
+        )
+        settled = service.aggregate_intraday_rows(
+            rows,
+            15,
+            now=datetime(2026, 8, 14, 13, 46, tzinfo=timezone.utc),
+        )
+
+        self.assertFalse(live[0]["is_complete"])
+        self.assertTrue(settled[0]["is_complete"])
+
     @patch.object(service.repository, "upsert_daily_prices")
     @patch.object(service.intraday_repository, "iter_minute_bars")
     def test_daily_prices_are_derived_from_regular_session_only(

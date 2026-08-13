@@ -374,6 +374,35 @@ def ensure_corporate_actions(
     return _actions_for_symbols(stored, normalized, required_starts)
 
 
+def get_stored_corporate_actions(
+    symbols: list[str],
+    *,
+    start_date: str,
+    end_date: str,
+    symbol_starts: dict[str, str] | None = None,
+) -> list[dict]:
+    """Return already-cached actions without refreshing the external provider.
+
+    Read-only display paths use this helper so rendering an overview never
+    turns into an external API call.  Identity/leg filtering deliberately
+    matches ``ensure_corporate_actions``; the only difference is that cache
+    coverage is not refreshed here.
+    """
+    normalized = list(dict.fromkeys(str(symbol).upper() for symbol in symbols))
+    if not normalized:
+        return []
+    required_starts = {
+        symbol: max(start_date, (symbol_starts or {}).get(symbol, start_date))
+        for symbol in normalized
+    }
+    stored = backtest_repository.get_corporate_actions(
+        normalized,
+        start_date=min(required_starts.values()),
+        end_date=end_date,
+    )
+    return _actions_for_symbols(stored, normalized, required_starts)
+
+
 def validate_supported_actions(actions: list[dict]) -> None:
     unsupported = [
         {
