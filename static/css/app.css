@@ -326,8 +326,10 @@ textarea {
 .realtime-sort-button span { margin-left: 3px; font-size: 10px; }
 .realtime-metric-help { display: inline-grid; width: 15px; height: 15px; margin-left: 5px; place-items: center; border: 1px solid var(--border); border-radius: 50%; color: var(--muted); font-size: 10px; cursor: help; }
 .realtime-symbol-cell { display: flex; align-items: center; gap: 9px; min-width: 112px; }
-.realtime-symbol-cell strong, .realtime-symbol-cell small { display: block; }
-.realtime-symbol-cell small { max-width: 150px; margin-top: 2px; color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; }
+.realtime-symbol-link { height: auto; min-height: auto; border: 0; background: transparent; color: inherit; padding: 0; text-align: left; }
+.realtime-symbol-link:hover { background: transparent; color: var(--accent); }
+.realtime-symbol-link strong, .realtime-symbol-link small { display: block; }
+.realtime-symbol-link small { max-width: 150px; margin-top: 2px; color: var(--muted); font-size: 10px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; }
 .realtime-status-pill { display: inline-block; border-radius: 999px; padding: 3px 8px; font-weight: 600; white-space: nowrap; }
 .realtime-status-ok { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success); }
 .realtime-status-filter { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--warning); }
@@ -337,8 +339,14 @@ textarea {
 .realtime-target-badge { display: block; width: max-content; margin-top: 4px; border-radius: 5px; padding: 2px 5px; background: var(--panel-active); color: var(--accent); font-size: 9px; font-weight: 700; }
 .realtime-updated-at { display: block; max-width: 126px; color: var(--muted); white-space: normal; }
 .realtime-dashboard-table th:last-child, .realtime-details-cell { width: 74px; min-width: 74px; }
-.realtime-row-details summary { color: var(--accent); cursor: pointer; white-space: nowrap; }
-.realtime-row-details pre { box-sizing: border-box; width: max(420px, 65vw); max-width: none; max-height: none; overflow: visible; margin: 8px 0 0; border-radius: 7px; padding: 9px 10px; background: var(--surface-muted); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+.realtime-details-button { height: auto; min-height: auto; border: 0; background: transparent; color: var(--accent); padding: 0; font-size: inherit; white-space: nowrap; }
+.realtime-details-button:hover { background: transparent; color: var(--accent-strong); }
+.realtime-details-dialog { width: fit-content; min-width: min(420px, calc(100vw - 32px)); max-width: min(960px, calc(100vw - 32px)); max-height: calc(100vh - 32px); border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); box-shadow: var(--shadow); padding: 0; }
+.realtime-details-dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+.realtime-details-dialog-body { display: grid; gap: 12px; padding: 18px; }
+.realtime-details-dialog .backtest-dialog-header { margin: 0; }
+.realtime-details-dialog .backtest-dialog-header button { min-height: auto; border: 0; background: transparent; padding: 2px 6px; font-size: 20px; }
+.realtime-details-dialog pre { box-sizing: border-box; min-width: 0; max-width: 100%; max-height: calc(100vh - 130px); overflow: auto; margin: 0; border-radius: 7px; padding: 11px 12px; background: var(--surface-muted); color: var(--muted); font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .realtime-follow-field { display: flex; align-items: flex-start; gap: 8px; margin: 12px 0; color: var(--muted); font-size: 13px; }
 .realtime-follow-field input { margin-top: 2px; }
 .realtime-json-summary { max-height: 300px; overflow: auto; margin: 12px 0; border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--surface-muted); font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
@@ -1259,14 +1267,6 @@ button:disabled {
 .overview-table .overview-indicator-column,
 .overview-table .overview-indicator-value {
   min-width: 0;
-}
-
-.overview-indicator-state {
-  display: inline-block;
-  margin-left: 4px;
-  color: var(--warning);
-  font-size: 9px;
-  font-weight: 600;
 }
 
 .overview-table .overview-actions-column,
@@ -2205,6 +2205,34 @@ td {
   gap: 7px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.backtest-competition-formulas {
+  margin-bottom: 12px;
+}
+
+.backtest-competition-fields {
+  align-items: end;
+  gap: 12px 10px;
+}
+
+.backtest-competition-fields .backtest-check-field {
+  min-height: 34px;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-muted);
+  padding: 8px 10px;
+  line-height: 1.35;
+}
+
+.backtest-competition-fields .backtest-check-field input[type="checkbox"] {
+  width: 13px;
+  min-width: 13px;
+  height: 13px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
 }
 
 .backtest-code-param {

@@ -83,6 +83,7 @@ let analysisOverviewLoadInFlight;
 let lastAnalysisRefreshState = {};
 let analysisIndicatorLegendVisible = false;
 let overviewLoadInFlight;
+let marketDetailReturnContext = null;
 const overviewIndicatorStorageKey = "trade-overview-indicator-columns";
 
 function applyOverviewAutoRefreshState(enabled) {
@@ -717,7 +718,7 @@ function renderMarketOverviewTable(items) {
       const title = `${formula}；${basisLabel}；数据日 ${reading.date || "-"}`
         + `${reading.as_of ? `；截至 ${reading.as_of}` : ""}`
         + `${provisional ? "；包含未收线 K 线，数值会变化" : ""}`;
-      return `<td class="number-neutral overview-indicator-value" title="${escapeHtml(title)}"><span>${formatOverviewIndicator(value, indicator)}</span>${provisional ? '<small class="overview-indicator-state">盘中</small>' : ""}</td>`;
+      return `<td class="number-neutral overview-indicator-value" title="${escapeHtml(title)}"><span>${formatOverviewIndicator(value, indicator)}</span></td>`;
     }).join("");
     return `
       <tr class="overview-row" draggable="true" data-symbol="${escapeHtml(item.symbol)}">
@@ -2009,6 +2010,9 @@ async function removeSymbolIndicator(symbolIndicatorId) {
 function bindNavigation() {
   document.querySelectorAll(".nav-item").forEach((button) => {
     button.addEventListener("click", () => {
+      marketDetailReturnContext = null;
+      backToOverview.title = "返回总览";
+      backToOverview.setAttribute("aria-label", "返回总览");
       document.querySelectorAll(".nav-item").forEach((item) => item.classList.remove("active"));
       document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
       button.classList.add("active");
@@ -2034,6 +2038,26 @@ function bindNavigation() {
     });
   });
 }
+
+function activatePrimaryView(viewId, mode = "market") {
+  document.querySelectorAll(".nav-item").forEach((item) => item.classList.remove("active"));
+  document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
+  const navItem = [...document.querySelectorAll(`.nav-item[data-view="${viewId}"]`)]
+    .find((item) => (item.dataset.mode || "market") === mode);
+  if (navItem) navItem.classList.add("active");
+  document.getElementById(viewId)?.classList.add("active");
+}
+
+document.addEventListener("open-market-detail", (event) => {
+  const symbol = String(event.detail?.symbol || "").trim().toUpperCase();
+  if (!symbol) return;
+  marketDetailReturnContext = event.detail?.returnContext || null;
+  activatePrimaryView("market-view", "market");
+  applyWorkspaceMode("market");
+  backToOverview.title = marketDetailReturnContext === "realtime-dashboard" ? "返回数据观察面板" : "返回总览";
+  backToOverview.setAttribute("aria-label", backToOverview.title);
+  loadMarketData(symbol);
+});
 
 function startHeartbeat() {
   const beat = () => {
@@ -2082,6 +2106,15 @@ backToOverview.addEventListener("click", () => {
   renderCandles([]);
   setChartIndicators([]);
   clearTrendlineAnalysis();
+  if (marketDetailReturnContext === "realtime-dashboard") {
+    marketDetailReturnContext = null;
+    backToOverview.title = "返回总览";
+    backToOverview.setAttribute("aria-label", "返回总览");
+    showMarketOverview();
+    activatePrimaryView("realtime-view", "market");
+    document.dispatchEvent(new CustomEvent("return-to-realtime-dashboard"));
+    return;
+  }
   if (currentWorkspaceMode === "analysis") {
     loadAnalysisOverview();
   } else {

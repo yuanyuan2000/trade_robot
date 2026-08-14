@@ -289,13 +289,13 @@ function renderRealtimeDashboardTable() {
   document.getElementById("realtime-dashboard-table").innerHTML = `<table class="realtime-dashboard-table">
     <thead><tr>${headers.map(([key, label, help]) => `<th>${rtSortHeader(key, label, help)}</th>`).join("")}<th>明细</th></tr></thead>
     <tbody>${rows.length ? rows.map((row) => `<tr>
-      <td><span class="realtime-symbol-cell">${row.is_candidate ? '<i class="realtime-candidate-dot" title="属于当前任务候选池" aria-label="属于当前任务候选池"></i>' : '<i class="realtime-candidate-dot is-empty" aria-hidden="true"></i>'}<span><strong>${rtEscape(row.display_symbol || row.symbol)}</strong>${row.name && row.name !== row.display_symbol ? `<small>${rtEscape(row.name)}</small>` : ""}</span></span></td>
+      <td><span class="realtime-symbol-cell">${row.is_candidate ? '<i class="realtime-candidate-dot" title="属于当前任务候选池" aria-label="属于当前任务候选池"></i>' : '<i class="realtime-candidate-dot is-empty" aria-hidden="true"></i>'}<button class="realtime-symbol-link" type="button" data-rt-open-symbol="${rtEscape(row.symbol)}" title="查看 ${rtEscape(row.display_symbol || row.symbol)} K线详情"><strong>${rtEscape(row.display_symbol || row.symbol)}</strong>${row.name && row.name !== row.display_symbol ? `<small>${rtEscape(row.name)}</small>` : ""}</button></span></td>
       <td><span class="realtime-status-pill realtime-status-${row.status === "通过" ? "ok" : row.status === "不可计算" ? "na" : row.status === "观察" ? "watch" : "filter"}">${rtEscape(row.status)}</span>${row.reason && row.reason !== "—" ? `<small class="realtime-reason">${rtEscape(row.reason)}</small>` : ""}</td>
       <td>${rtFormatMetric(row.latest_price, "price")}</td>
       ${columns.map((column) => `<td>${rtFormatMetric(row.metrics?.[column.key], column.format)}</td>`).join("")}
       <td>${row.rank ? `<strong>#${row.rank}</strong>${row.selected_for_target ? '<span class="realtime-target-badge">面板目标</span>' : ""}` : "—"}</td>
       <td><span class="realtime-updated-at">${rtEscape(rtDate(row.price_updated_at || row.data_date))}</span></td>
-      <td class="realtime-details-cell"><details class="realtime-row-details"><summary>查看</summary><pre>${rtEscape(JSON.stringify(row.details || {}, null, 2))}</pre></details></td>
+      <td class="realtime-details-cell"><button class="realtime-details-button" type="button" data-rt-details-symbol="${rtEscape(row.display_symbol || row.symbol)}" data-rt-details="${rtEscape(JSON.stringify(row.details || {}, null, 2))}">查看</button></td>
     </tr>`).join("") : `<tr><td colspan="${headers.length + 1}" class="realtime-empty">没有符合筛选条件的标的。</td></tr>`}</tbody>
   </table>`;
 }
@@ -442,14 +442,32 @@ function initRealtime() {
   document.getElementById("realtime-create-form").addEventListener("submit", createRealtimeTask);
   document.getElementById("realtime-channel-form").addEventListener("submit", createRealtimeChannel);
   document.querySelectorAll("[data-realtime-tab]").forEach((button) => button.addEventListener("click", () => selectRealtimePanel(button.dataset.realtimeTab)));
+  document.addEventListener("return-to-realtime-dashboard", () => {
+    if (rt.current) selectRealtimePanel("dashboard");
+  });
   ["realtime-dashboard-search", "realtime-dashboard-status-filter", "realtime-dashboard-candidate-only"].forEach((id) => document.getElementById(id).addEventListener("input", renderRealtimeDashboardTable));
   document.getElementById("realtime-dashboard-table").addEventListener("click", (event) => {
+    const symbolButton = event.target.closest("[data-rt-open-symbol]");
+    if (symbolButton) {
+      document.dispatchEvent(new CustomEvent("open-market-detail", {
+        detail: { symbol: symbolButton.dataset.rtOpenSymbol, returnContext: "realtime-dashboard" },
+      }));
+      return;
+    }
+    const detailsButton = event.target.closest("[data-rt-details]");
+    if (detailsButton) {
+      document.getElementById("realtime-details-title").textContent = `${detailsButton.dataset.rtDetailsSymbol} 明细`;
+      document.getElementById("realtime-details-content").textContent = detailsButton.dataset.rtDetails;
+      document.getElementById("realtime-details-dialog").showModal();
+      return;
+    }
     const button = event.target.closest("[data-rt-sort]"); if (!button) return;
     const key = button.dataset.rtSort;
     rt.sort = rt.sort?.key === key ? { key, direction: rt.sort.direction === "asc" ? "desc" : "asc" } : { key, direction: ["symbol", "status", "price_updated_at"].includes(key) ? "asc" : "desc" };
     renderRealtimeDashboardTable();
   });
   document.getElementById("realtime-dashboard-refresh").addEventListener("click", () => loadRealtimeDashboard(true));
+  document.getElementById("realtime-details-close").addEventListener("click", () => document.getElementById("realtime-details-dialog").close());
   document.getElementById("realtime-overview-auto-toggle").addEventListener("change", async (event) => {
     try {
       const payload = await rtJson(await fetch("/api/market-overview/auto-refresh", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: event.target.checked }) }));

@@ -125,10 +125,8 @@ def main() -> int:
 
     payload = snapshot(args.limit)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    with args.output.open("w", encoding="utf-8", newline="\n") as output_file:
+        output_file.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     line_count = sum(
         len(item["trends"])
         for item in payload["symbols"]

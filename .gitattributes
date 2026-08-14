@@ -1,0 +1,16 @@
+# Keep repository text files consistent on Windows, macOS, and Linux.
+* text=auto eol=lf
+
+# Native Windows command scripts are the only text files that require CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Never apply text conversion to common binary artifacts.
+*.db binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.xls binary
+*.xlsx binary
