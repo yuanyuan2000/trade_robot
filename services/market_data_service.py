@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -8,7 +8,7 @@ from config import FULL_HISTORY_START_DATE
 from database import repository
 from services.api_errors import MarketDataError
 from services.corporate_action_adjustment_service import adjusted_daily_payload
-from services.alpaca_data_client import fetch_stock_bars
+from services.alpaca_data_client import fetch_stock_bars, fetch_stock_snapshots
 from services.intraday_bar_service import (
     derive_daily_prices_from_minutes,
     refresh_alpaca_capability,
@@ -586,6 +586,7 @@ def _sync_overview_daily_from_alpaca(
     results: dict[str, dict],
 ) -> list[dict]:
     pending = []
+    live_symbol_map: dict[str, str] = {}
     for alias in aliases:
         normalized = alias["common_symbol"]
         try:
@@ -593,6 +594,8 @@ def _sync_overview_daily_from_alpaca(
             if not capability.get("alpaca_supported"):
                 pending.append(alias)
                 continue
+            alpaca_symbol = capability.get("alpaca_symbol") or normalized
+            live_symbol_map[alpaca_symbol] = normalized
             sync_state = intraday_repository.get_sync_state(normalized)
             intraday_ready = _has_initialized_intraday_history(normalized, sync_state)
             if intraday_ready:
@@ -612,7 +615,7 @@ def _sync_overview_daily_from_alpaca(
                 sync_status = import_result["sync_state"]["status"]
             else:
                 rows = _fetch_alpaca_daily_prices(
-                    capability.get("alpaca_symbol") or normalized,
+                    alpaca_symbol,
                     start_date,
                 )
                 repository.upsert_symbol(normalized)
@@ -642,7 +645,90 @@ def _sync_overview_daily_from_alpaca(
                 message=exc.detail or exc.message,
             )
             pending.append(alias)
+    _merge_live_iex_daily_snapshots(live_symbol_map, results)
     return pending
+
+
+def _live_iex_snapshot_window(*, now: datetime | None = None) -> bool:
+    current = (now or datetime.now(timezone.utc)).astimezone(NEW_YORK)
+    return (
+        current.weekday() < 5
+        and time(9, 30) <= current.time() < time(16, 20)
+    )
+
+
+def _merge_live_iex_daily_snapshots(
+    provider_to_symbol: dict[str, str],
+    results: dict[str, dict],
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Overlay today's live IEX daily bars on delayed historical SIP rows."""
+    if not provider_to_symbol or not _live_iex_snapshot_window(now=now):
+        return 0
+    current = (now or datetime.now(timezone.utc)).astimezone(NEW_YORK)
+    today = current.date().isoformat()
+    try:
+        snapshots = fetch_stock_snapshots(
+            list(provider_to_symbol),
+            feed="iex",
+        )
+    except MarketDataError as exc:
+        repository.log_api_request(
+            provider="alpaca_iex_snapshot",
+            status="error",
+            symbol=None,
+            error_code=exc.code,
+            message=exc.detail or exc.message,
+        )
+        return 0
+
+    updated = 0
+    for provider_symbol, snapshot in snapshots.items():
+        normalized = provider_to_symbol.get(provider_symbol)
+        bar = snapshot.get("daily_bar") if normalized else None
+        if not normalized or not bar:
+            continue
+        try:
+            bar_date = datetime.fromisoformat(
+                str(bar["timestamp"]).replace("Z", "+00:00")
+            ).astimezone(NEW_YORK).date().isoformat()
+        except (KeyError, ValueError):
+            continue
+        # Before the first regular-session trade Alpaca may still expose the
+        # previous session as dailyBar. Never relabel it as today's candle.
+        if bar_date != today:
+            continue
+        written = repository.upsert_daily_prices(
+            normalized,
+            [{
+                "date": today,
+                "open": bar["open"],
+                "high": bar["high"],
+                "low": bar["low"],
+                "close": bar["close"],
+                "volume": bar.get("volume", 0),
+                "is_complete": False,
+            }],
+            source_provider="alpaca",
+            source_timeframe="snapshot_iex_1Day",
+        )
+        updated += written
+        item = results.get(normalized)
+        if item is not None:
+            item.update({
+                "source": "alpaca-iex",
+                "status": "success",
+                "updated_rows": int(item.get("updated_rows") or 0) + written,
+                "error": None,
+            })
+        repository.log_api_request(
+            provider="alpaca_iex_snapshot",
+            status="success",
+            symbol=normalized,
+            message=f"Stored live IEX provisional daily bar for {today}.",
+        )
+    return updated
 
 
 def _sync_overview_daily_from_twelve_data(

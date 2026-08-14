@@ -21,6 +21,35 @@ def response(payload: dict, remaining: int) -> Mock:
 
 class AlpacaDataClientTests(unittest.TestCase):
     @patch.object(alpaca, "_request_bars_page")
+    @patch.object(alpaca, "ALPACA_SECRET", "test-secret")
+    @patch.object(alpaca, "ALPACA_API_KEY", "test-key")
+    def test_stock_snapshots_parse_direct_symbol_map(self, request_page) -> None:
+        request_page.return_value = ({
+            "GLD": {
+                "dailyBar": {
+                    "t": "2026-08-14T04:00:00Z",
+                    "o": 220, "h": 222, "l": 219, "c": 221,
+                    "v": 1234, "n": 42, "vw": 220.5,
+                },
+                "prevDailyBar": {
+                    "t": "2026-08-13T04:00:00Z",
+                    "o": 218, "h": 221, "l": 217, "c": 220,
+                    "v": 4321,
+                },
+            }
+        }, {"remaining": 199})
+
+        result = alpaca.fetch_stock_snapshots(["gld"], feed="iex")
+
+        self.assertEqual(result["GLD"]["daily_bar"]["close"], 221.0)
+        self.assertEqual(result["GLD"]["previous_daily_bar"]["close"], 220.0)
+        self.assertEqual(result["GLD"]["feed"], "iex")
+        self.assertEqual(
+            request_page.call_args.kwargs["url"],
+            f"{alpaca.ALPACA_DATA_BASE_URL}/stocks/snapshots",
+        )
+
+    @patch.object(alpaca, "_request_bars_page")
     def test_crypto_bars_use_v1beta3_endpoint_and_preserve_fractional_volume(
         self,
         request_page,

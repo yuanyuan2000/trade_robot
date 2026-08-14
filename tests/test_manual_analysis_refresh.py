@@ -20,7 +20,10 @@ class ManualAnalysisRefreshTests(unittest.TestCase):
 
     def test_overview_has_manual_refresh_button(self) -> None:
         html = app_module.app.test_client().get("/").get_data(as_text=True)
-        self.assertIn('id="analysis-refresh-all"', html)
+        self.assertEqual(html.count('id="overview-refresh-all"'), 1)
+        self.assertIn('title="刷新全部标的日线数据"', html)
+        self.assertNotIn('id="market-refresh-all"', html)
+        self.assertNotIn('id="analysis-refresh-all"', html)
         self.assertNotIn('id="backtest-create-mode"', html)
         self.assertNotIn('id="backtest-create-code"', html)
 

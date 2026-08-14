@@ -531,3 +531,78 @@ def fetch_latest_stock_bars(
         except (KeyError, TypeError, ValueError) as exc:
             raise DataParseError(detail=f"Invalid Alpaca latest bar: {exc}") from exc
     return result
+
+
+def fetch_stock_snapshots(
+    symbols: list[str] | tuple[str, ...],
+    *,
+    feed: str = "iex",
+) -> dict[str, dict]:
+    """Fetch live minute/daily snapshots for several US symbols at once."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET:
+        raise MissingAlpacaCredentialsError()
+    normalized_symbols = sorted({
+        str(symbol).strip().upper()
+        for symbol in symbols
+        if str(symbol).strip()
+    })
+    if not normalized_symbols:
+        raise ValueError("At least one symbol is required")
+    normalized_feed = feed.strip().lower()
+    if normalized_feed not in {"iex", "sip"}:
+        raise ValueError("feed must be either iex or sip")
+    payload, rate_limit = _request_bars_page(
+        {
+            "symbols": ",".join(normalized_symbols),
+            "feed": normalized_feed,
+        },
+        url=f"{ALPACA_DATA_BASE_URL}/stocks/snapshots",
+    )
+    # Alpaca currently returns the symbol map directly; accepting the wrapped
+    # shape as well keeps this parser compatible with older fixtures/proxies.
+    raw = payload.get("snapshots") if "snapshots" in payload else payload
+    if not isinstance(raw, dict):
+        raise InvalidResponseError(
+            detail="Alpaca snapshots response is missing snapshots."
+        )
+
+    def parse_bar(values: object) -> dict | None:
+        if not isinstance(values, dict):
+            return None
+        try:
+            return {
+                "timestamp": str(values["t"]),
+                "open": float(values["o"]),
+                "high": float(values["h"]),
+                "low": float(values["l"]),
+                "close": float(values["c"]),
+                "volume": float(values.get("v") or 0),
+                "trade_count": (
+                    int(values["n"])
+                    if values.get("n") is not None
+                    else None
+                ),
+                "vwap": (
+                    float(values["vw"])
+                    if values.get("vw") is not None
+                    else None
+                ),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DataParseError(
+                detail=f"Invalid Alpaca snapshot bar: {exc}"
+            ) from exc
+
+    result: dict[str, dict] = {}
+    for symbol, values in raw.items():
+        if not isinstance(values, dict):
+            continue
+        result[str(symbol).upper()] = {
+            "daily_bar": parse_bar(values.get("dailyBar")),
+            "previous_daily_bar": parse_bar(values.get("prevDailyBar")),
+            "minute_bar": parse_bar(values.get("minuteBar")),
+            "source": "alpaca",
+            "feed": normalized_feed,
+            "rate_limit": rate_limit,
+        }
+    return result

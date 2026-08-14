@@ -30,6 +30,58 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
             service._daily_bar_is_complete("2026-08-13", now=before_delay)
         )
 
+    def test_live_iex_snapshot_window_covers_open_until_sip_catches_up(self) -> None:
+        self.assertFalse(service._live_iex_snapshot_window(
+            now=datetime(2026, 8, 14, 13, 29, tzinfo=timezone.utc)
+        ))
+        self.assertTrue(service._live_iex_snapshot_window(
+            now=datetime(2026, 8, 14, 13, 40, tzinfo=timezone.utc)
+        ))
+        self.assertFalse(service._live_iex_snapshot_window(
+            now=datetime(2026, 8, 14, 20, 20, tzinfo=timezone.utc)
+        ))
+
+    @patch.object(service.repository, "log_api_request")
+    @patch.object(service.repository, "upsert_daily_prices", return_value=1)
+    @patch.object(service, "fetch_stock_snapshots")
+    def test_live_iex_snapshot_creates_provisional_current_daily_bar(
+        self,
+        snapshots,
+        upsert,
+        _log,
+    ) -> None:
+        snapshots.return_value = {
+            "GLD": {
+                "daily_bar": {
+                    "timestamp": "2026-08-14T04:00:00Z",
+                    "open": 220.0,
+                    "high": 222.0,
+                    "low": 219.5,
+                    "close": 221.5,
+                    "volume": 12345,
+                }
+            }
+        }
+        results = {"GLD": {"status": "success", "updated_rows": 3}}
+
+        updated = service._merge_live_iex_daily_snapshots(
+            {"GLD": "GLD"},
+            results,
+            now=datetime(2026, 8, 14, 13, 40, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(updated, 1)
+        row = upsert.call_args.args[1][0]
+        self.assertEqual(row["date"], "2026-08-14")
+        self.assertEqual(row["close"], 221.5)
+        self.assertFalse(row["is_complete"])
+        self.assertEqual(
+            upsert.call_args.kwargs["source_timeframe"],
+            "snapshot_iex_1Day",
+        )
+        self.assertEqual(results["GLD"]["source"], "alpaca-iex")
+        self.assertEqual(results["GLD"]["updated_rows"], 4)
+
     @patch.object(service.repository, "log_api_request")
     @patch.object(service, "_fetch_alpaca_daily_prices")
     @patch.object(service, "_ensure_alpaca_capability")
@@ -119,6 +171,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
             service._has_initialized_intraday_history("BTC/USD", sync_state)
         )
 
+    @patch.object(service, "_merge_live_iex_daily_snapshots", return_value=0)
     @patch.object(service.repository, "log_api_request")
     @patch.object(service, "_fetch_alpaca_daily_prices")
     @patch.object(service, "derive_daily_prices_from_minutes")
@@ -133,6 +186,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         derive_daily,
         fetch_daily,
         _log,
+        merge_live,
     ) -> None:
         capability.return_value = {
             "alpaca_supported": True,
@@ -163,6 +217,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
             start_at="2023-12-31",
         )
         fetch_daily.assert_not_called()
+        merge_live.assert_called_once_with({"GLD": "GLD"}, results)
 
     @patch.object(service.repository, "get_symbol")
     @patch.object(service.repository, "get_daily_prices")
@@ -310,6 +365,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
             date(2024, 1, 1),
         )
 
+    @patch.object(service, "_merge_live_iex_daily_snapshots", return_value=0)
     @patch.object(service.repository, "upsert_daily_prices")
     @patch.object(service.repository, "upsert_symbol")
     @patch.object(service.repository, "log_api_request")
@@ -326,6 +382,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         _log,
         _upsert_symbol,
         _upsert_daily,
+        merge_live,
     ) -> None:
         capability.return_value = {
             "alpaca_supported": True,
@@ -346,6 +403,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
 
         self.assertEqual(results["GLD"]["source"], "alpaca")
         import_history.assert_not_called()
+        merge_live.assert_called_once_with({"GLD": "GLD"}, results)
 
     @patch.object(service, "_sync_overview_daily_from_twelve_data")
     @patch.object(service, "_sync_overview_daily_from_yahoo")

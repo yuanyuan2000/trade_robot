@@ -17,7 +17,7 @@ const overviewPageText = document.getElementById("overview-page-text");
 const overviewLiveToggle = document.getElementById("overview-live-toggle");
 const overviewLiveLabel = document.getElementById("overview-live-label");
 const overviewLiveControl = document.getElementById("overview-live-control");
-const analysisRefreshAll = document.getElementById("analysis-refresh-all");
+const overviewRefreshAll = document.getElementById("overview-refresh-all");
 const overviewTitle = document.getElementById("overview-title");
 const analysisOverviewProgress = document.getElementById("analysis-overview-progress");
 const analysisTrendTooltip = document.getElementById("analysis-trend-tooltip");
@@ -84,7 +84,10 @@ let lastAnalysisRefreshState = {};
 let analysisIndicatorLegendVisible = false;
 let overviewLoadInFlight;
 let marketDetailReturnContext = null;
+let visibleMarketRefreshInFlight = false;
+let marketOverviewManualRefreshRunning = false;
 const overviewIndicatorStorageKey = "trade-overview-indicator-columns";
+const visibleMarketDatabaseRefreshMs = 60_000;
 
 function applyOverviewAutoRefreshState(enabled) {
   marketOverviewAutoUpdate = Boolean(enabled);
@@ -139,7 +142,14 @@ function applyWorkspaceMode(mode) {
   overviewLiveLabel.textContent = "自动更新";
   overviewLiveToggle.checked = marketOverviewAutoUpdate;
   overviewLiveControl.hidden = isAnalysis;
-  analysisRefreshAll.hidden = !isAnalysis;
+  const refreshTitle = isAnalysis
+    ? "更新全部趋势线分析"
+    : "刷新全部标的日线数据";
+  overviewRefreshAll.title = refreshTitle;
+  overviewRefreshAll.setAttribute("aria-label", refreshTitle);
+  overviewRefreshAll.disabled = isAnalysis
+    ? Boolean(lastAnalysisRefreshState.running)
+    : marketOverviewManualRefreshRunning;
   overviewLiveControl.title = "每5分钟刷新总览最新价格";
   analysisOverviewProgress.hidden = !isAnalysis;
   if (isAnalysis) {
@@ -587,7 +597,7 @@ function renderAnalysisProgress(state) {
     return;
   }
   const running = Boolean(state.running);
-  analysisRefreshAll.disabled = running;
+  overviewRefreshAll.disabled = running;
   const hasError = Boolean(state.last_error);
   analysisOverviewProgress.hidden = false;
   analysisOverviewProgress.className = `analysis-overview-progress${running ? " is-running" : ""}${hasError ? " is-error" : ""}`;
@@ -615,6 +625,54 @@ async function syncMarketOverviewDaily() {
   if (isMarketOverviewActive()) {
     setStatus(`行情总览更新完成，共写入 ${result.updated_rows || 0} 条日线${suffix}。`, failed ? "warning" : "success");
   }
+}
+
+async function refreshAllMarketDailyData() {
+  if (marketOverviewManualRefreshRunning) return;
+  marketOverviewManualRefreshRunning = true;
+  overviewRefreshAll.disabled = true;
+  try {
+    await syncMarketOverviewDaily();
+    await fetchAndRenderMarketOverview({ silent: true });
+  } catch (error) {
+    if (isMarketOverviewActive()) {
+      setStatus(error.message || "行情总览更新失败。", "error");
+    }
+  } finally {
+    marketOverviewManualRefreshRunning = false;
+    if (currentWorkspaceMode === "market") {
+      overviewRefreshAll.disabled = false;
+    }
+  }
+}
+
+async function refreshVisibleMarketDataFromDatabase() {
+  if (
+    visibleMarketRefreshInFlight
+    || currentWorkspaceMode !== "market"
+    || !document.getElementById("market-view").classList.contains("active")
+  ) {
+    return;
+  }
+  visibleMarketRefreshInFlight = true;
+  try {
+    if (currentSymbol && !marketDetailPanel.hidden) {
+      await loadSymbolIndicators();
+    } else if (isMarketOverviewActive()) {
+      await fetchAndRenderMarketOverview({ silent: true });
+    }
+  } catch (_error) {
+    // Background database reads are best-effort. Manual refresh reports errors.
+  } finally {
+    visibleMarketRefreshInFlight = false;
+  }
+}
+
+function startVisibleMarketDatabaseRefresh() {
+  window.setInterval(
+    refreshVisibleMarketDataFromDatabase,
+    visibleMarketDatabaseRefreshMs,
+  );
 }
 
 async function waitForOverviewSync() {
@@ -2236,7 +2294,13 @@ shutdownButton.addEventListener("click", shutdownSystem);
 overviewLiveToggle.addEventListener("change", () => {
   setOverviewLiveRefresh(overviewLiveToggle.checked);
 });
-analysisRefreshAll.addEventListener("click", () => startAnalysisOverviewRefresh());
+overviewRefreshAll.addEventListener("click", () => {
+  if (currentWorkspaceMode === "analysis") {
+    startAnalysisOverviewRefresh();
+  } else {
+    refreshAllMarketDailyData();
+  }
+});
 themeToggle.addEventListener("click", () => {
   const nextTheme = document.body.classList.contains("theme-dark") ? "light" : "dark";
   applyTheme(nextTheme);
@@ -2326,6 +2390,7 @@ initChart();
 initTheme();
 updateCustomIndicatorFields();
 startHeartbeat();
+startVisibleMarketDatabaseRefresh();
 initializeOverviewIndicatorSelection();
 loadOverviewRefreshPreference();
 loadIndicatorCatalog().finally(() => loadMarketOverview());
