@@ -275,8 +275,105 @@ class RealtimeDashboardTests(unittest.TestCase):
             "source": "alpaca", "feed": "iex", "missing": [],
             "requested_at": "2026-08-12T13:30:00Z",
         }
-        RealtimeDecisionEvaluator(hub).evaluate(task, run, trading_date="2026-08-12", event="OPEN")
+        history_rows = repository.get_daily_prices("SPY", include_metadata=True)
+        history_snapshot = {
+            "required_sessions": 21,
+            "expected_dates": [row["date"] for row in history_rows[-21:]],
+            "symbols": {"SPY": {
+                "symbol": "SPY", "complete": True,
+                "latest_complete_date": history_rows[-1]["date"],
+                "snapshot_id": "SPY:test",
+            }},
+            "daily": {"SPY": history_rows},
+            "snapshot_id": "SPY:test",
+        }
+        with patch(
+            "services.realtime_decision_service.prepare_strategy_history",
+            return_value=history_snapshot,
+        ):
+            RealtimeDecisionEvaluator(hub).evaluate(
+                task,
+                run,
+                trading_date="2026-08-12",
+                event="OPEN",
+            )
         hub.event_snapshot.assert_called_once()
+
+    def test_formal_competition_fails_when_equity_candidate_snapshot_is_missing(self) -> None:
+        strategy = next(
+            item for item in backtest_repository.list_strategies()
+            if item["design_mode"] == "visual"
+            and item["selection_mode"] == "competition"
+        )
+        task = realtime_repository.create_task(
+            name="formal strict candidates",
+            strategy=strategy,
+            follow_strategy=False,
+            settings=strategy["default_settings"],
+            notification_settings={"enabled": False},
+            portfolio_state={"cash": 100000, "positions": {}},
+            panel_settings=generate_panel_settings(strategy),
+        )
+        run = realtime_repository.create_run(task)
+        candidates = [
+            item["symbol"] for item in strategy["definition"]["symbols"]
+        ]
+        history_snapshot = {
+            "required_sessions": 2,
+            "expected_dates": ["2026-08-10", "2026-08-11"],
+            "symbols": {
+                symbol: {
+                    "symbol": symbol,
+                    "complete": True,
+                    "latest_complete_date": "2026-08-11",
+                    "snapshot_id": f"{symbol}:test",
+                }
+                for symbol in candidates
+            },
+            "daily": {
+                symbol: repository.get_daily_prices(
+                    symbol,
+                    include_metadata=True,
+                )
+                for symbol in candidates
+            },
+            "snapshot_id": "strict:test",
+        }
+        hub = Mock()
+        available_symbol, missing_symbol = candidates[:2]
+        latest = history_snapshot["daily"][available_symbol][-1]
+        hub.event_snapshot.return_value = {
+            "symbols": {available_symbol: {
+                "signal_price": latest["close"],
+                "fill_price": latest["close"],
+                "signal_time": "2026-08-12T13:29:00Z",
+                "fill_time": "2026-08-12T13:30:00Z",
+                "daily": latest,
+                "daily_is_complete": False,
+                "latest_minute": latest,
+                "cumulative_volume": None,
+                "source": "alpaca",
+                "feed": "iex",
+            }},
+            "source": "alpaca",
+            "feed": "iex",
+            "missing": [f"{missing_symbol}: missing"],
+            "requested_at": "2026-08-12T13:30:00Z",
+        }
+
+        with (
+            patch(
+                "services.realtime_decision_service.prepare_strategy_history",
+                return_value=history_snapshot,
+            ),
+            self.assertRaisesRegex(RuntimeError, missing_symbol),
+        ):
+            RealtimeDecisionEvaluator(hub).evaluate(
+                task,
+                run,
+                trading_date="2026-08-12",
+                event="OPEN",
+            )
 
     def test_dashboard_routes_and_default_ui_are_available(self) -> None:
         import app as app_module

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import threading
 from zoneinfo import ZoneInfo
 
@@ -10,15 +10,17 @@ from config import (
     REALTIME_MAX_WORKERS,
     REALTIME_RECOVERY_STALE_SECONDS,
 )
-from database import backtest_repository, realtime_repository, repository
+from database import backtest_repository, realtime_repository
 from services.backtest.code_strategies import get_code_strategy
-from services.backtest.dsl import compile_expression
 from services.backtest.market_calendar import ensure_market_sessions
 from services.backtest.validation import validate_strategy_payload
 from services.realtime_decision_service import RealtimeDecisionEvaluator
 from services.realtime_mail import NotificationDispatcher
 from services.realtime_market_data import IEXMarketDataHub
 from services.realtime_panel_script import generate_panel_settings
+from services.market_data_request_coordinator import PRIORITY_FORMAL_DECISION
+from services.market_data_service import refresh_symbol_daily_history
+from services.realtime_history_service import prepare_strategy_history
 
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -52,45 +54,20 @@ def _events_for_strategy(strategy: dict) -> list[str]:
 
 
 def _validate_local_history(strategy: dict) -> None:
-    """Fail before launch when the local point-in-time history cannot support the formula."""
-    definition = strategy["definition"]
-    candidate_symbols = [str(item["symbol"]).upper() for item in definition.get("symbols", [])]
-    symbols = list(candidate_symbols)
-    auxiliary_symbols: list[str] = []
-    minimum = 2
-    if strategy["design_mode"] == "visual":
-        expressions = [
-            str(rule.get("condition") or "true")
-            for rule in definition.get("rules", [])
-            if rule.get("enabled", True)
-        ]
-        if strategy["selection_mode"] == "competition":
-            competition = definition["competition"]
-            expressions.extend((competition["eligibility"], competition["score"]))
-        minimum = max(
-            minimum,
-            max(
-                (compile_expression(expression).max_lookback for expression in expressions),
-                default=1,
-            ) + 1,
-        )
-    else:
-        strategy_type = get_code_strategy(strategy["code_key"])
-        params = strategy_type.validate_params(definition.get("params", {}))
-        auxiliary_symbols = list(strategy_type.additional_symbols(params))
-        symbols.extend(auxiliary_symbols)
-        minimum = max(minimum, int(strategy_type.minimum_lookback(params)) + 1)
-    available_candidates = 0
-    for symbol in dict.fromkeys(symbols):
-        rows = repository.get_daily_prices(symbol, include_metadata=True)
-        if len(rows) < minimum:
-            if strategy["selection_mode"] == "competition" and symbol in candidate_symbols and symbol not in auxiliary_symbols:
-                continue
-            raise ValueError(f"{symbol} 本地日线仅 {len(rows)} 根，策略至少需要 {minimum} 根；请先同步历史数据。")
-        if symbol in candidate_symbols:
-            available_candidates += 1
-    if strategy["selection_mode"] == "competition" and available_candidates < 2:
-        raise ValueError("competition 模式至少需要两个候选标的具备足够本地日线数据。")
+    """Repair and validate the exact completed-session window before launch."""
+    current = datetime.now(UTC).astimezone(NEW_YORK)
+    cutoff = current.date()
+    if current.time() >= time(16, 20):
+        cutoff += timedelta(days=1)
+    prepare_strategy_history(
+        strategy,
+        trading_date=cutoff.isoformat(),
+        refresh=lambda symbol, start_date: refresh_symbol_daily_history(
+            symbol,
+            start_date=start_date,
+            priority=PRIORITY_FORMAL_DECISION,
+        ),
+    )
 
 
 def _session_at(sessions: list[dict], trading_date: str) -> dict | None:

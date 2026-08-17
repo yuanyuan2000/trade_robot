@@ -796,7 +796,7 @@ def market_overview_order():
 @app.route("/api/market-overview/sync-daily", methods=["POST"])
 def market_overview_sync_daily():
     try:
-        started = start_overview_sync()
+        started = start_overview_sync(reason="manual")
         return jsonify({"ok": True, "running": True, "started": started, **overview_sync_snapshot()})
     except Exception as exc:
         app.logger.exception("Unexpected market overview daily sync error")
@@ -844,7 +844,7 @@ def market_overview_auto_refresh():
 @app.route("/api/market-overview/refresh-prices", methods=["POST"])
 def market_overview_refresh_prices():
     try:
-        started = start_overview_sync()
+        started = start_overview_sync(reason="manual")
         overview = repository.list_market_overview()
         items = [
             {
@@ -886,14 +886,14 @@ def market_overview_refresh_prices():
         )
 
 
-def start_overview_sync() -> bool:
-    return market_overview_coordinator.trigger()
+def start_overview_sync(*, reason: str = "manual") -> bool:
+    return market_overview_coordinator.trigger(reason=reason)
 
 
 def run_overview_sync() -> None:
     # Compatibility entry point used by maintenance/tests; the application
     # itself schedules refreshes only through the coordinator.
-    sync_market_overview_daily_prices()
+    sync_market_overview_daily_prices(reason="maintenance")
 
 
 def overview_sync_snapshot() -> dict:

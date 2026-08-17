@@ -13,6 +13,9 @@ from services.backtest.engine import BacktestEngine
 from services.backtest.portfolio import D, Lot, Portfolio, Position
 from services.backtest.validation import validate_strategy_payload
 from services.realtime_market_data import IEXMarketDataHub
+from services.market_data_request_coordinator import PRIORITY_FORMAL_DECISION
+from services.market_data_service import refresh_symbol_daily_history
+from services.realtime_history_service import prepare_strategy_history
 
 
 UTC = timezone.utc
@@ -86,7 +89,13 @@ def _current_daily_row(symbol: str, payload: dict) -> dict:
     }
 
 
-def _build_dataset(strategy: dict, payload: dict, trading_date: str) -> HistoricalDataSet:
+def _build_dataset(
+    strategy: dict,
+    payload: dict,
+    trading_date: str,
+    *,
+    history_daily: dict[str, list[dict]] | None = None,
+) -> HistoricalDataSet:
     definition = strategy["definition"]
     symbols = [str(item["symbol"]).upper() for item in definition.get("symbols", [])]
     if strategy["design_mode"] == "code":
@@ -96,7 +105,11 @@ def _build_dataset(strategy: dict, payload: dict, trading_date: str) -> Historic
     symbols = list(dict.fromkeys(symbols))
     daily: dict[str, list[dict]] = {}
     for symbol in symbols:
-        rows = repository.get_daily_prices(symbol, include_metadata=True)
+        rows = (
+            [dict(row) for row in history_daily[symbol]]
+            if history_daily is not None and symbol in history_daily
+            else repository.get_daily_prices(symbol, include_metadata=True)
+        )
         if not rows:
             raise RuntimeError(f"{symbol} 没有本地日线数据，无法进行实时决策。")
         daily[symbol] = [dict(row) for row in rows]
@@ -160,6 +173,15 @@ class RealtimeDecisionEvaluator:
             symbols.extend(auxiliary_symbols)
             include_volume = event in strategy_type.cumulative_volume_events(params)
         symbols = list(dict.fromkeys(symbols))
+        history_snapshot = prepare_strategy_history(
+            strategy,
+            trading_date=trading_date,
+            refresh=lambda symbol, start_date: refresh_symbol_daily_history(
+                symbol,
+                start_date=start_date,
+                priority=PRIORITY_FORMAL_DECISION,
+            ),
+        )
         allow_partial = strategy["selection_mode"] == "competition"
         payload = self.hub.event_snapshot(
             symbols,
@@ -175,7 +197,19 @@ class RealtimeDecisionEvaluator:
         if missing_auxiliary:
             raise RuntimeError("代码策略所需辅助标的行情缺失：" + "、".join(missing_auxiliary))
         if allow_partial:
-            available_candidates = [symbol for symbol in candidate_symbols if symbol in available]
+            required_candidates = [
+                symbol for symbol in candidate_symbols if "/" not in symbol
+            ]
+            missing_candidates = [
+                symbol for symbol in required_candidates if symbol not in available
+            ]
+            if missing_candidates:
+                raise RuntimeError(
+                    "正式候选池实时行情缺失：" + "、".join(missing_candidates)
+                )
+            available_candidates = [
+                symbol for symbol in candidate_symbols if symbol in available
+            ]
             if len(available_candidates) < 2:
                 raise RuntimeError("competition 模式至少需要两个标的取得有效 IEX 行情。")
             strategy["definition"]["symbols"] = [
@@ -183,7 +217,12 @@ class RealtimeDecisionEvaluator:
                 if str(item["symbol"]).upper() in set(available_candidates)
             ]
             definition = strategy["definition"]
-        dataset = _build_dataset(strategy, payload, trading_date)
+        dataset = _build_dataset(
+            strategy,
+            payload,
+            trading_date,
+            history_daily=history_snapshot["daily"],
+        )
         settings = {
             **strategy.get("default_settings", {}),
             **(run.get("settings") or {}),
@@ -249,8 +288,50 @@ class RealtimeDecisionEvaluator:
             "portfolio": _portfolio_state(engine.portfolio, marks),
             "data_warnings": list(payload.get("missing") or []),
         }
+        audit_logs = []
+        for symbol, audit in history_snapshot["symbols"].items():
+            audit_logs.append({
+                "level": "INFO",
+                "event_type": "DATA_HISTORY_AUDIT",
+                "message": (
+                    f"{symbol} 历史数据截至 {audit.get('latest_complete_date')}，"
+                    f"快照 {audit.get('snapshot_id')}。"
+                ),
+                "symbol": symbol,
+                "context": audit,
+            })
+        event_snapshot_id = (
+            f"{history_snapshot['snapshot_id']}|"
+            f"{payload.get('feed')}:{payload.get('requested_at')}"
+        )
+        audit_logs.append({
+            "level": "INFO",
+            "event_type": "DATA_EVENT_SNAPSHOT",
+            "message": f"正式事件行情快照 {event_snapshot_id}。",
+            "symbol": None,
+            "context": {
+                "snapshot_id": event_snapshot_id,
+                "source": payload.get("source"),
+                "feed": payload.get("feed"),
+                "requested_at": payload.get("requested_at"),
+                "signals": {
+                    symbol: {
+                        "signal_price": item.get("signal_price"),
+                        "signal_time": item.get("signal_time"),
+                    }
+                    for symbol, item in payload["symbols"].items()
+                },
+            },
+        })
+        history_manifest = {
+            key: value
+            for key, value in history_snapshot.items()
+            if key != "daily"
+        }
         calculation = {
-            "engine_logs": engine.logs,
+            "engine_logs": [*engine.logs, *audit_logs],
+            "history_snapshot": history_manifest,
+            "event_snapshot_id": event_snapshot_id,
             "symbol_inputs": {
                 symbol: {
                     "signal_price": value["signal_price"],

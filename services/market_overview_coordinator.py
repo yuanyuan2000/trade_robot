@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import inspect
 import threading
 from typing import Callable
 
@@ -33,6 +34,7 @@ class MarketOverviewRefreshCoordinator:
         self._last_result: dict | None = None
         self._last_error: str | None = None
         self._updated_at: str | None = None
+        self._reason: str | None = None
 
     @staticmethod
     def _now() -> str:
@@ -57,7 +59,7 @@ class MarketOverviewRefreshCoordinator:
             self._thread.start()
         # Opening the application always performs one refresh. The switch
         # controls subsequent five-minute refreshes only.
-        self.trigger()
+        self.trigger(reason="startup")
 
     def stop(self) -> None:
         self._stop.set()
@@ -69,7 +71,7 @@ class MarketOverviewRefreshCoordinator:
     def _loop(self) -> None:
         while not self._stop.wait(self.interval_seconds):
             if self.auto_enabled:
-                self.trigger()
+                self.trigger(reason="periodic")
 
     @property
     def auto_enabled(self) -> bool:
@@ -84,26 +86,33 @@ class MarketOverviewRefreshCoordinator:
             self._auto_enabled = value
             self._updated_at = self._now()
         if changed_to_enabled:
-            self.trigger()
+            self.trigger(reason="enabled")
         return self.snapshot()
 
-    def trigger(self) -> bool:
+    def trigger(self, *, reason: str = "manual") -> bool:
         with self._lock:
             if self._running:
                 return False
             self._running = True
             self._last_error = None
             self._updated_at = self._now()
+            self._reason = str(reason)
         threading.Thread(
             target=self._run_once,
+            args=(str(reason),),
             name="market-overview-refresh",
             daemon=True,
         ).start()
         return True
 
-    def _run_once(self) -> None:
+    def _run_once(self, reason: str) -> None:
         try:
-            result = self.sync_callback()
+            parameters = inspect.signature(self.sync_callback).parameters
+            result = (
+                self.sync_callback(reason=reason)
+                if "reason" in parameters
+                else self.sync_callback()
+            )
             with self._lock:
                 self._last_result = result
                 self._last_error = None
@@ -125,6 +134,7 @@ class MarketOverviewRefreshCoordinator:
                 "last_result": self._last_result,
                 "last_error": self._last_error,
                 "updated_at": self._updated_at,
+                "reason": self._reason,
             }
 
 

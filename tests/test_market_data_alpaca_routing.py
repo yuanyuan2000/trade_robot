@@ -178,7 +178,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
     @patch.object(service, "import_symbol_history")
     @patch.object(service.intraday_repository, "get_sync_state")
     @patch.object(service, "_ensure_alpaca_capability")
-    def test_overview_uses_incremental_minutes_only_after_initialization(
+    def test_overview_refreshes_daily_without_touching_initialized_minutes(
         self,
         capability,
         get_sync_state,
@@ -198,24 +198,59 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
             "earliest_minute_at": "2020-01-02T14:30:00Z",
             "latest_complete_minute_at": "2024-01-05T20:00:00Z",
         }
-        import_history.return_value = {"sync_state": {"status": "success"}}
-        derive_daily.return_value = {"updated_rows": 2}
+        fetch_daily.return_value = [{"date": "2024-01-05"}]
+        results = {"GLD": {"status": "pending"}}
+
+        with (
+            patch.object(service.repository, "upsert_symbol"),
+            patch.object(
+                service.repository,
+                "upsert_daily_prices",
+                return_value=2,
+            ),
+        ):
+            pending = service._sync_overview_daily_from_alpaca(
+                [self.alias],
+                date(2024, 1, 1),
+                results,
+            )
+
+        self.assertEqual(pending, [])
+        self.assertEqual(results["GLD"]["source"], "alpaca")
+        self.assertEqual(results["GLD"]["updated_rows"], 2)
+        fetch_daily.assert_called_once_with(
+            "GLD",
+            start_date=date(2024, 1, 1),
+        )
+        import_history.assert_not_called()
+        derive_daily.assert_not_called()
+        merge_live.assert_called_once_with({"GLD": "GLD"}, results)
+
+    @patch.object(service, "_merge_live_iex_daily_snapshots", return_value=0)
+    @patch.object(service, "_fetch_alpaca_daily_prices")
+    @patch.object(service, "_ensure_alpaca_capability")
+    def test_overview_skips_history_api_when_required_sessions_are_complete(
+        self,
+        capability,
+        fetch_daily,
+        merge_live,
+    ) -> None:
+        capability.return_value = {
+            "alpaca_supported": True,
+            "alpaca_symbol": "GLD",
+        }
         results = {"GLD": {"status": "pending"}}
 
         pending = service._sync_overview_daily_from_alpaca(
             [self.alias],
             date(2024, 1, 1),
             results,
+            history_audits={"GLD": {"complete": True}},
         )
 
         self.assertEqual(pending, [])
-        self.assertEqual(results["GLD"]["source"], "alpaca-minute")
-        self.assertEqual(results["GLD"]["updated_rows"], 2)
-        import_history.assert_called_once_with("GLD", start="2023-12-31")
-        derive_daily.assert_called_once_with(
-            "GLD",
-            start_at="2023-12-31",
-        )
+        self.assertEqual(results["GLD"]["source"], "database")
+        self.assertEqual(results["GLD"]["updated_rows"], 0)
         fetch_daily.assert_not_called()
         merge_live.assert_called_once_with({"GLD": "GLD"}, results)
 
@@ -261,9 +296,17 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         get_daily_prices.return_value = [{"date": "2024-01-05"}]
         get_symbol.return_value = {"alpaca_supported": True}
 
-        service.update_full_market_data("GLD", initialize_intraday=False)
+        with patch.object(
+            service,
+            "_manual_integrity",
+            return_value={"complete": True},
+        ):
+            service.update_full_market_data("GLD", initialize_intraday=False)
 
-        fetch_daily.assert_called_once_with("GLD", date(2024, 1, 1))
+        fetch_daily.assert_called_once_with(
+            "GLD",
+            start_date=date(2024, 1, 1),
+        )
         import_history.assert_not_called()
         get_sync_state.assert_not_called()
 
@@ -303,11 +346,16 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         get_daily_prices.return_value = [{"date": "2020-01-02"}]
 
         progress_updates = []
-        service.update_full_market_data(
-            "GLD",
-            initialize_intraday=True,
-            progress_callback=progress_updates.append,
-        )
+        with patch.object(
+            service,
+            "_manual_integrity",
+            return_value={"complete": True},
+        ):
+            service.update_full_market_data(
+                "GLD",
+                initialize_intraday=True,
+                progress_callback=progress_updates.append,
+            )
 
         self.assertEqual(import_history.call_args.args, ("GLD",))
         self.assertEqual(
@@ -358,7 +406,12 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         get_daily_prices.return_value = [{"date": "2024-01-05"}]
         get_symbol.return_value = {"alpaca_supported": False}
 
-        service.update_full_market_data("GLD", initialize_intraday=False)
+        with patch.object(
+            service,
+            "_manual_integrity",
+            return_value={"complete": True},
+        ):
+            service.update_full_market_data("GLD", initialize_intraday=False)
 
         fetch_fallback.assert_called_once_with(
             self.alias,
@@ -429,6 +482,40 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         self.assertEqual(sync_alpaca.call_args.args[0], [self.alias])
         sync_yahoo.assert_called_once()
         sync_twelve.assert_called_once()
+
+    @patch.object(service, "_sync_overview_daily_from_twelve_data")
+    @patch.object(service, "_sync_overview_daily_from_yahoo", return_value=[])
+    @patch.object(service, "_sync_overview_daily_from_alpaca")
+    @patch.object(service, "_overview_sync_start_date", return_value=date(2024, 1, 1))
+    @patch.object(service.repository, "list_overview_symbols")
+    @patch.object(service, "latest_completed_session_dates")
+    def test_overview_reports_unverified_when_calendar_validation_fails(
+        self,
+        completed_sessions,
+        list_overview,
+        _sync_start,
+        sync_alpaca,
+        _sync_yahoo,
+        _sync_twelve,
+    ) -> None:
+        completed_sessions.side_effect = RuntimeError("calendar unavailable")
+        list_overview.return_value = [self.alias]
+
+        def mark_success(_aliases, _start, results, **_kwargs):
+            results["GLD"].update({
+                "source": "alpaca",
+                "status": "success",
+                "updated_rows": 1,
+            })
+            return []
+
+        sync_alpaca.side_effect = mark_success
+
+        result = service.sync_market_overview_daily_prices()
+
+        self.assertEqual(result["history_validation_error"], "calendar unavailable")
+        self.assertEqual(result["items"][0]["status"], "unverified")
+        self.assertIsNone(result["items"][0]["history_complete"])
 
 
 if __name__ == "__main__":

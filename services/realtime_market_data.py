@@ -6,10 +6,15 @@ from zoneinfo import ZoneInfo
 
 from config import ALPACA_API_KEY, ALPACA_SECRET
 from services.alpaca_data_client import fetch_latest_stock_bars, fetch_stock_bars
+from services.market_data_request_coordinator import (
+    PRIORITY_FORMAL_DECISION,
+    market_data_request_coordinator,
+)
 
 
 NEW_YORK = ZoneInfo("America/New_York")
 UTC = timezone.utc
+MAX_SIGNAL_STALENESS_SECONDS = 5 * 60
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -115,29 +120,43 @@ class IEXMarketDataHub:
                 missing.append(f"{symbol}: IEX 股票行情不支持该加密货币代码")
                 continue
             try:
-                minute_page = fetch_stock_bars(
-                    symbol,
-                    timeframe="1Min",
-                    start=open_at.isoformat().replace("+00:00", "Z"),
-                    end=end_at.isoformat().replace("+00:00", "Z"),
-                    feed="iex",
-                    limit=1000,
-                    max_pages=1,
+                def fetch_event_pages() -> dict:
+                    minute_page = fetch_stock_bars(
+                        symbol,
+                        timeframe="1Min",
+                        start=open_at.isoformat().replace("+00:00", "Z"),
+                        end=end_at.isoformat().replace("+00:00", "Z"),
+                        feed="iex",
+                        limit=1000,
+                        max_pages=1,
+                    )
+                    daily_page = fetch_stock_bars(
+                        symbol,
+                        timeframe="1Day",
+                        # Include prior sessions: the OPEN signal is the last
+                        # completed daily close, never the current session's
+                        # partial bar.
+                        start=(current_day - timedelta(days=10)).date().isoformat(),
+                        end=(current_day + timedelta(days=1)).date().isoformat(),
+                        feed="iex",
+                        limit=10,
+                        max_pages=1,
+                    )
+                    return {
+                        "minute_rows": minute_page.get("data", []),
+                        "daily_rows": daily_page.get("data", []),
+                        "fetched_at": datetime.now(UTC).isoformat().replace(
+                            "+00:00", "Z"
+                        ),
+                    }
+
+                pages = market_data_request_coordinator.run(
+                    ("formal-event-bars", symbol, trading_date, event),
+                    priority=PRIORITY_FORMAL_DECISION,
+                    callback=fetch_event_pages,
                 )
-                minute_rows = minute_page.get("data", [])
-                daily_page = fetch_stock_bars(
-                    symbol,
-                    timeframe="1Day",
-                    # Include prior sessions: the OPEN signal is the last
-                    # completed daily close, never the current session's
-                    # partial bar.
-                    start=(current_day - timedelta(days=10)).date().isoformat(),
-                    end=(current_day + timedelta(days=1)).date().isoformat(),
-                    feed="iex",
-                    limit=10,
-                    max_pages=1,
-                )
-                daily_rows = daily_page.get("data", [])
+                minute_rows = pages["minute_rows"]
+                daily_rows = pages["daily_rows"]
             except Exception as exc:
                 missing.append(f"{symbol}: {exc}")
                 continue
@@ -176,6 +195,19 @@ class IEXMarketDataHub:
                 signal_price = float(signal_row["close"]) if signal_row else None
                 fill_price = float(fill_row["open"]) if fill_row else None
                 signal_time = signal_row.get("timestamp") if signal_row else None
+                if signal_row is not None:
+                    signal_age = (
+                        signal_minute
+                        - datetime.fromisoformat(
+                            signal_row["timestamp"].replace("Z", "+00:00")
+                        )
+                    ).total_seconds()
+                    if signal_age > MAX_SIGNAL_STALENESS_SECONDS:
+                        missing.append(
+                            f"{symbol}: {event} 前最新完整分钟已滞后 "
+                            f"{int(signal_age // 60)} 分钟"
+                        )
+                        continue
             if signal_price is None:
                 missing.append(f"{symbol}: 缺少 {trading_date} {event} 的信号行情")
                 continue
@@ -198,7 +230,7 @@ class IEXMarketDataHub:
                 "cumulative_volume": cumulative_volume,
                 "source": "alpaca",
                 "feed": "iex",
-                "requested_at": now.isoformat().replace("+00:00", "Z"),
+                "requested_at": pages["fetched_at"],
             }
         if missing and not allow_missing:
             raise RuntimeError("IEX 行情不完整：" + "；".join(missing[:8]))

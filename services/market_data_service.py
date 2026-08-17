@@ -15,6 +15,15 @@ from services.intraday_bar_service import (
 )
 from services.intraday_import_service import import_symbol_history
 from database import intraday_repository
+from services.market_data_integrity import (
+    assess_daily_history,
+    latest_completed_session_dates,
+)
+from services.market_data_request_coordinator import (
+    PRIORITY_MANUAL,
+    PRIORITY_OVERVIEW,
+    market_data_request_coordinator,
+)
 from services.twelve_data_client import (
     fetch_daily_prices as fetch_twelve_data_daily_prices,
     fetch_daily_prices_batch as fetch_twelve_data_daily_prices_batch,
@@ -301,12 +310,13 @@ def get_market_data(
     }
 
 
-def update_full_market_data(
+def _update_full_market_data_uncoordinated(
     symbol: str,
     *,
     initialize_intraday: bool = False,
     progress_callback: Callable[[dict], None] | None = None,
     adjustment: str = "all",
+    priority: int = PRIORITY_MANUAL,
 ) -> dict:
     if not normalize_symbol(symbol):
         raise ValueError("Symbol is required")
@@ -388,19 +398,32 @@ def update_full_market_data(
         import_kwargs = {"start": start_value}
         if progress_callback:
             import_kwargs["progress"] = import_progress
-        import_result = import_symbol_history(normalized, **import_kwargs)
-        emit(
-            stage="deriving_daily",
-            progress=0.93,
-            current_date=(
-                str(import_result.get("end") or "")[:10] or None
-            ),
-            message="分钟数据下载完成，正在重建日线",
+        def import_and_derive() -> dict:
+            import_result = import_symbol_history(normalized, **import_kwargs)
+            emit(
+                stage="deriving_daily",
+                progress=0.93,
+                current_date=(
+                    str(import_result.get("end") or "")[:10] or None
+                ),
+                message="分钟数据下载完成，正在重建日线",
+            )
+            derived = derive_daily_prices_from_minutes(
+                normalized,
+                start_at=derive_start,
+            )
+            return {
+                "import_result": import_result,
+                "derived": derived,
+            }
+
+        minute_result = market_data_request_coordinator.run(
+            ("minute-history", normalized, str(start_value)),
+            priority=priority,
+            callback=import_and_derive,
         )
-        derived = derive_daily_prices_from_minutes(
-            normalized,
-            start_at=derive_start,
-        )
+        import_result = minute_result["import_result"]
+        derived = minute_result["derived"]
         rows = repository.get_daily_prices(
             normalized, start_date.isoformat(), include_metadata=True
         )
@@ -444,43 +467,20 @@ def update_full_market_data(
         current_date=recent_start.isoformat(),
         message=f"正在更新 {recent_start.isoformat()} 起的日线数据",
     )
-    if capability.get("alpaca_supported"):
-        rows = _fetch_alpaca_daily_prices(
-            capability.get("alpaca_symbol") or normalized,
-            recent_start,
-        )
-        repository.upsert_symbol(normalized)
-        repository.upsert_daily_prices(
-            normalized,
-            rows,
-            source_provider="alpaca",
-            source_timeframe="1Day",
-        )
-        source = "alpaca"
-    else:
-        rows, provider, _provider_symbol = _fetch_daily_prices_with_fallback(
-            alias,
-            recent_start,
-        )
-        repository.upsert_symbol(normalized)
-        repository.upsert_daily_prices(
-            normalized,
-            rows,
-            source_provider=provider,
-            source_timeframe="1Day",
-        )
-        source = provider
+    refresh_result = refresh_symbol_daily_history(
+        normalized,
+        start_date=recent_start,
+        priority=priority,
+    )
+    source = refresh_result["source"]
 
     if recent_start > start_date and not _has_history_start(normalized, start_date):
-        rows, provider, _provider_symbol = _fetch_daily_prices_with_fallback(alias, start_date)
-        repository.upsert_symbol(normalized)
-        repository.upsert_daily_prices(
+        refresh_result = refresh_symbol_daily_history(
             normalized,
-            rows,
-            source_provider=provider,
-            source_timeframe="1Day",
+            start_date=start_date,
+            priority=priority,
         )
-        source = provider
+        source = refresh_result["source"]
 
     rows = repository.get_daily_prices(
         normalized, start_date.isoformat(), include_metadata=True
@@ -519,6 +519,106 @@ def update_full_market_data(
     }
 
 
+def refresh_symbol_daily_history(
+    symbol: str,
+    *,
+    start_date: str | date,
+    priority: int = PRIORITY_MANUAL,
+) -> dict:
+    """Refresh a bounded daily range through the shared request coordinator."""
+    normalized = normalize_symbol(symbol)
+    if not normalized:
+        raise ValueError("Symbol is required")
+    start_value = (
+        start_date if isinstance(start_date, date)
+        else date.fromisoformat(str(start_date)[:10])
+    )
+
+    def execute() -> dict:
+        alias = repository.resolve_symbol_alias(normalized)
+        rows, provider, provider_symbol = _fetch_daily_prices_with_fallback(
+            alias,
+            start_value,
+        )
+        repository.upsert_symbol(normalized)
+        updated_rows = repository.upsert_daily_prices(
+            normalized,
+            rows,
+            source_provider=provider,
+            source_timeframe="1Day",
+        )
+        return {
+            "symbol": normalized,
+            "source": provider,
+            "provider_symbol": provider_symbol,
+            "start_date": start_value.isoformat(),
+            "updated_rows": updated_rows,
+        }
+
+    return market_data_request_coordinator.run(
+        ("daily-history", normalized, start_value.isoformat()),
+        priority=priority,
+        callback=execute,
+    )
+
+
+def _manual_integrity(symbol: str) -> dict:
+    expected = latest_completed_session_dates(260)
+    return assess_daily_history(
+        symbol,
+        expected,
+        respect_verified_start=True,
+    )
+
+
+def update_full_market_data(
+    symbol: str,
+    *,
+    initialize_intraday: bool = False,
+    progress_callback: Callable[[dict], None] | None = None,
+    adjustment: str = "all",
+    priority: int = PRIORITY_MANUAL,
+) -> dict:
+    normalized = normalize_symbol(symbol)
+
+    result = _update_full_market_data_uncoordinated(
+        normalized,
+        initialize_intraday=initialize_intraday,
+        progress_callback=progress_callback,
+        adjustment=adjustment,
+        priority=priority,
+    )
+    try:
+        integrity = _manual_integrity(normalized)
+        if not integrity["complete"] and integrity.get("repair_start_date"):
+            refresh_symbol_daily_history(
+                normalized,
+                start_date=integrity["repair_start_date"],
+                priority=priority,
+            )
+            integrity = _manual_integrity(normalized)
+            # Preserve minute-import metadata while replacing the display
+            # rows with the post-repair database snapshot.
+            refreshed = get_market_data(normalized, adjustment=adjustment)
+            for field in (
+                "data",
+                "adjustment",
+                "corporate_actions",
+                "symbol_settings",
+                "warning",
+            ):
+                if field in refreshed:
+                    result[field] = refreshed[field]
+        result["integrity"] = integrity
+    except Exception as exc:
+        result["integrity"] = {
+            "symbol": normalized,
+            "complete": False,
+            "validation_error": str(exc),
+        }
+    return result
+
+
 def _overview_sync_start_date(symbol: str) -> date:
     configured_start = date.fromisoformat(FULL_HISTORY_START_DATE)
     bounds = repository.get_symbol_date_bounds(symbol)
@@ -528,7 +628,7 @@ def _overview_sync_start_date(symbol: str) -> date:
     return max(configured_start, latest - timedelta(days=OVERVIEW_DAILY_REFRESH_LOOKBACK_DAYS))
 
 
-def sync_market_overview_daily_prices() -> dict:
+def sync_market_overview_daily_prices(*, reason: str = "manual") -> dict:
     aliases = repository.list_overview_symbols()
     if not aliases:
         return {
@@ -542,6 +642,23 @@ def sync_market_overview_daily_prices() -> dict:
         }
 
     batch_start_date = min(_overview_sync_start_date(alias["common_symbol"]) for alias in aliases)
+    history_validation_error = None
+    try:
+        overview_expected = latest_completed_session_dates(260)
+        history_audits = {
+            alias["common_symbol"]: assess_daily_history(
+                alias["common_symbol"],
+                overview_expected,
+                respect_verified_start=True,
+            )
+            for alias in aliases
+        }
+    except Exception as exc:
+        # A calendar outage must not prevent a user-requested refresh. The
+        # provider request still runs, while the result remains auditable as
+        # an unverified refresh rather than a false "complete" state.
+        history_audits = {}
+        history_validation_error = str(exc)
     results = {
         alias["common_symbol"]: {
             "symbol": alias["common_symbol"],
@@ -558,13 +675,46 @@ def sync_market_overview_daily_prices() -> dict:
         aliases,
         batch_start_date,
         results,
+        history_audits=history_audits,
     )
     pending_aliases = _sync_overview_daily_from_yahoo(
         pending_aliases,
         batch_start_date,
         results,
+        history_audits=history_audits,
     )
-    _sync_overview_daily_from_twelve_data(pending_aliases, batch_start_date, results)
+    _sync_overview_daily_from_twelve_data(
+        pending_aliases,
+        batch_start_date,
+        results,
+        history_audits=history_audits,
+    )
+
+    verified_audits = {}
+    if history_audits:
+        verified_audits = {
+            alias["common_symbol"]: assess_daily_history(
+                alias["common_symbol"],
+                overview_expected,
+                respect_verified_start=True,
+            )
+            for alias in aliases
+        }
+        for symbol, audit in verified_audits.items():
+            results[symbol]["history_complete"] = audit["complete"]
+            if results[symbol]["status"] == "success" and not audit["complete"]:
+                results[symbol]["status"] = "incomplete"
+                results[symbol]["error"] = (
+                    "日线完整性校验未通过，缺失："
+                    + ",".join(audit["missing_sessions"] + audit["incomplete_sessions"])
+                )
+    elif history_validation_error:
+        for item in results.values():
+            item["history_complete"] = None
+            item["history_validation_error"] = history_validation_error
+            if item["status"] == "success":
+                item["status"] = "unverified"
+                item["error"] = "交易日历不可用，日线完整性未确认。"
 
     updated_rows = sum(int(item["updated_rows"] or 0) for item in results.values())
     return {
@@ -575,6 +725,9 @@ def sync_market_overview_daily_prices() -> dict:
         ),
         "start_date": batch_start_date.isoformat(),
         "end_date": date.today().isoformat(),
+        "reason": reason,
+        "history_audits": verified_audits,
+        "history_validation_error": history_validation_error,
         "items": list(results.values()),
         "updated_rows": updated_rows,
     }
@@ -584,6 +737,8 @@ def _sync_overview_daily_from_alpaca(
     aliases: list[dict],
     start_date: date,
     results: dict[str, dict],
+    *,
+    history_audits: dict[str, dict] | None = None,
 ) -> list[dict]:
     pending = []
     live_symbol_map: dict[str, str] = {}
@@ -595,38 +750,26 @@ def _sync_overview_daily_from_alpaca(
                 pending.append(alias)
                 continue
             alpaca_symbol = capability.get("alpaca_symbol") or normalized
-            live_symbol_map[alpaca_symbol] = normalized
-            sync_state = intraday_repository.get_sync_state(normalized)
-            intraday_ready = _has_initialized_intraday_history(normalized, sync_state)
-            if intraday_ready:
-                start_value = _intraday_incremental_start(
-                    sync_state["latest_complete_minute_at"]
-                )
-                import_result = import_symbol_history(
-                    normalized,
-                    start=start_value,
-                )
-                derived = derive_daily_prices_from_minutes(
-                    normalized,
-                    start_at=start_value,
-                )
-                updated_rows = derived["updated_rows"]
-                source = "alpaca-minute"
-                sync_status = import_result["sync_state"]["status"]
+            if "/" not in alpaca_symbol:
+                live_symbol_map[alpaca_symbol] = normalized
+            audit = (history_audits or {}).get(normalized)
+            if audit and audit.get("complete"):
+                updated_rows = 0
+                source = "database"
+                sync_status = "history-current"
             else:
-                rows = _fetch_alpaca_daily_prices(
-                    alpaca_symbol,
-                    start_date,
+                symbol_start = date.fromisoformat(
+                    str((audit or {}).get("repair_start_date") or start_date)[:10]
                 )
-                repository.upsert_symbol(normalized)
-                updated_rows = repository.upsert_daily_prices(
+
+                refresh_result = refresh_symbol_daily_history(
                     normalized,
-                    rows,
-                    source_provider="alpaca",
-                    source_timeframe="1Day",
+                    start_date=symbol_start,
+                    priority=PRIORITY_OVERVIEW,
                 )
-                source = "alpaca"
-                sync_status = sync_state.get("status")
+                updated_rows = int(refresh_result.get("updated_rows") or 0)
+                source = str(refresh_result.get("source") or "alpaca")
+                sync_status = "daily"
             results[normalized].update(
                 {
                     "source": source,
@@ -645,7 +788,15 @@ def _sync_overview_daily_from_alpaca(
                 message=exc.detail or exc.message,
             )
             pending.append(alias)
-    _merge_live_iex_daily_snapshots(live_symbol_map, results)
+    minute_bucket = int(datetime.now(timezone.utc).timestamp()) // 60
+    market_data_request_coordinator.run(
+        ("overview-live-snapshot", minute_bucket, id(results)),
+        priority=PRIORITY_OVERVIEW,
+        callback=lambda: _merge_live_iex_daily_snapshots(
+            live_symbol_map,
+            results,
+        ),
+    )
     return pending
 
 
@@ -735,6 +886,8 @@ def _sync_overview_daily_from_twelve_data(
     aliases: list[dict],
     start_date: date,
     results: dict[str, dict],
+    *,
+    history_audits: dict[str, dict] | None = None,
 ) -> list[dict]:
     provider_symbols = [
         alias["twelvedata_symbol"]
@@ -767,7 +920,21 @@ def _sync_overview_daily_from_twelve_data(
             )
 
     try:
-        rows_by_symbol = fetch_twelve_data_daily_prices_batch(provider_symbols, start_date)
+        batch_start = min(
+            date.fromisoformat(
+                str(
+                    (history_audits or {})
+                    .get(provider_to_alias[symbol]["common_symbol"], {})
+                    .get("repair_start_date")
+                    or start_date
+                )[:10]
+            )
+            for symbol in provider_symbols
+        )
+        rows_by_symbol = fetch_twelve_data_daily_prices_batch(
+            provider_symbols,
+            batch_start,
+        )
     except MarketDataError as exc:
         repository.log_api_request(
             provider="twelvedata",
@@ -824,6 +991,8 @@ def _sync_overview_daily_from_yahoo(
     aliases: list[dict],
     start_date: date,
     results: dict[str, dict],
+    *,
+    history_audits: dict[str, dict] | None = None,
 ) -> list[dict]:
     pending = []
     for alias in aliases:
@@ -834,7 +1003,14 @@ def _sync_overview_daily_from_yahoo(
             continue
 
         try:
-            rows = fetch_yahoo_recent_daily_prices_fast(provider_symbol, start_date=start_date)
+            audit = (history_audits or {}).get(normalized) or {}
+            symbol_start = date.fromisoformat(
+                str(audit.get("repair_start_date") or start_date)[:10]
+            )
+            rows = fetch_yahoo_recent_daily_prices_fast(
+                provider_symbol,
+                start_date=symbol_start,
+            )
             repository.upsert_symbol(normalized)
             updated_rows = repository.upsert_daily_prices(normalized, rows)
             results[normalized].update(

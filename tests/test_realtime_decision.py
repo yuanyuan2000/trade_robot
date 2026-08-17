@@ -86,6 +86,49 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "缺少 2026-08-03 CLOSE"):
                 hub.event_snapshot(["SPY"], trading_date="2026-08-03", event="CLOSE")
 
+    def test_timed_event_rejects_materially_stale_signal_minute(self) -> None:
+        hub = IEXMarketDataHub()
+
+        def fake_bars(
+            symbol,
+            *,
+            timeframe,
+            start=None,
+            end=None,
+            feed="iex",
+            limit=1000,
+            max_pages=1,
+        ):
+            if timeframe == "1Day":
+                return {"data": [{
+                    "timestamp": "2026-08-03T00:00:00Z",
+                    "open": 100,
+                    "high": 101,
+                    "low": 99,
+                    "close": 100,
+                    "volume": 10,
+                }]}
+            return {"data": [{
+                "timestamp": "2026-08-03T13:50:00Z",
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 10,
+            }]}
+
+        with patch(
+            "services.realtime_market_data.fetch_stock_bars",
+            side_effect=fake_bars,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "已滞后 9 分钟"):
+                hub.event_snapshot(
+                    ["SPY"],
+                    trading_date="2026-08-03",
+                    event="10:00",
+                    now=datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc),
+                )
+
     def test_competition_snapshot_can_keep_valid_symbols_and_report_unsupported_iex_symbol(self) -> None:
         hub = IEXMarketDataHub()
 
@@ -120,6 +163,32 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
         _subject, body = render_message(task, result)
         self.assertIn("急跌回避 + ATR 动量轮动", body)
         self.assertIn("BTC/USD", body)
+
+    def test_data_audit_logs_do_not_expand_email_body(self) -> None:
+        result = {
+            "decision": {
+                "trading_date": "2026-08-03",
+                "event": "OPEN",
+                "recommendations": [],
+            },
+            "data_manifest": {"missing": []},
+            "calculation": {"engine_logs": [{
+                "event_type": "DATA_HISTORY_AUDIT",
+                "message": "SLV 历史数据快照 audit-secret-id",
+                "symbol": "SLV",
+                "context": {"snapshot_id": "audit-secret-id"},
+            }]},
+        }
+        task = {
+            "name": "审计日志邮件隔离",
+            "strategy_snapshot": {"design_mode": "visual", "definition": {}},
+            "notification_settings": {},
+        }
+
+        _subject, body = render_message(task, result)
+
+        self.assertNotIn("audit-secret-id", body)
+        self.assertNotIn("DATA_HISTORY_AUDIT", body)
 
     def test_visual_notification_template_exposes_decision_and_indicator_basis(self) -> None:
         task = {

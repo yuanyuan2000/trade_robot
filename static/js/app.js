@@ -610,7 +610,7 @@ async function syncMarketOverviewDaily() {
   overviewDailySyncDone = true;
   if (isMarketOverviewActive()) {
     overviewSummary.textContent = "更新行情中";
-    setStatus("正在更新行情总览；已初始化标的同步分钟数据，其余标的更新日线...", "neutral");
+    setStatus("正在校验并补齐行情总览日线；交易时段同时更新 IEX 当前快照...", "neutral");
   }
   const response = await fetch("/api/market-overview/sync-daily", { method: "POST" });
   const payload = await parseJsonResponse(response);
@@ -1348,11 +1348,25 @@ async function updateCurrentMarketData() {
       : payload.source === "api"
         ? "已从 API 更新"
         : "数据库已完整";
-    if (payload.warning) {
+    const integrity = payload.integrity;
+    if (integrity && !integrity.complete) {
+      const problemDates = [
+        ...(integrity.missing_sessions || []),
+        ...(integrity.incomplete_sessions || []),
+      ];
+      const detail = integrity.validation_error
+        || (problemDates.length
+          ? `仍缺失 ${problemDates.slice(0, 6).join("、")}${problemDates.length > 6 ? " 等交易日" : ""}`
+          : "完整性状态尚未确认");
+      setStatus(`${actionText}，但日线完整性校验未通过：${detail}。`, "warning");
+    } else if (payload.warning) {
       setStatus(payload.warning, "warning");
     } else {
+      const verifiedText = integrity?.expected_last_date
+        ? `；完整日线已校验至 ${integrity.expected_last_date}`
+        : "";
       setStatus(
-        `${actionText}：${payload.symbol} 共 ${payload.data.length} 条数据，范围 ${firstDate} 至 ${lastDate}。`,
+        `${actionText}：${payload.symbol} 共 ${payload.data.length} 条数据，范围 ${firstDate} 至 ${lastDate}${verifiedText}。`,
         "success",
       );
     }
