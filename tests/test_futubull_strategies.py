@@ -52,7 +52,7 @@ class FutubullStrategySourceTests(unittest.TestCase):
 
     def test_data_prepare_hints_cover_every_declared_trigger_symbol(self):
         expected_counts = {
-            "rapid_drop_ratr_rotation.py": 5,
+            "rapid_drop_ratr_rotation.py": 7,
             "rapid_drop_wtme_rotation.py": 7,
             "sevenstar_etf_rotation.py": 8,
         }

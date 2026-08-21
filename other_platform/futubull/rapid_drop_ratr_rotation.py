@@ -5,7 +5,7 @@ class Strategy(StrategyBase):
         self.trigger_symbols()
         self.global_variables()
         self.custom_indicator()
-        self.candidates = [self.candidate_1, self.candidate_2, self.candidate_3, self.candidate_4, self.candidate_5]
+        self.candidates = [self.candidate_1, self.candidate_2, self.candidate_3, self.candidate_4, self.candidate_5, self.candidate_6, self.candidate_7]
         self.risk_off = []
         self.last_risk_date = -1
         self.last_selection_date = -1
@@ -64,6 +64,14 @@ class Strategy(StrategyBase):
             bar_high(symbol=self.candidate_5, bar_type=BarType.D1, select=500, session_type=THType.RTH)
             bar_low(symbol=self.candidate_5, bar_type=BarType.D1, select=500, session_type=THType.RTH)
             bar_close(symbol=self.candidate_5, bar_type=BarType.D1, select=500, session_type=THType.RTH)
+            bar_close(symbol=self.candidate_6, bar_type=BarType.M1, select=2, session_type=THType.RTH)
+            bar_high(symbol=self.candidate_6, bar_type=BarType.D1, select=500, session_type=THType.RTH)
+            bar_low(symbol=self.candidate_6, bar_type=BarType.D1, select=500, session_type=THType.RTH)
+            bar_close(symbol=self.candidate_6, bar_type=BarType.D1, select=500, session_type=THType.RTH)
+            bar_close(symbol=self.candidate_7, bar_type=BarType.M1, select=2, session_type=THType.RTH)
+            bar_high(symbol=self.candidate_7, bar_type=BarType.D1, select=500, session_type=THType.RTH)
+            bar_low(symbol=self.candidate_7, bar_type=BarType.D1, select=500, session_type=THType.RTH)
+            bar_close(symbol=self.candidate_7, bar_type=BarType.D1, select=500, session_type=THType.RTH)
 
     def handle_data(self):
         if not self._parameters_valid():
