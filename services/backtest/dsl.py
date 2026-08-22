@@ -11,7 +11,10 @@ from services.backtest.errors import BacktestValidationError
 
 ALLOWED_NAMES = {"price", "position", "true", "false"}
 HISTORY_FUNCTIONS = {"open", "high", "low", "close", "volume"}
-INDICATOR_FUNCTIONS = {"ma", "ema", "atr", "ratr", "wtme", "rapid_drop"}
+INDICATOR_FUNCTIONS = {
+    "ma", "ema", "atr", "ratr", "wtme", "rapid_drop", "rsi",
+    "macd_line", "macd_signal", "macd_hist",
+}
 ALLOWED_FUNCTIONS = HISTORY_FUNCTIONS | INDICATOR_FUNCTIONS
 _EQUALITY = re.compile(r"(?<![<>=!])=(?!=)")
 _BOOLEAN_WORD = re.compile(r"\b(AND|OR|NOT|TRUE|FALSE)\b", re.IGNORECASE)
@@ -60,11 +63,17 @@ def _validate_function_call(node: ast.Call) -> None:
     expected = {
         "wtme": {2, 3},
         "rapid_drop": {2},
+        "macd_line": {2},
+        "macd_signal": {3},
+        "macd_hist": {3},
     }.get(name, {1})
     if len(node.args) not in expected:
         signatures = {
             "wtme": "wtme(周期, 半衰期[, epsilon])",
             "rapid_drop": "rapid_drop(观察段数, 跌幅阈值%)",
+            "macd_line": "macd_line(快线周期, 慢线周期)",
+            "macd_signal": "macd_signal(快线周期, 慢线周期, 信号周期)",
+            "macd_hist": "macd_hist(快线周期, 慢线周期, 信号周期)",
         }
         signature = signatures.get(name, f"{name}(周期)")
         raise _node_error(node, f"函数参数数量错误，应使用 {signature}。")
@@ -72,7 +81,13 @@ def _validate_function_call(node: ast.Call) -> None:
     period = _numeric_constant(node.args[0])
     if not isinstance(period, int) or not 1 <= period <= 500:
         raise _node_error(node, "周期 n 必须是 1 至 500 的整数，禁止使用 0。")
-    if name == "wtme":
+    if name.startswith("macd_"):
+        periods = [_numeric_constant(argument) for argument in node.args]
+        if not all(isinstance(value, int) and 1 <= value <= 500 for value in periods):
+            raise _node_error(node, "MACD 各周期必须是 1 至 500 的整数。")
+        if int(periods[0]) >= int(periods[1]):
+            raise _node_error(node, "MACD 快线周期必须小于慢线周期。")
+    elif name == "wtme":
         if period < 2:
             raise _node_error(node, "WTME 周期必须是 2 至 500 的整数。")
         half_life = _numeric_constant(node.args[1])
@@ -98,7 +113,12 @@ def _format_argument(value: float | int) -> str:
 
 def _call_lookback(node: ast.Call) -> int:
     name = node.func.id.lower()
-    period = int(_call_arguments(node)[0])
+    arguments = _call_arguments(node)
+    period = int(arguments[0])
+    if name == "macd_line":
+        return int(arguments[1])
+    if name in {"macd_signal", "macd_hist"}:
+        return int(arguments[1]) + int(arguments[2]) - 1
     return period + 1 if name in {"atr", "ratr"} else period
 
 

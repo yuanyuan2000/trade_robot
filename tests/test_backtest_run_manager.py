@@ -19,14 +19,15 @@ class FakeEngine:
         strategy,
         settings,
         *,
-        progress_callback,
-        cancellation_check,
+        dataset=None,
+        progress_callback=None,
+        cancellation_check=None,
     ):
         self.strategy = strategy
         self.settings = settings
         self.progress_callback = progress_callback
         self.cancellation_check = cancellation_check
-        self.dataset = type(
+        self.dataset = dataset or type(
             "Dataset",
             (),
             {"manifest": {"test": True}, "sessions": ["2024-01-02"]},
@@ -106,10 +107,11 @@ class CancellableEngine:
         strategy,
         settings,
         *,
-        progress_callback,
-        cancellation_check,
+        dataset=None,
+        progress_callback=None,
+        cancellation_check=None,
     ):
-        self.dataset = type(
+        self.dataset = dataset or type(
             "Dataset",
             (),
             {"manifest": {"test": True}, "sessions": ["2024-01-02"]},
@@ -187,29 +189,19 @@ class BacktestRunManagerTests(unittest.TestCase):
         )
 
     @patch("services.backtest.service.BacktestEngine", FailingPreflightEngine)
-    def test_preflight_failure_persists_specific_error_log(self) -> None:
-        run = self.manager.start(
-            self.strategy["id"],
-            {
-                **self.strategy["default_settings"],
-                "start_date": "2024-01-02",
-                "end_date": "2024-01-02",
-                "initial_capital": 100,
-                "benchmark": "none",
-            },
-        )
-        deadline = time.monotonic() + 2
-        status = run
-        while time.monotonic() < deadline:
-            status = self.manager.run_status(run["id"])
-            if status["status"] == "failed":
-                break
-            time.sleep(0.01)
-
-        self.assertEqual(status["status"], "failed")
-        logs = backtest_repository.get_logs(run["id"], level="ERROR")
-        self.assertEqual(logs[0]["message"], "公司行动核验失败。")
-        self.assertEqual(logs[0]["context"]["detail"]["provider"], "test")
+    def test_preflight_failure_does_not_create_run_record(self) -> None:
+        with self.assertRaisesRegex(BacktestDataError, "公司行动核验失败"):
+            self.manager.start(
+                self.strategy["id"],
+                {
+                    **self.strategy["default_settings"],
+                    "start_date": "2024-01-02",
+                    "end_date": "2024-01-02",
+                    "initial_capital": 100,
+                    "benchmark": "none",
+                },
+            )
+        self.assertEqual(backtest_repository.list_runs(self.strategy["id"]), [])
 
     @patch("services.backtest.service.BacktestEngine", LiquidatedEngine)
     def test_liquidation_is_completed_with_full_result_and_outcome(self) -> None:

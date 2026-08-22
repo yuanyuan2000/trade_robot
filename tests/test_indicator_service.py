@@ -13,6 +13,8 @@ from services.indicator_service import (
     attach_overview_indicator_values,
     build_indicator_series,
     calculate_indicator_values,
+    calculate_macd_components,
+    calculate_wilder_rsi,
     calculate_rapid_drop_filter,
     calculate_wilder_atr,
     calculate_wtme,
@@ -30,7 +32,62 @@ def sample_rows() -> list[dict]:
     ]
 
 
+def simple_rows(closes: list[float], scale: float = 1.0) -> list[dict]:
+    return [
+        {
+            "date": f"2024-02-{index + 1:02d}",
+            "open": close * scale,
+            "high": close * scale,
+            "low": close * scale,
+            "close": close * scale,
+            "volume": 1,
+        }
+        for index, close in enumerate(closes)
+    ]
+
+
 class IndicatorCalculationTests(unittest.TestCase):
+    def test_rsi_and_macd_catalog_parameters_use_standard_defaults(self) -> None:
+        self.assertEqual(repository.validate_indicator("RSI", {"period": 14}), ("RSI", {"period": 14}))
+        self.assertEqual(
+            repository.validate_indicator("MACD", {}),
+            ("MACD", {"fast_period": 12, "slow_period": 26, "signal_period": 9}),
+        )
+        with self.assertRaisesRegex(ValueError, "快线周期必须小于慢线周期"):
+            repository.validate_indicator("MACD", {"fast_period": 26, "slow_period": 12, "signal_period": 9})
+
+    def test_wilder_rsi_handles_rising_falling_and_flat_prices(self) -> None:
+        rising = simple_rows([100, 101, 102, 103, 104])
+        falling = simple_rows([100, 99, 98, 97, 96])
+        flat = simple_rows([100, 100, 100, 100, 100])
+        self.assertEqual(calculate_wilder_rsi(rising, 3)[-1], 100.0)
+        self.assertEqual(calculate_wilder_rsi(falling, 3)[-1], 0.0)
+        self.assertEqual(calculate_wilder_rsi(flat, 3)[-1], 50.0)
+
+    def test_macd_returns_dif_dea_and_undoubled_histogram(self) -> None:
+        rows = simple_rows([100 + index + (index % 3) for index in range(20)])
+        components = calculate_macd_components(rows, 3, 6, 4)
+        index = next(
+            value for value in range(len(rows) - 1, -1, -1)
+            if components["histogram"][value] is not None
+        )
+        self.assertAlmostEqual(
+            components["histogram"][index],
+            components["line"][index] - components["signal"][index],
+        )
+        series = build_indicator_series(
+            rows,
+            [{
+                "id": 99,
+                "indicator_type": "MACD",
+                "params": {"fast_period": 3, "slow_period": 6, "signal_period": 4},
+            }],
+            price_basis="raw",
+        )[0]
+        point = series["points"][index]
+        self.assertEqual(set(point["components"]), {"line", "signal", "histogram"})
+        self.assertAlmostEqual(point["value"], point["components"]["histogram"])
+
     def test_indicator_catalog_accepts_configurable_atr_periods(self) -> None:
         self.assertEqual(repository.validate_indicator("ATR", {"period": 14}), ("ATR", {"period": 14}))
         self.assertEqual(repository.validate_indicator("ratr", {"period": "21"}), ("RATR", {"period": 21}))
@@ -142,6 +199,7 @@ class IndicatorCalculationTests(unittest.TestCase):
             ("ema", (3,), "EMA", {"period": 3}),
             ("atr", (3,), "ATR", {"period": 3}),
             ("ratr", (3,), "RATR", {"period": 3}),
+            ("rsi", (3,), "RSI", {"period": 3}),
             (
                 "wtme",
                 (3, 2, 1e-8),
@@ -171,6 +229,10 @@ class IndicatorCalculationTests(unittest.TestCase):
                     expected,
                     places=12,
                 )
+        macd = calculate_macd_components(rows, 2, 3, 2)
+        self.assertAlmostEqual(context.resolve_function("macd_line", 2, 3), macd["line"][-1])
+        self.assertAlmostEqual(context.resolve_function("macd_signal", 2, 3, 2), macd["signal"][-1])
+        self.assertAlmostEqual(context.resolve_function("macd_hist", 2, 3, 2), macd["histogram"][-1])
 
     def test_rapid_drop_filter_checks_n_changes_and_includes_latest_bar(self) -> None:
         rows = [
@@ -442,7 +504,10 @@ class MarketOverviewIndicatorRouteTests(unittest.TestCase):
         self.assertIn('<option value="RATR">', html)
         self.assertIn('<option value="WTME">', html)
         self.assertIn('<option value="RAPID_DROP">', html)
+        self.assertIn('<option value="RSI">', html)
+        self.assertIn('<option value="MACD">', html)
         self.assertIn('id="custom-indicator-half-life"', html)
+        self.assertIn('id="custom-indicator-fast-period"', html)
         self.assertIn('id="custom-indicator-threshold"', html)
 
 

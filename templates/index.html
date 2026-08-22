@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260814-01') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260822-01') }}">
   </head>
   <body class="theme-dark">
     <aside class="sidebar">
@@ -230,8 +230,13 @@
                 <option value="RATR">相对 ATR 动量评分</option>
                 <option value="WTME">加权真实波幅动量效率（WTME）</option>
                 <option value="RAPID_DROP">急跌过滤（0/1）</option>
+                <option value="RSI">RSI</option>
+                <option value="MACD">MACD</option>
               </select>
               <input id="custom-indicator-period" type="number" min="2" max="500" value="20" aria-label="指标周期">
+              <label class="compact-indicator-param" hidden><span>快</span><input id="custom-indicator-fast-period" type="number" min="1" max="499" value="12" aria-label="MACD 快线周期" title="MACD 快线周期"></label>
+              <label class="compact-indicator-param" hidden><span>慢</span><input id="custom-indicator-slow-period" type="number" min="2" max="500" value="26" aria-label="MACD 慢线周期" title="MACD 慢线周期"></label>
+              <label class="compact-indicator-param" hidden><span>信号</span><input id="custom-indicator-signal-period" type="number" min="1" max="500" value="9" aria-label="MACD 信号线周期" title="MACD 信号线周期"></label>
               <input id="custom-indicator-half-life" type="number" min="0.1" max="500" step="0.1" value="15" aria-label="WTME 权重半衰期" title="WTME 权重半衰期 h" hidden>
               <input id="custom-indicator-epsilon" type="number" min="0.000000000001" max="0.01" step="0.000000000001" value="0.00000001" aria-label="WTME epsilon" title="WTME epsilon" hidden>
               <input id="custom-indicator-threshold" type="number" min="0.1" max="50" step="0.1" value="5" aria-label="急跌阈值百分比" title="单日急跌阈值（%）" hidden>
@@ -466,16 +471,7 @@
                     <h4 class="field-label-with-help">
                       <span id="backtest-rules-title">交易规则</span>
                       <span class="syntax-help">
-                        <button class="syntax-help-icon" type="button" aria-label="查看非代码策略规则语法">?</button>
-                        <span class="syntax-help-popover" role="tooltip">
-                          <strong>条件公式语法</strong>
-                          <span>变量：<code>price</code> 决策价，<code>position</code> 当前仓位比例，<code>true</code>/<code>false</code>。</span>
-                          <span>行情/基础指标：<code>open(n)</code>、<code>high(n)</code>、<code>low(n)</code>、<code>close(n)</code>、<code>volume(n)</code>、<code>ma(n)</code>、<code>ema(n)</code>、<code>atr(n)</code>、<code>ratr(n)</code>。</span>
-                          <span>扩展指标：<code>wtme(n, h)</code> 或 <code>wtme(n, h, epsilon)</code>；<code>rapid_drop(n, threshold_percent)</code> 命中急跌返回 1，否则返回 0。</span>
-                          <span>运算：<code>+ - * /</code>，比较 <code>&gt; &gt;= &lt; &lt;= = !=</code>，逻辑 <code>AND OR NOT</code>，可使用括号。</span>
-                          <span>时间可填 <code>OPEN</code>、<code>CLOSE</code> 或美东时间 <code>HH:MM</code>。</span>
-                          <span class="syntax-help-example">示例：<code>wtme(40, 15) &gt;= 0 AND rapid_drop(5, 5) = 0</code><br><code>price &lt; close(1) - 2 * atr(14)</code></span>
-                        </span>
+                        <button id="backtest-syntax-help-open" class="syntax-help-icon" type="button" aria-label="查看非代码策略规则语法">?</button>
                       </span>
                     </h4>
                     <button id="backtest-add-rule" type="button">添加规则</button>
@@ -740,10 +736,31 @@
       </div>
     </dialog>
 
-    <script src="{{ url_for('static', filename='js/chart.js', v='20260812-01') }}"></script>
+    <dialog id="backtest-syntax-help-dialog" class="realtime-details-dialog backtest-syntax-help-dialog">
+      <div class="realtime-details-dialog-body">
+        <div class="backtest-dialog-header">
+          <h3>非代码策略公式语法</h3>
+          <button id="backtest-syntax-help-close" type="button" aria-label="关闭语法帮助">×</button>
+        </div>
+        <div class="backtest-syntax-help-content">
+          <section><h4>变量与布尔值</h4><p><code>price</code> 是当前决策价；<code>position</code> 是当前仓位比例（0 到 1）；布尔值使用 <code>true</code>、<code>false</code>。</p></section>
+          <section><h4>历史行情</h4><p><code>open(n)</code>、<code>high(n)</code>、<code>low(n)</code>、<code>close(n)</code>、<code>volume(n)</code>。参数 n 表示向前第 n 根已完成日线，例如 <code>close(1)</code>。</p></section>
+          <section><h4>单值指标</h4><p><code>ma(n)</code>、<code>ema(n)</code>、<code>atr(n)</code>、<code>ratr(n)</code>、<code>rsi(n)</code>。常用默认参数：<code>atr(14)</code>、<code>rsi(14)</code>。</p></section>
+          <section><h4>WTME 与急跌过滤</h4><p><code>wtme(n, h)</code> 或 <code>wtme(n, h, epsilon)</code>；默认示例 <code>wtme(40, 15, 0.00000001)</code>。<code>rapid_drop(n, threshold_percent)</code> 命中急跌返回 1，否则返回 0。</p></section>
+          <section><h4>MACD</h4><p><code>macd_line(fast, slow)</code> 返回 DIF；<code>macd_signal(fast, slow, signal)</code> 返回 DEA；<code>macd_hist(fast, slow, signal)</code> 返回未加倍柱状值 DIF − DEA。默认参数为 12、26、9。</p></section>
+          <section><h4>运算与执行时间</h4><p>支持 <code>+ - * /</code>、<code>&gt; &gt;= &lt; &lt;= = !=</code>、<code>AND OR NOT</code> 和括号。执行时间可填 <code>OPEN</code>、<code>CLOSE</code> 或美东时间 <code>HH:MM</code>。</p></section>
+          <section><h4>示例</h4><pre>rsi(14) &lt; 30 AND price &gt; ma(20)
+macd_hist(12, 26, 9) &gt; 0 AND macd_line(12, 26) &gt; macd_signal(12, 26, 9)
+wtme(40, 15) &gt;= 0 AND rapid_drop(5, 5) = 0
+price &lt; close(1) - 2 * atr(14)</pre></section>
+        </div>
+      </div>
+    </dialog>
+
+    <script src="{{ url_for('static', filename='js/chart.js', v='20260822-01') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260730-02') }}"></script>
-    <script src="{{ url_for('static', filename='js/backtest.js', v='20260805-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest.js', v='20260822-01') }}"></script>
     <script src="{{ url_for('static', filename='js/realtime.js', v='20260814-01') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260814-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260822-01') }}"></script>
   </body>
 </html>

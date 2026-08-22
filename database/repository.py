@@ -905,8 +905,25 @@ def seed_default_indicators() -> None:
 
 def validate_indicator(indicator_type: str, params: dict) -> tuple[str, dict]:
     normalized_type = str(indicator_type or "").strip().upper()
-    if normalized_type not in {"MA", "EMA", "ATR", "RATR", "WTME", "RAPID_DROP"}:
-        raise ValueError("仅支持 MA、EMA、ATR、相对 ATR、WTME 和急跌过滤指标。")
+    if normalized_type not in {"MA", "EMA", "ATR", "RATR", "WTME", "RAPID_DROP", "RSI", "MACD"}:
+        raise ValueError("仅支持 MA、EMA、ATR、相对 ATR、WTME、急跌过滤、RSI 和 MACD 指标。")
+
+    if normalized_type == "MACD":
+        try:
+            fast_period = int(params.get("fast_period", 12))
+            slow_period = int(params.get("slow_period", 26))
+            signal_period = int(params.get("signal_period", 9))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("MACD 快线、慢线和信号线周期必须是整数。") from exc
+        if not all(1 <= value <= 500 for value in (fast_period, slow_period, signal_period)):
+            raise ValueError("MACD 各周期必须在 1 到 500 之间。")
+        if fast_period >= slow_period:
+            raise ValueError("MACD 快线周期必须小于慢线周期。")
+        return normalized_type, {
+            "fast_period": fast_period,
+            "slow_period": slow_period,
+            "signal_period": signal_period,
+        }
 
     try:
         period = int(params.get("period"))
@@ -999,6 +1016,11 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
     params_json = normalize_params(normalized_params)
     if normalized_type == "RATR":
         default_name = f"相对ATR{normalized_params['period']}"
+    elif normalized_type == "MACD":
+        default_name = (
+            f"MACD({normalized_params['fast_period']},"
+            f"{normalized_params['slow_period']},{normalized_params['signal_period']})"
+        )
     elif normalized_type == "WTME":
         default_name = (
             f"WTME{normalized_params['period']}"
@@ -1011,7 +1033,15 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
         )
     else:
         default_name = f"{normalized_type}{normalized_params['period']}"
-    code = f"{normalized_type}{normalized_params['period']}"
+    code = normalized_type
+    if normalized_type == "MACD":
+        code += (
+            f"F{normalized_params['fast_period']}"
+            f"S{normalized_params['slow_period']}"
+            f"G{normalized_params['signal_period']}"
+        )
+    else:
+        code += str(normalized_params["period"])
     if normalized_type == "WTME":
         half_life_code = format(normalized_params["half_life"], ".15g")
         epsilon_code = format(normalized_params["epsilon"], ".15g")
@@ -1053,6 +1083,10 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
                     if normalized_type == "WTME"
                     else "近 N 个连续变化段任一跌幅达到阈值时输出 1，否则输出 0"
                     if normalized_type == "RAPID_DROP"
+                    else "Wilder 相对强弱指标"
+                    if normalized_type == "RSI"
+                    else "DIF、DEA 与未加倍柱状值"
+                    if normalized_type == "MACD"
                     else "用户创建指标"
                 ),
                 now,

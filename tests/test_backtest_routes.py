@@ -8,9 +8,42 @@ from unittest.mock import patch
 import app as app_module
 import database.db as main_db
 from database import backtest_repository
+import services.backtest.service as backtest_service
 
 
 class BacktestRouteTests(unittest.TestCase):
+    def test_recent_data_issue_repair_uses_bounded_daily_refresh(self) -> None:
+        with (
+            patch.object(backtest_service, "latest_completed_session_dates", return_value=["2026-08-21"]),
+            patch.object(backtest_service, "validate_saved_strategy", return_value={
+                "issues": [{
+                    "symbol": "SPY",
+                    "type": "daily",
+                    "missing_date": "2026-08-10",
+                    "repairable": True,
+                }],
+            }),
+            patch.object(backtest_service, "refresh_symbol_daily_history", return_value={"updated_rows": 1}) as refresh,
+        ):
+            result = backtest_service.repair_saved_strategy_data(1, "spy")
+        refresh.assert_called_once_with("SPY", start_date="2026-08-10")
+        self.assertEqual(result["data_type"], "日线")
+
+    def test_old_data_issue_is_not_automatically_repairable(self) -> None:
+        with patch.object(backtest_service, "latest_completed_session_dates", return_value=["2026-08-21"]):
+            self.assertFalse(backtest_service._is_recent_repairable_issue({
+                "symbol": "SPY",
+                "type": "daily",
+                "missing_date": "2026-06-01",
+            }))
+
+    def test_backtest_page_uses_click_help_dialog_and_larger_selection_hitbox(self) -> None:
+        html = self.client.get("/").get_data(as_text=True)
+        script = (Path(app_module.app.static_folder) / "js" / "backtest.js").read_text(encoding="utf-8")
+        self.assertIn('id="backtest-syntax-help-dialog"', html)
+        self.assertIn('id="backtest-syntax-help-open"', html)
+        self.assertIn("bt-result-select-hitbox", script)
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.database_path = Path(self.temp_dir.name) / "market.sqlite"

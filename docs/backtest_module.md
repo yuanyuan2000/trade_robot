@@ -78,7 +78,9 @@ WHEN [OPEN | CLOSE | HH:MM]
 - 算术：`+`、`-`、`*`、`/`
 - 当前量：`price`、`position`
 - 已完成日线：`open(n)`、`high(n)`、`low(n)`、`close(n)`、`volume(n)`
-- 指标：`ma(n)`、`ema(n)`、`atr(n)`、`ratr(n)`
+- 指标：`ma(n)`、`ema(n)`、`atr(n)`、`ratr(n)`、`rsi(n)`
+- MACD：`macd_line(fast, slow)` 返回 DIF，`macd_signal(fast, slow, signal)` 返回 DEA，
+  `macd_hist(fast, slow, signal)` 返回未加倍的 `DIF - DEA`
 - WTME：`wtme(n, h)` 或 `wtme(n, h, epsilon)`
 - 急跌过滤：`rapid_drop(n, threshold_percent)`，最近 n 个连续价格变化段任一跌幅达到阈值
   时返回 `1`，否则返回 `0`
@@ -100,6 +102,8 @@ Infinity 都会被拒绝。
 price > ma(20) AND position < 0.5
 (price - close(5)) / atr(5) > 1.2
 close(1) >= ema(20) OR atr(14) < 3
+rsi(14) < 30 AND price > ma(20)
+macd_hist(12, 26, 9) > 0
 wtme(40, 15) >= 0 AND rapid_drop(5, 5) = 0
 ```
 
@@ -364,6 +368,7 @@ WAL 和 busy timeout。
 | `GET/PATCH/DELETE /api/backtest/strategies/{id}` | 查看、修改、永久删除 |
 | `POST /api/backtest/strategies/{id}/duplicate` | 复制 |
 | `POST /api/backtest/strategies/{id}/validate` | 验证已保存策略 |
+| `POST /api/backtest/strategies/{id}/repair-recent-data` | 补齐验证发现的最近 30 个自然日内单标的缺口 |
 | `GET /api/backtest/code-strategies` | 代码策略目录和参数 schema |
 | `GET/POST /api/backtest/strategies/{id}/runs` | 运行历史、启动后台运行 |
 | `GET /api/backtest/runs/{id}` | 运行状态 |
@@ -378,6 +383,14 @@ WAL 和 busy timeout。
 策略 PATCH 应带当前 `revision`。revision 不一致返回 409，避免两个页面互相覆盖。
 
 ## 10. 验证
+
+页面“验证”先校验结构、公式和参数，再用与运行相同的严格数据加载器检查策略标的、附加
+标的、比较基准、预热日线、具体事件分钟线、交易日历、公司行动和价格口径。若缺口位于
+相对最新已完成美股交易日最近 30 个自然日内，前端会显示当前标的并调用受限补齐接口，
+完成后重新执行全量预检。更早缺口、数据源失败或复检仍缺失时保持失败并给出标的与日期。
+
+直接点击“运行”只执行同一预检，不会自动修改行情。预检失败时接口在创建运行记录之前
+返回错误；预检成功的数据集直接交给后台 worker，避免检查与执行读取不同快照。
 
 完整单元测试：
 

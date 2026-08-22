@@ -390,7 +390,7 @@ function drawChart() {
     drawOscillatorIndicators(ctx, oscillatorPlot, oscillatorSeries, theme);
   }
   drawTrendlines(ctx, plot, priceRange, theme);
-  drawCrosshair(ctx, plot, visible, priceRange, theme, oscillatorPlot || plot);
+  drawCrosshair(ctx, plot, visible, priceRange, theme, oscillatorPlot || plot, oscillatorPlot);
   renderIndicatorLegend();
   updateTrendlineLegendPlacement();
 }
@@ -502,20 +502,19 @@ function drawTimeAxis(ctx, plot, visible, theme) {
   }
 }
 
-function drawCrosshair(ctx, plot, visible, priceRange, theme, timeAxisPlot = plot) {
+function drawCrosshair(ctx, plot, visible, priceRange, theme, timeAxisPlot = plot, oscillatorPlot = null) {
   if (chartState.hoverX === null || chartState.hoverY === null) {
     return;
   }
-  if (chartState.hoverY < plot.top || chartState.hoverY > plot.bottom) {
+  if (chartState.hoverY < plot.top || chartState.hoverY > timeAxisPlot.bottom) {
     return;
   }
 
   const x = clamp(chartState.hoverX, plot.left, plot.right);
-  const y = clamp(chartState.hoverY, plot.top, plot.bottom);
-  const price = yToPrice(y, plot, priceRange);
-  if (!Number.isFinite(price)) {
-    return;
-  }
+  const inPricePlot = chartState.hoverY <= plot.bottom;
+  const activePlot = inPricePlot ? plot : oscillatorPlot;
+  if (!activePlot) return;
+  const y = clamp(chartState.hoverY, activePlot.top, activePlot.bottom);
   const slot = plot.width / chartState.visibleCount;
   const visibleIndex = clamp(
     Math.floor((x - plot.left) / slot),
@@ -526,21 +525,38 @@ function drawCrosshair(ctx, plot, visible, priceRange, theme, timeAxisPlot = plo
 
   ctx.strokeStyle = theme.crosshair;
   ctx.setLineDash([4, 4]);
-  drawLine(ctx, x, plot.top, x, plot.bottom);
-  drawLine(ctx, plot.left, y, plot.right, y);
+  drawLine(ctx, x, plot.top, x, timeAxisPlot.bottom);
+  drawLine(ctx, activePlot.left, y, activePlot.right, y);
   ctx.setLineDash([]);
 
-  drawCrosshairAxisLabels(
-    ctx,
-    plot,
-    visible,
-    theme,
-    x,
-    y,
-    price,
-    candle,
-    timeAxisPlot.bottom,
-  );
+  if (inPricePlot) {
+    const price = yToPrice(y, plot, priceRange);
+    if (Number.isFinite(price)) {
+      drawCrosshairAxisLabels(ctx, plot, visible, theme, x, y, price, candle, timeAxisPlot.bottom);
+    }
+  } else {
+    drawCrosshairDateLabel(ctx, plot, theme, x, candle, timeAxisPlot.bottom);
+  }
+}
+
+function drawCrosshairDateLabel(ctx, plot, theme, x, candle, timeAxisBottom) {
+  const dateText = crosshairDateText(candle);
+  if (!dateText) return;
+  const labelHeight = 20;
+  ctx.save();
+  ctx.font = "12px system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+  const dateWidth = ctx.measureText(dateText).width + 14;
+  const dateX = clamp(x - dateWidth / 2, plot.left, plot.right - dateWidth);
+  const dateY = timeAxisBottom + 6;
+  ctx.fillStyle = theme.background;
+  ctx.strokeStyle = theme.crosshair;
+  ctx.fillRect(dateX, dateY, dateWidth, labelHeight);
+  ctx.strokeRect(dateX, dateY, dateWidth, labelHeight);
+  ctx.fillStyle = theme.label;
+  ctx.textAlign = "center";
+  ctx.fillText(dateText, dateX + dateWidth / 2, dateY + labelHeight / 2);
+  ctx.restore();
 }
 
 function drawCrosshairAxisLabels(ctx, plot, visible, theme, x, y, price, candle, timeAxisBottom) {
@@ -640,7 +656,7 @@ function drawIndicators(ctx, plot, priceRange) {
 }
 
 function isOscillatorIndicator(series) {
-  return ["ATR", "RATR", "WTME", "RAPID_DROP"].includes(series.indicator_type);
+  return ["ATR", "RATR", "WTME", "RAPID_DROP", "RSI", "MACD"].includes(series.indicator_type);
 }
 
 function getVisibleOscillatorSeries() {
@@ -656,11 +672,17 @@ function drawOscillatorIndicators(ctx, plot, seriesList, theme) {
     RATR: getIndicatorRange(seriesList, "RATR", true),
     WTME: getIndicatorRange(seriesList, "WTME", true),
     RAPID_DROP: getIndicatorRange(seriesList, "RAPID_DROP", true),
+    RSI: seriesList.some((series) => series.indicator_type === "RSI") ? { min: 0, max: 100 } : null,
+    MACD: getIndicatorRange(seriesList, "MACD", true),
   };
 
   for (const series of seriesList) {
     const range = ranges[series.indicator_type];
     if (!range) continue;
+    if (series.indicator_type === "MACD") {
+      drawMacdSeries(ctx, plot, series, range, theme, slot);
+      continue;
+    }
     ctx.strokeStyle = series.color;
     ctx.lineWidth = 1.6;
     ctx.beginPath();
@@ -684,7 +706,7 @@ function drawOscillatorIndicators(ctx, plot, seriesList, theme) {
     ctx.stroke();
   }
 
-  for (const indicatorType of ["RATR", "WTME"]) {
+  for (const indicatorType of ["RATR", "WTME", "MACD"]) {
     const range = ranges[indicatorType];
     if (range && range.min < 0 && range.max > 0) {
       ctx.save();
@@ -695,7 +717,47 @@ function drawOscillatorIndicators(ctx, plot, seriesList, theme) {
       ctx.restore();
     }
   }
+  if (ranges.RSI) {
+    ctx.save();
+    ctx.strokeStyle = theme.axis;
+    ctx.setLineDash([3, 3]);
+    drawLine(ctx, plot.left, priceToY(70, plot, ranges.RSI), plot.right, priceToY(70, plot, ranges.RSI));
+    drawLine(ctx, plot.left, priceToY(30, plot, ranges.RSI), plot.right, priceToY(30, plot, ranges.RSI));
+    ctx.restore();
+  }
   drawOscillatorAxes(ctx, plot, ranges, theme);
+}
+
+function drawMacdSeries(ctx, plot, series, range, theme, slot) {
+  const histogram = series.componentValues?.histogram || series.values;
+  const zeroY = priceToY(0, plot, range);
+  for (let dataIndex = chartState.firstVisible; dataIndex < chartState.firstVisible + chartState.visibleCount; dataIndex += 1) {
+    const value = histogram[dataIndex];
+    if (!Number.isFinite(value) || dataIndex >= chartState.candles.length) continue;
+    const visibleIndex = dataIndex - chartState.firstVisible;
+    const x = plot.left + slot * (visibleIndex + 0.5);
+    const y = priceToY(value, plot, range);
+    ctx.fillStyle = value >= 0 ? theme.up : theme.down;
+    ctx.globalAlpha = 0.48;
+    ctx.fillRect(x - Math.max(1, slot * 0.28), Math.min(y, zeroY), Math.max(2, slot * 0.56), Math.max(1, Math.abs(zeroY - y)));
+  }
+  ctx.globalAlpha = 1;
+  const drawComponent = (values, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let drawing = false;
+    for (let dataIndex = chartState.firstVisible; dataIndex < chartState.firstVisible + chartState.visibleCount; dataIndex += 1) {
+      const value = values?.[dataIndex];
+      if (!Number.isFinite(value) || dataIndex >= chartState.candles.length) { drawing = false; continue; }
+      const x = plot.left + slot * (dataIndex - chartState.firstVisible + 0.5);
+      const y = priceToY(value, plot, range);
+      if (!drawing) { ctx.moveTo(x, y); drawing = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  };
+  drawComponent(series.componentValues?.line, series.color);
+  drawComponent(series.componentValues?.signal, theme.danger);
 }
 
 function getIndicatorRange(seriesList, indicatorType, includeZero = false) {
@@ -703,7 +765,11 @@ function getIndicatorRange(seriesList, indicatorType, includeZero = false) {
   for (const series of seriesList) {
     if (series.indicator_type !== indicatorType) continue;
     for (let index = chartState.firstVisible; index < chartState.firstVisible + chartState.visibleCount; index += 1) {
-      if (Number.isFinite(series.values[index])) values.push(series.values[index]);
+      if (indicatorType === "MACD") {
+        for (const component of Object.values(series.componentValues || {})) {
+          if (Number.isFinite(component[index])) values.push(component[index]);
+        }
+      } else if (Number.isFinite(series.values[index])) values.push(series.values[index]);
     }
   }
   if (!values.length) return null;
@@ -751,6 +817,10 @@ function drawOscillatorAxes(ctx, plot, ranges, theme) {
       ctx.textAlign = "left";
       ctx.fillText(value.toFixed(1), plot.left + 8, y);
     }
+    if (ranges.RSI) {
+      ctx.textAlign = "left";
+      ctx.fillText((100 - index * 50).toFixed(0), plot.left + 8, y);
+    }
   }
   ctx.textBaseline = "top";
   if (ranges.ATR) {
@@ -768,6 +838,14 @@ function drawOscillatorAxes(ctx, plot, ranges, theme) {
   if (ranges.RAPID_DROP) {
     ctx.textAlign = "left";
     ctx.fillText("急跌 0/1", plot.left + 6, plot.top + (ranges.ATR ? 18 : 4));
+  }
+  if (ranges.RSI) {
+    ctx.textAlign = "left";
+    ctx.fillText("RSI", plot.left + 6, plot.top + 4);
+  }
+  if (ranges.MACD) {
+    ctx.textAlign = "right";
+    ctx.fillText("MACD", plot.right - 6, plot.top + 4);
   }
 }
 
@@ -1017,12 +1095,26 @@ function drawEmptyState(ctx, width, height) {
 }
 
 function updateHover(offsetX, offsetY) {
-  const plot = getPlotArea();
+  const fullPlot = getPlotArea();
+  const oscillatorSeries = getVisibleOscillatorSeries();
+  const oscillatorHeight = oscillatorSeries.length
+    ? Math.max(100, Math.min(150, fullPlot.height * 0.28)) : 0;
+  const oscillatorGap = oscillatorSeries.length ? 16 : 0;
+  const plot = oscillatorSeries.length ? {
+    ...fullPlot,
+    bottom: fullPlot.bottom - oscillatorHeight - oscillatorGap,
+    height: fullPlot.height - oscillatorHeight - oscillatorGap,
+  } : fullPlot;
+  const oscillatorPlot = oscillatorSeries.length ? {
+    ...fullPlot,
+    top: plot.bottom + oscillatorGap,
+    height: oscillatorHeight,
+  } : null;
   if (
     offsetX < plot.left
     || offsetX > plot.right
     || offsetY < plot.top
-    || offsetY > plot.bottom
+    || offsetY > (oscillatorPlot?.bottom || plot.bottom)
   ) {
     chartState.hoverIndex = null;
     chartState.hoverX = null;
@@ -1051,12 +1143,8 @@ function updateHover(offsetX, offsetY) {
   chartState.hoverY = offsetY;
   const visible = getVisibleCandles();
   const priceRange = getPriceRange(visible);
-  const trendlineHit = findTrendlineHit(
-    offsetX,
-    offsetY,
-    plot,
-    priceRange,
-  );
+  const inOscillator = Boolean(oscillatorPlot && offsetY >= oscillatorPlot.top);
+  const trendlineHit = inOscillator ? null : findTrendlineHit(offsetX, offsetY, plot, priceRange);
   chartState.hoverTrendlineId = trendlineHit?.id || null;
   if (trendlineHit) {
     hideOhlcvTooltip();
@@ -1067,6 +1155,12 @@ function updateHover(offsetX, offsetY) {
   }
 
   hideTrendlineTooltip();
+  if (inOscillator) {
+    showIndicatorTooltip(dataIndex, offsetX, offsetY);
+    renderIndicatorLegend();
+    drawChart();
+    return;
+  }
   const candleCenterX = plot.left + slot * (visibleIndex + 0.5);
   const candle = chartState.candles[dataIndex];
   if (isCandleHit(candle, candleCenterX, offsetX, offsetY, slot, plot, priceRange)) {
@@ -1076,6 +1170,27 @@ function updateHover(offsetX, offsetY) {
   }
   renderIndicatorLegend();
   drawChart();
+}
+
+function showIndicatorTooltip(dataIndex, offsetX, offsetY) {
+  const candle = chartState.candles[dataIndex];
+  const dateText = crosshairDateText(candle);
+  const rows = getVisibleOscillatorSeries().map((series) => {
+    if (series.indicator_type === "MACD") {
+      const components = series.componentValues || {};
+      return `<span>${escapeHtml(series.name)}</span><b>DIF ${formatIndicatorValue(components.line?.[dataIndex])} · DEA ${formatIndicatorValue(components.signal?.[dataIndex])} · 柱 ${formatIndicatorValue(components.histogram?.[dataIndex])}</b>`;
+    }
+    return `<span>${escapeHtml(series.name)}</span><b>${formatIndicatorValue(series.values[dataIndex])}</b>`;
+  }).join("");
+  chartState.tooltip.innerHTML = `
+    <strong>${escapeHtml(periodLabels[chartState.period])} · ${escapeHtml(dateText)}</strong>
+    <div class="indicator-tooltip-grid">${rows}</div>
+  `;
+  positionChartTooltip(chartState.tooltip, offsetX, offsetY);
+}
+
+function formatIndicatorValue(value) {
+  return Number.isFinite(value) ? Number(value).toFixed(4).replace(/0+$/, "").replace(/\.$/, "") : "—";
 }
 
 function showTooltip(candle, offsetX, offsetY) {
@@ -1293,6 +1408,7 @@ function recalculateIndicators() {
   chartState.indicatorSeries = chartState.indicators.map((indicator) => ({
     ...indicator,
     values: alignIndicatorPoints(chartState.candles, indicator.points || []),
+    componentValues: alignIndicatorComponents(chartState.candles, indicator.points || []),
   }));
 }
 
@@ -1303,6 +1419,16 @@ function indicatorBarKey(item) {
 function alignIndicatorPoints(candles, points) {
   const byBar = new Map(points.map((point) => [indicatorBarKey(point), point.value]));
   return candles.map((candle) => byBar.get(indicatorBarKey(candle)) ?? null);
+}
+
+function alignIndicatorComponents(candles, points) {
+  const names = new Set(points.flatMap((point) => Object.keys(point.components || {})));
+  const result = {};
+  for (const name of names) {
+    const byBar = new Map(points.map((point) => [indicatorBarKey(point), point.components?.[name]]));
+    result[name] = candles.map((candle) => byBar.get(indicatorBarKey(candle)) ?? null);
+  }
+  return result;
 }
 
 function indicatorPriceBasisLabel(priceBasis) {
@@ -1327,6 +1453,9 @@ function renderIndicatorLegend() {
   const valueIndex = getLegendValueIndex();
   chartState.legend.innerHTML = chartState.indicatorSeries.map((series) => {
     const value = series.values[valueIndex];
+    const displayValue = series.indicator_type === "MACD"
+      ? `DIF ${formatIndicatorValue(series.componentValues?.line?.[valueIndex])} · DEA ${formatIndicatorValue(series.componentValues?.signal?.[valueIndex])} · 柱 ${formatIndicatorValue(series.componentValues?.histogram?.[valueIndex])}`
+      : value == null ? "-" : formatPrice(value);
     const visibilityClass = series.visible ? "" : " is-hidden";
     const favoriteClass = series.is_favorite ? " is-favorite" : "";
     const basis = indicatorPriceBasisLabel(series.price_basis);
@@ -1341,7 +1470,7 @@ function renderIndicatorLegend() {
           ${starIcon(series.is_favorite)}
         </button>
         <span class="legend-name" title="服务端统一计算 · ${escapeHtml(basis)} · ${state}">${escapeHtml(series.name)}<small>${escapeHtml(basis)}${series.is_provisional ? " · 盘中" : ""}</small></span>
-        <span class="legend-value">${value == null ? "-" : formatPrice(value)}</span>
+        <span class="legend-value">${displayValue}</span>
         <button class="legend-button legend-remove" type="button" data-action="remove" title="移除">×</button>
       </div>
     `;

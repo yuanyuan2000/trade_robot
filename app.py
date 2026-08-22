@@ -63,6 +63,7 @@ from services.backtest.service import (
     create_default_strategy,
     create_strategy as create_backtest_strategy_service,
     duplicate_strategy,
+    repair_saved_strategy_data,
     run_manager as backtest_run_manager,
     update_strategy as update_backtest_strategy_service,
     validate_saved_strategy,
@@ -1338,6 +1339,18 @@ def duplicate_backtest_strategy(strategy_id: int):
 def validate_backtest_strategy(strategy_id: int):
     try:
         return jsonify(validate_saved_strategy(strategy_id))
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route(
+    "/api/backtest/strategies/<int:strategy_id>/repair-recent-data",
+    methods=["POST"],
+)
+def repair_backtest_strategy_data(strategy_id: int):
+    payload = request.get_json(silent=True) or {}
+    try:
+        return jsonify(repair_saved_strategy_data(strategy_id, payload.get("symbol", "")))
     except Exception as exc:
         return backtest_error_response(exc)
 

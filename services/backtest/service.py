@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import threading
 import time
 
@@ -14,9 +14,13 @@ from services.backtest.code_strategies import (
 from services.backtest.engine import BacktestEngine
 from services.backtest.errors import (
     BacktestCancelled,
+    BacktestDataError,
     BacktestError,
     BacktestValidationError,
 )
+from services.intraday_import_service import import_symbol_history
+from services.market_data_integrity import latest_completed_session_dates
+from services.market_data_service import refresh_symbol_daily_history
 from services.backtest.validation import (
     default_strategy_payload,
     validate_settings,
@@ -128,13 +132,117 @@ def duplicate_strategy(strategy_id: int, name: str | None = None) -> dict:
     return create_strategy(payload)
 
 
+def _preflight_engine(strategy: dict, settings: dict) -> BacktestEngine:
+    return BacktestEngine(strategy, settings)
+
+
+def _validated_saved_strategy(strategy: dict) -> dict:
+    validated_fields = validate_strategy_payload(strategy)
+    return _validate_code_configuration({**strategy, **validated_fields})
+
+
+def _issue_dates(issue: dict) -> list[str]:
+    values = []
+    for key in ("missing_date", "at", "start_date"):
+        value = str(issue.get(key) or "")[:10]
+        if value:
+            values.append(value)
+    for segment in issue.get("segments") or []:
+        for key in ("start_date", "end_date"):
+            value = str(segment.get(key) or "")[:10]
+            if value:
+                values.append(value)
+    return values
+
+
+def _is_recent_repairable_issue(issue: dict) -> bool:
+    repairable_types = {"daily", "daily_missing", "daily_incomplete", "minute"}
+    if issue.get("type") not in repairable_types or not issue.get("symbol"):
+        return False
+    dates = _issue_dates(issue)
+    if not dates:
+        return False
+    try:
+        latest_session = date.fromisoformat(latest_completed_session_dates(1)[-1])
+        cutoff = latest_session - timedelta(days=30)
+        parsed = [date.fromisoformat(value) for value in dates]
+    except (ValueError, IndexError):
+        return False
+    return min(parsed) >= cutoff and max(parsed) <= latest_session
+
+
+def _data_issue_payload(exc: BacktestDataError) -> list[dict]:
+    raw = exc.detail if isinstance(exc.detail, list) else [exc.detail or {}]
+    return [
+        {
+            **dict(item),
+            "message": exc.message,
+            "repairable": _is_recent_repairable_issue(dict(item)),
+        }
+        for item in raw
+        if isinstance(item, dict)
+    ] or [{"message": exc.message, "repairable": False}]
+
+
 def validate_saved_strategy(strategy_id: int) -> dict:
     strategy = backtest_repository.get_strategy(strategy_id)
-    validated = _validate_code_configuration(validate_strategy_payload(strategy))
+    validated = _validated_saved_strategy(strategy)
+    settings = validate_settings(validated.get("default_settings"))
+    try:
+        _preflight_engine(validated, settings)
+    except BacktestDataError as exc:
+        issues = _data_issue_payload(exc)
+        return {
+            "ok": True,
+            "strategy": validated,
+            "structure_valid": True,
+            "data_complete": False,
+            "issues": issues,
+            "message": exc.message,
+        }
     return {
         "ok": True,
         "strategy": validated,
-        "message": "策略结构、公式和参数校验通过；行情完整性将在运行前检查。",
+        "structure_valid": True,
+        "data_complete": True,
+        "issues": [],
+        "message": "策略结构、公式、参数和行情完整性校验通过。",
+    }
+
+
+def repair_saved_strategy_data(strategy_id: int, symbol: str) -> dict:
+    normalized = str(symbol or "").strip().upper()
+    report = validate_saved_strategy(strategy_id)
+    issue = next(
+        (
+            item for item in report.get("issues", [])
+            if item.get("symbol") == normalized and item.get("repairable")
+        ),
+        None,
+    )
+    if issue is None:
+        raise BacktestValidationError("该标的当前没有可自动补齐的最近 30 日行情缺口。")
+    dates = _issue_dates(issue)
+    start_date = min(dates)
+    end_date = max(dates)
+    if issue.get("type") == "minute":
+        end_exclusive = (date.fromisoformat(end_date) + timedelta(days=1)).isoformat()
+        result = import_symbol_history(
+            normalized,
+            start=f"{start_date}T00:00:00Z",
+            end=f"{end_exclusive}T00:00:00Z",
+        )
+        data_type = "分钟线"
+    else:
+        result = refresh_symbol_daily_history(normalized, start_date=start_date)
+        data_type = "日线"
+    return {
+        "ok": True,
+        "symbol": normalized,
+        "data_type": data_type,
+        "start_date": start_date,
+        "end_date": end_date,
+        "result": result,
     }
 
 
@@ -228,8 +336,12 @@ class BacktestRunManager:
             **(settings or {}),
         }
         validated_settings = validate_settings(merged_settings)
+        validated_strategy = _validated_saved_strategy(strategy)
+        # A direct run is deliberately read-only: fail before creating a run
+        # record and never repair market data implicitly.
+        preflight = _preflight_engine(validated_strategy, validated_settings)
         run = backtest_repository.create_run(
-            strategy,
+            validated_strategy,
             validated_settings,
             configuration_summary=build_run_configuration_summary(
                 strategy, validated_settings
@@ -243,13 +355,14 @@ class BacktestRunManager:
             "trades": [],
             "logs": [],
             "last_db_update": 0.0,
+            "dataset": preflight.dataset,
         }
         with self._lock:
             self._states[run["id"]] = state
         self._get_executor().submit(
             self._execute,
             run["id"],
-            strategy,
+            validated_strategy,
             validated_settings,
         )
         return run
@@ -285,6 +398,7 @@ class BacktestRunManager:
             engine = BacktestEngine(
                 strategy,
                 settings,
+                dataset=state.pop("dataset", None),
                 progress_callback=progress,
                 cancellation_check=state["cancel"].is_set,
             )

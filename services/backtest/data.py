@@ -17,6 +17,7 @@ from services.backtest.errors import BacktestDataError, BacktestValidationError
 from services.backtest.market_calendar import ensure_market_sessions
 from services.indicator_service import (
     WTME_DEFAULT_EPSILON,
+    calculate_macd_components,
     calculate_indicator_values,
 )
 
@@ -117,7 +118,7 @@ class ExpressionContext:
                     f"{self.symbol} 在 {self.trading_date} 之前没有足够数据计算 {name}({period})。"
                 )
             return float(rows[-period][name])
-        if name in {"ma", "ema", "atr"}:
+        if name in {"ma", "ema", "atr", "rsi"}:
             rows = self.dataset.indicator_history(
                 self.symbol,
                 self.trading_date,
@@ -140,6 +141,24 @@ class ExpressionContext:
                     float(arguments[1]) if name == "rapid_drop" else None
                 ),
             )
+        elif name in {"macd_line", "macd_signal", "macd_hist"}:
+            rows = self.dataset.indicator_history(
+                self.symbol,
+                self.trading_date,
+                include_current=self.event == "CLOSE",
+            )
+            fast_period = int(arguments[0])
+            slow_period = int(arguments[1])
+            signal_period = int(arguments[2]) if len(arguments) == 3 else 9
+            components = calculate_macd_components(
+                rows, fast_period, slow_period, signal_period
+            )
+            component_name = {
+                "macd_line": "line",
+                "macd_signal": "signal",
+                "macd_hist": "histogram",
+            }[name]
+            values = components[component_name]
         else:
             raise BacktestValidationError(f"不支持指标函数 {name}。")
         value = values[-1] if values else None

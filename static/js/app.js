@@ -32,6 +32,9 @@ const favoriteIndicators = document.getElementById("favorite-indicators");
 const customIndicatorForm = document.getElementById("custom-indicator-form");
 const customIndicatorType = document.getElementById("custom-indicator-type");
 const customIndicatorPeriod = document.getElementById("custom-indicator-period");
+const customIndicatorFastPeriod = document.getElementById("custom-indicator-fast-period");
+const customIndicatorSlowPeriod = document.getElementById("custom-indicator-slow-period");
+const customIndicatorSignalPeriod = document.getElementById("custom-indicator-signal-period");
 const customIndicatorHalfLife = document.getElementById("custom-indicator-half-life");
 const customIndicatorEpsilon = document.getElementById("custom-indicator-epsilon");
 const customIndicatorThreshold = document.getElementById("custom-indicator-threshold");
@@ -772,7 +775,11 @@ function renderMarketOverviewTable(items) {
             ? `近 ${indicator.params.period} 个连续变化段任一跌幅 ≤ -${indicator.params.threshold_percent}% 时为 1，否则为 0（包含最新未结束 K 线）`
             : indicator.indicator_type === "ATR"
               ? `Wilder ATR(${indicator.params.period})`
-              : `${indicator.indicator_type}(${indicator.params.period})`;
+              : indicator.indicator_type === "RSI"
+                ? `Wilder RSI(${indicator.params.period})`
+                : indicator.indicator_type === "MACD"
+                  ? `MACD(${indicator.params.fast_period}, ${indicator.params.slow_period}, ${indicator.params.signal_period}) 柱状值 DIF - DEA`
+                  : `${indicator.indicator_type}(${indicator.params.period})`;
       const title = `${formula}；${basisLabel}；数据日 ${reading.date || "-"}`
         + `${reading.as_of ? `；截至 ${reading.as_of}` : ""}`
         + `${provisional ? "；包含未收线 K 线，数值会变化" : ""}`;
@@ -1213,7 +1220,7 @@ function formatOverviewIndicator(value, indicator) {
   if (indicator.indicator_type === "RAPID_DROP") {
     return number >= 0.5 ? "1" : "0";
   }
-  if (["RATR", "WTME"].includes(indicator.indicator_type)) {
+  if (["RATR", "WTME", "MACD"].includes(indicator.indicator_type)) {
     return `${number >= 0 ? "+" : ""}${number.toFixed(2)}`;
   }
   return number.toLocaleString("en-US", {
@@ -1952,7 +1959,11 @@ async function createAndAddIndicator(event) {
 
   const indicatorType = customIndicatorType.value;
   const period = Number(customIndicatorPeriod.value);
-  const params = { period };
+  const params = indicatorType === "MACD" ? {
+    fast_period: Number(customIndicatorFastPeriod.value),
+    slow_period: Number(customIndicatorSlowPeriod.value),
+    signal_period: Number(customIndicatorSignalPeriod.value),
+  } : { period };
   if (indicatorType === "WTME") {
     params.half_life = Number(customIndicatorHalfLife.value);
     params.epsilon = Number(customIndicatorEpsilon.value);
@@ -1965,6 +1976,8 @@ async function createAndAddIndicator(event) {
       ? `WTME${period}(h=${params.half_life})`
       : indicatorType === "RAPID_DROP"
         ? `急跌过滤${period}日${params.threshold_percent}%`
+        : indicatorType === "MACD"
+          ? `MACD(${params.fast_period},${params.slow_period},${params.signal_period})`
         : `${indicatorType}${period}`;
   const response = await fetch(
     `/api/symbols/${encodeURIComponent(currentSymbol)}/chart-views/${encodeURIComponent(currentViewCode)}/indicators`,
@@ -1992,6 +2005,11 @@ async function createAndAddIndicator(event) {
 function updateCustomIndicatorFields() {
   const isWtme = customIndicatorType.value === "WTME";
   const isRapidDrop = customIndicatorType.value === "RAPID_DROP";
+  const isMacd = customIndicatorType.value === "MACD";
+  customIndicatorPeriod.hidden = isMacd;
+  customIndicatorFastPeriod.closest("label").hidden = !isMacd;
+  customIndicatorSlowPeriod.closest("label").hidden = !isMacd;
+  customIndicatorSignalPeriod.closest("label").hidden = !isMacd;
   customIndicatorHalfLife.hidden = !isWtme;
   customIndicatorEpsilon.hidden = !isWtme;
   customIndicatorThreshold.hidden = !isRapidDrop;
@@ -2000,6 +2018,10 @@ function updateCustomIndicatorFields() {
     "aria-label",
     isRapidDrop ? "急跌观察变化段数" : "指标周期",
   );
+  const defaults = { ATR: 14, RATR: 14, RSI: 14, WTME: 40, RAPID_DROP: 5 };
+  if (defaults[customIndicatorType.value] != null) {
+    customIndicatorPeriod.value = String(defaults[customIndicatorType.value]);
+  }
 }
 
 async function handleIndicatorAction(event) {

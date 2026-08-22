@@ -44,13 +44,25 @@ def calculate_wilder_atr(
 def calculate_indicator_values(
     rows: list[dict],
     indicator_type: str,
-    period: int,
+    period: int | None,
     *,
     half_life: float | None = None,
     epsilon: float = WTME_DEFAULT_EPSILON,
     threshold_percent: float | None = None,
+    fast_period: int | None = None,
+    slow_period: int | None = None,
+    signal_period: int | None = None,
 ) -> list[float | None]:
     normalized_type = str(indicator_type).strip().upper()
+    if normalized_type == "MACD":
+        return calculate_macd_components(
+            rows,
+            int(fast_period or 12),
+            int(slow_period or 26),
+            int(signal_period or 9),
+        )["histogram"]
+    if period is None:
+        return [None] * len(rows)
     minimum_period = 2 if normalized_type == "WTME" else 1
     if period < minimum_period:
         return [None] * len(rows)
@@ -58,6 +70,8 @@ def calculate_indicator_values(
         return _calculate_ma(rows, period)
     if normalized_type == "EMA":
         return _calculate_ema(rows, period)
+    if normalized_type == "RSI":
+        return calculate_wilder_rsi(rows, period)
     if normalized_type == "ATR":
         return calculate_wilder_atr(rows, period)
     if normalized_type == "RATR":
@@ -78,6 +92,91 @@ def calculate_indicator_values(
     return [None] * len(rows)
 
 
+def calculate_wilder_rsi(rows: list[dict], period: int = 14) -> list[float | None]:
+    """Return Wilder RSI, seeded from the first ``period`` close changes."""
+    values: list[float | None] = [None] * len(rows)
+    if period < 1 or len(rows) <= period:
+        return values
+    changes = [
+        float(current["close"]) - float(previous["close"])
+        for previous, current in zip(rows, rows[1:])
+    ]
+    average_gain = sum(max(change, 0.0) for change in changes[:period]) / period
+    average_loss = sum(max(-change, 0.0) for change in changes[:period]) / period
+
+    def rsi(gain: float, loss: float) -> float:
+        if loss == 0:
+            return 100.0 if gain > 0 else 50.0
+        if gain == 0:
+            return 0.0
+        return 100.0 - 100.0 / (1.0 + gain / loss)
+
+    values[period] = rsi(average_gain, average_loss)
+    for row_index, change in enumerate(changes[period:], start=period + 1):
+        average_gain = (average_gain * (period - 1) + max(change, 0.0)) / period
+        average_loss = (average_loss * (period - 1) + max(-change, 0.0)) / period
+        values[row_index] = rsi(average_gain, average_loss)
+    return values
+
+
+def calculate_macd_components(
+    rows: list[dict],
+    fast_period: int = 12,
+    slow_period: int = 26,
+    signal_period: int = 9,
+) -> dict[str, list[float | None]]:
+    """Return MACD line (DIF), signal (DEA), and undoubled histogram."""
+    empty = [None] * len(rows)
+    if min(fast_period, slow_period, signal_period) < 1 or fast_period >= slow_period:
+        return {"line": empty[:], "signal": empty[:], "histogram": empty[:]}
+    fast = _calculate_ema(rows, fast_period)
+    slow = _calculate_ema(rows, slow_period)
+    line: list[float | None] = [
+        float(fast_value) - float(slow_value)
+        if fast_value is not None and slow_value is not None else None
+        for fast_value, slow_value in zip(fast, slow)
+    ]
+    signal: list[float | None] = [None] * len(rows)
+    valid = [(index, value) for index, value in enumerate(line) if value is not None]
+    if len(valid) >= signal_period:
+        seed = sum(float(value) for _, value in valid[:signal_period]) / signal_period
+        seed_index = valid[signal_period - 1][0]
+        signal[seed_index] = seed
+        multiplier = 2 / (signal_period + 1)
+        previous = seed
+        for index, value in valid[signal_period:]:
+            previous = float(value) * multiplier + previous * (1 - multiplier)
+            signal[index] = previous
+    histogram = [
+        float(line_value) - float(signal_value)
+        if line_value is not None and signal_value is not None else None
+        for line_value, signal_value in zip(line, signal)
+    ]
+    return {"line": line, "signal": signal, "histogram": histogram}
+
+
+def _indicator_calculation(indicator: dict, rows: list[dict]) -> tuple[list[float | None], dict[str, list[float | None]]]:
+    params = indicator.get("params") or {}
+    indicator_type = str(indicator.get("indicator_type", "")).upper()
+    if indicator_type == "MACD":
+        components = calculate_macd_components(
+            rows,
+            int(params.get("fast_period", 12)),
+            int(params.get("slow_period", 26)),
+            int(params.get("signal_period", 9)),
+        )
+        return components["histogram"], components
+    values = calculate_indicator_values(
+        rows,
+        indicator_type,
+        int(params.get("period")),
+        half_life=params.get("half_life"),
+        epsilon=float(params.get("epsilon", WTME_DEFAULT_EPSILON)),
+        threshold_percent=params.get("threshold_percent"),
+    )
+    return values, {}
+
+
 def latest_indicator_value(
     rows: list[dict],
     indicator: dict,
@@ -85,21 +184,12 @@ def latest_indicator_value(
     price_basis: str | None = None,
     as_of: str | None = None,
 ) -> dict:
-    params = indicator.get("params") or {}
-    period = int(params.get("period"))
-    values = calculate_indicator_values(
-        rows,
-        indicator.get("indicator_type", ""),
-        period,
-        half_life=params.get("half_life"),
-        epsilon=float(params.get("epsilon", WTME_DEFAULT_EPSILON)),
-        threshold_percent=params.get("threshold_percent"),
-    )
+    values, components = _indicator_calculation(indicator, rows)
     for index in range(len(values) - 1, -1, -1):
         value = values[index]
         if value is not None:
             row = rows[index]
-            return {
+            result = {
                 "value": float(value),
                 "date": row.get("date"),
                 "as_of": as_of or row.get("updated_at") or row.get("date"),
@@ -107,6 +197,12 @@ def latest_indicator_value(
                 "price_basis": price_basis or row.get("price_basis") or "raw",
                 "indicator_contract_version": INDICATOR_CONTRACT_VERSION,
             }
+            if components:
+                result["components"] = {
+                    name: float(series[index]) if series[index] is not None else None
+                    for name, series in components.items()
+                }
+            return result
     latest = rows[-1] if rows else {}
     return {
         "value": None,
@@ -156,24 +252,22 @@ def build_indicator_series(
     """
     result: list[dict] = []
     for indicator in indicators:
-        params = indicator.get("params") or {}
-        values = calculate_indicator_values(
-            rows,
-            indicator.get("indicator_type", ""),
-            int(params.get("period")),
-            half_life=params.get("half_life"),
-            epsilon=float(params.get("epsilon", WTME_DEFAULT_EPSILON)),
-            threshold_percent=params.get("threshold_percent"),
-        )
+        values, components = _indicator_calculation(indicator, rows)
         points = []
         for row, value in zip(rows, values):
-            points.append({
+            point = {
                 "date": row.get("date"),
                 "endDate": row.get("endDate"),
                 "value": float(value) if value is not None else None,
                 "is_provisional": not bool(row.get("is_complete", True)),
                 "as_of": row.get("updated_at") or as_of or row.get("date"),
-            })
+            }
+            if components:
+                point["components"] = {
+                    name: float(series[len(points)]) if series[len(points)] is not None else None
+                    for name, series in components.items()
+                }
+            points.append(point)
         latest = points[-1] if points else {}
         result.append({
             **indicator,

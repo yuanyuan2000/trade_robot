@@ -77,6 +77,52 @@ function btErrorText(error) {
   return `${error.message} ${typeof error.detail === "string" ? error.detail : ""}`.trim();
 }
 
+function btDataIssueText(issue) {
+  const dates = issue.segments?.length
+    ? `${issue.segments[0].start_date}${issue.segments[0].end_date !== issue.segments[0].start_date ? ` 至 ${issue.segments[0].end_date}` : ""}`
+    : issue.missing_date || issue.at || issue.start_date || "";
+  const type = issue.type === "minute" ? "分钟线" : "日线";
+  return `${issue.symbol || "未知标的"} ${dates} ${type}`.trim();
+}
+
+async function validateAndRepairBacktest() {
+  const button = document.getElementById("backtest-validate");
+  button.disabled = true;
+  const attempted = new Set();
+  try {
+    for (let pass = 0; pass < 50; pass += 1) {
+      btSetStatus("正在校验策略和历史行情完整性...", "neutral", true);
+      const report = await btJson(await fetch(`/api/backtest/strategies/${bt.current.id}/validate`, { method: "POST" }));
+      if (report.data_complete) {
+        btSetStatus(report.message, "success", true);
+        return;
+      }
+      const repairable = (report.issues || []).filter((issue) => issue.repairable);
+      if (!repairable.length) {
+        const details = (report.issues || []).map(btDataIssueText).join("；");
+        throw new Error(`${report.message}${details ? `（${details}）` : ""}`);
+      }
+      for (let index = 0; index < repairable.length; index += 1) {
+        const issue = repairable[index];
+        const signature = JSON.stringify([issue.symbol, issue.type, issue.missing_date, issue.segments]);
+        if (attempted.has(signature)) {
+          throw new Error(`自动补齐后仍存在缺口：${btDataIssueText(issue)}。`);
+        }
+        attempted.add(signature);
+        btSetStatus(`正在补齐（${index + 1}/${repairable.length}）：${btDataIssueText(issue)}...`, "neutral", true);
+        await btJson(await fetch(`/api/backtest/strategies/${bt.current.id}/repair-recent-data`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol: issue.symbol }),
+        }));
+      }
+    }
+    throw new Error("行情完整性复检次数过多，请检查数据源状态。 ");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function loadBacktestStrategies() {
   btSetStatus("正在加载策略...", "neutral");
   try {
@@ -199,7 +245,7 @@ async function loadBacktestResultsOverview(page = 1) {
     const headers = ["", "编号", "回测时间", "策略名称", "回测区间", "标的", "杠杆", "状态", "收益率", "最大回撤", "成交"];
     const rows = (payload.items || []).map((run) => `
       <tr data-result-run-id="${run.id}">
-        <td><input class="bt-result-select" type="checkbox" value="${run.id}" ${["queued", "validating", "running", "cancelling"].includes(run.status) ? "disabled" : ""}></td>
+        <td><label class="bt-result-select-hitbox" aria-label="选择回测 #${run.id}"><input class="bt-result-select" type="checkbox" value="${run.id}" ${["queued", "validating", "running", "cancelling"].includes(run.status) ? "disabled" : ""}></label></td>
         <td>#${run.id}</td>
         <td>${btEscape(btDateTime(run.created_at))}</td>
         <td>${btEscape(run.strategy_name)}</td>
@@ -977,6 +1023,12 @@ function closeBtDialog(dialog) {
 }
 
 function initBacktest() {
+  const syntaxHelpDialog = document.getElementById("backtest-syntax-help-dialog");
+  document.getElementById("backtest-syntax-help-open").addEventListener("click", () => showBtDialog(syntaxHelpDialog));
+  document.getElementById("backtest-syntax-help-close").addEventListener("click", () => closeBtDialog(syntaxHelpDialog));
+  syntaxHelpDialog.addEventListener("click", (event) => {
+    if (event.target === syntaxHelpDialog) closeBtDialog(syntaxHelpDialog);
+  });
   document.querySelector('[data-view="backtest-view"]').addEventListener("click", () => {
     if (btWorkspace.hidden) loadBacktestStrategies();
   });
@@ -1002,7 +1054,7 @@ function initBacktest() {
     document.getElementById("backtest-delete-runs").disabled = !btResultsTable.querySelector(".bt-result-select:checked");
   });
   btResultsTable.addEventListener("click", (event) => {
-    if (event.target.closest("input")) return;
+    if (event.target.closest(".bt-result-select-hitbox")) return;
     const row = event.target.closest("[data-result-run-id]");
     if (row) openBacktestRunDetail(Number(row.dataset.resultRunId));
   });
@@ -1103,8 +1155,7 @@ function initBacktest() {
   document.getElementById("backtest-validate").addEventListener("click", async () => {
     try {
       await saveBacktestStrategy({ announce: false });
-      const payload = await btJson(await fetch(`/api/backtest/strategies/${bt.current.id}/validate`, { method: "POST" }));
-      btSetStatus(payload.message, "success", true);
+      await validateAndRepairBacktest();
     } catch (error) {
       btSetStatus(btErrorText(error), "error", true);
     }
