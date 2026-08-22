@@ -129,7 +129,7 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
                     now=datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc),
                 )
 
-    def test_competition_snapshot_can_keep_valid_symbols_and_report_unsupported_iex_symbol(self) -> None:
+    def test_competition_snapshot_supports_stock_and_crypto_candidates(self) -> None:
         hub = IEXMarketDataHub()
 
         def fake_bars(symbol, *, timeframe, start=None, end=None, feed="iex", limit=1000, max_pages=1):
@@ -140,12 +140,64 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
                 ]}
             return {"data": [{"timestamp": "2026-08-03T13:30:00Z", "open": 100, "high": 101, "low": 99, "close": 100, "volume": 10}]}
 
-        with patch("services.realtime_market_data.fetch_stock_bars", side_effect=fake_bars):
+        crypto_rows = [
+            {"timestamp": "2026-08-03T13:29:00Z", "open": 120000, "high": 120010, "low": 119990, "close": 120005, "volume": 2},
+            {"timestamp": "2026-08-03T13:30:00Z", "open": 120006, "high": 120020, "low": 120000, "close": 120015, "volume": 3},
+        ]
+        with (
+            patch("services.realtime_market_data.fetch_stock_bars", side_effect=fake_bars),
+            patch(
+                "services.realtime_market_data.fetch_crypto_bars_page",
+                return_value={"data": crypto_rows},
+            ),
+        ):
             snapshot = hub.event_snapshot(
-                ["SPY", "BTC/USD"], trading_date="2026-08-03", event="OPEN", allow_missing=True
+                ["SPY", "BTC/USD"],
+                trading_date="2026-08-03",
+                event="OPEN",
+                allow_missing=True,
+                previous_session_closes={
+                    "BTC/USD": {"date": "2026-07-31", "close": 119500},
+                },
             )
-        self.assertEqual(set(snapshot["symbols"]), {"SPY"})
-        self.assertTrue(any("BTC/USD" in item for item in snapshot["missing"]))
+        self.assertEqual(set(snapshot["symbols"]), {"SPY", "BTC/USD"})
+        self.assertEqual(snapshot["symbols"]["BTC/USD"]["signal_price"], 119500)
+        self.assertEqual(snapshot["symbols"]["BTC/USD"]["fill_price"], 120006)
+        self.assertEqual(snapshot["symbols"]["BTC/USD"]["source"], "alpaca_crypto")
+        self.assertEqual(snapshot["feed"], "mixed")
+        self.assertEqual(snapshot["missing"], [])
+
+    def test_crypto_close_uses_actual_early_close_minute(self) -> None:
+        hub = IEXMarketDataHub()
+        close_minute_utc = int(
+            datetime(2024, 7, 3, 17, 0, tzinfo=timezone.utc).timestamp()
+        ) // 60
+        with patch(
+            "services.realtime_market_data.fetch_crypto_bars_page",
+            return_value={"data": [{
+                "timestamp": "2024-07-03T16:59:00Z",
+                "open": 60000,
+                "high": 60020,
+                "low": 59980,
+                "close": 60010,
+                "volume": 4,
+            }]},
+        ):
+            snapshot = hub.event_snapshot(
+                ["BTC/USD"],
+                trading_date="2024-07-03",
+                event="CLOSE",
+                market_session={
+                    "trading_date": "2024-07-03",
+                    "open_minute_utc": close_minute_utc - 210,
+                    "close_minute_utc": close_minute_utc,
+                    "is_early_close": True,
+                },
+                now=datetime(2024, 7, 3, 17, 0, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(snapshot["symbols"]["BTC/USD"]["signal_price"], 60010)
+        self.assertEqual(snapshot["feed"], "us")
 
     def test_code_notification_contains_strategy_intro_and_data_warning(self) -> None:
         result = {

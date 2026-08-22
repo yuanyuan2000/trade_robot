@@ -249,6 +249,137 @@ class BacktestIntradayGapTests(unittest.TestCase):
         self.assertIn("事件前信号行情", message)
         self.assertIn("事件后可成交行情", message)
 
+    def test_verified_minute_start_delays_symbol_and_logs_join_date(self) -> None:
+        sessions = ["2020-12-31", "2021-01-04"]
+        daily_rows = [
+            {
+                "date": trading_date,
+                "open": 10,
+                "high": 11,
+                "low": 9,
+                "close": 10,
+                "volume": 1,
+                "is_complete": 1,
+            }
+            for trading_date in ["2020-12-30", *sessions]
+        ]
+        market_sessions = [
+            {
+                "trading_date": trading_date,
+                "open_minute_utc": _epoch_minute(trading_date, "09:30"),
+                "close_minute_utc": _epoch_minute(trading_date, "16:00"),
+                "is_early_close": False,
+            }
+            for trading_date in sessions
+        ]
+        target = _epoch_minute("2021-01-04", "10:00")
+        minute_rows = {
+            target - 1: {
+                "minute_utc": target - 1,
+                "open": 10,
+                "high": 10,
+                "low": 10,
+                "close": 10,
+                "volume": 1,
+            },
+            target: {
+                "minute_utc": target,
+                "open": 10,
+                "high": 10,
+                "low": 10,
+                "close": 10,
+                "volume": 1,
+            },
+        }
+        with (
+            patch(
+                "services.backtest.data.repository.get_daily_prices",
+                return_value=daily_rows,
+            ),
+            patch(
+                "services.backtest.data.repository.get_symbol",
+                return_value={
+                    "asset_class": "crypto",
+                    "quantity_step": 0.0001,
+                    "daily_history_start_date": "2020-12-30",
+                },
+            ),
+            patch(
+                "services.backtest.data.ensure_market_sessions",
+                return_value=market_sessions,
+            ),
+            patch(
+                "services.backtest.data.ensure_corporate_actions",
+                return_value=[],
+            ),
+            patch(
+                "services.backtest.data.intraday_repository.get_sync_state",
+                return_value={
+                    "minute_history_start_date": "2021-01-01",
+                    "minute_history_start_source": "alpaca_crypto",
+                    "minute_history_start_verified": True,
+                },
+            ),
+            patch(
+                "services.backtest.data.intraday_repository.get_minute_bars_at",
+                return_value=minute_rows,
+            ),
+        ):
+            dataset = load_historical_dataset(
+                universe=["BTC/USD"],
+                additional_symbols=[],
+                start_date=sessions[0],
+                end_date=sessions[-1],
+                intraday_events=["10:00"],
+                minimum_lookback=1,
+            )
+
+        self.assertFalse(dataset.is_eligible("BTC/USD", sessions[0]))
+        self.assertTrue(dataset.is_eligible("BTC/USD", sessions[1]))
+        details = dataset.manifest["symbols"]["BTC/USD"]
+        self.assertEqual(details["daily_history_start_date"], "2020-12-30")
+        self.assertEqual(details["minute_history_start_date"], "2021-01-01")
+        self.assertEqual(details["intraday_join_date"], "2021-01-04")
+
+        strategy = {
+            "name": "BTC 延迟加入测试",
+            "design_mode": "visual",
+            "selection_mode": "single",
+            "definition": {
+                "symbols": [{"symbol": "BTC/USD", "max_weight": 100}],
+                "rules": [{
+                    "id": "buy",
+                    "name": "buy",
+                    "enabled": True,
+                    "priority": 1,
+                    "action": "BUY",
+                    "sizing_mode": "TARGET",
+                    "value": 100,
+                    "condition": "price > 0",
+                    "when": "10:00",
+                }],
+            },
+            "default_settings": {},
+        }
+        result = BacktestEngine(
+            strategy,
+            {
+                **DEFAULT_BACKTEST_SETTINGS,
+                "start_date": sessions[0],
+                "end_date": sessions[-1],
+                "benchmark": "none",
+            },
+            dataset=dataset,
+        ).run()
+        join_log = next(
+            log for log in result.logs
+            if log["event_type"] == "SYMBOL_INTRADAY_JOIN"
+        )
+        self.assertEqual(
+            join_log["message"],
+            "BTC/USD从2021年1月4日加入回测。",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

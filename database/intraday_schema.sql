@@ -3,6 +3,9 @@ CREATE TABLE IF NOT EXISTS intraday_instruments (
     symbol TEXT NOT NULL UNIQUE,
     exchange_timezone TEXT NOT NULL DEFAULT 'America/New_York',
     asset_class TEXT NOT NULL DEFAULT 'us_equity',
+    minute_history_start_date TEXT,
+    minute_history_start_source TEXT,
+    minute_history_start_verified INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

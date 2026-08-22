@@ -8,6 +8,13 @@ from database.db import get_connection
 from database.repository import utc_now_iso
 
 
+DEFAULT_MARKET = {
+    "type": "US_EQUITY",
+    "calendar": "XNYS",
+    "timezone": "America/New_York",
+}
+
+
 def _json(value: Any) -> str:
     return json.dumps(
         value,
@@ -28,6 +35,10 @@ def _strategy_row(row: sqlite3.Row | dict) -> dict:
     item = dict(row)
     item["definition"] = _decode(item.pop("definition_json"), {})
     item["default_settings"] = _decode(item.pop("default_settings_json"), {})
+    item["market"] = _decode(
+        item.pop("market_json", None),
+        DEFAULT_MARKET,
+    )
     return item
 
 
@@ -80,11 +91,11 @@ def create_strategy(payload: dict) -> dict:
                 """
                 INSERT INTO backtest_strategies (
                     name, description, design_mode, selection_mode,
-                    code_key, code_version, definition_json,
+                    code_key, code_version, market_json, definition_json,
                     default_settings_json, schema_version, revision,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     payload["name"],
@@ -93,6 +104,7 @@ def create_strategy(payload: dict) -> dict:
                     payload["selection_mode"],
                     payload.get("code_key"),
                     payload.get("code_version"),
+                    _json(payload.get("market") or DEFAULT_MARKET),
                     _json(payload["definition"]),
                     _json(payload["default_settings"]),
                     int(payload.get("schema_version", 1)),
@@ -130,11 +142,11 @@ def seed_strategy_once(seed_key: str, payload: dict) -> dict | None:
                 """
                 INSERT INTO backtest_strategies (
                     name, description, design_mode, selection_mode,
-                    code_key, code_version, definition_json,
+                    code_key, code_version, market_json, definition_json,
                     default_settings_json, schema_version, revision,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     payload["name"],
@@ -143,6 +155,7 @@ def seed_strategy_once(seed_key: str, payload: dict) -> dict | None:
                     payload["selection_mode"],
                     payload.get("code_key"),
                     payload.get("code_version"),
+                    _json(payload.get("market") or DEFAULT_MARKET),
                     _json(payload["definition"]),
                     _json(payload["default_settings"]),
                     int(payload.get("schema_version", 1)),
@@ -323,6 +336,7 @@ def update_strategy(
         "description": payload.get("description", current["description"]),
         "code_key": payload.get("code_key", current["code_key"]),
         "code_version": payload.get("code_version", current["code_version"]),
+        "market": payload.get("market", current["market"]),
         "definition": payload.get("definition", current["definition"]),
         "default_settings": payload.get(
             "default_settings",
@@ -336,7 +350,7 @@ def update_strategy(
                 """
                 UPDATE backtest_strategies
                 SET name = ?, description = ?, code_key = ?, code_version = ?,
-                    definition_json = ?, default_settings_json = ?,
+                    market_json = ?, definition_json = ?, default_settings_json = ?,
                     schema_version = ?, revision = revision + 1, updated_at = ?
                 WHERE id = ? AND deleted_at IS NULL
                 """,
@@ -345,6 +359,7 @@ def update_strategy(
                     values["description"],
                     values["code_key"],
                     values["code_version"],
+                    _json(values["market"]),
                     _json(values["definition"]),
                     _json(values["default_settings"]),
                     values["schema_version"],

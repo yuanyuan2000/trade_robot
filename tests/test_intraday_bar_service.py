@@ -61,6 +61,33 @@ class IntradayBarServiceTests(unittest.TestCase):
         self.assertFalse(live[0]["is_complete"])
         self.assertTrue(settled[0]["is_complete"])
 
+    @patch.object(service, "market_sessions")
+    def test_intraday_filter_removes_holiday_and_minutes_after_early_close(
+        self,
+        sessions,
+    ) -> None:
+        open_minute = minute_row("2024-07-03T13:30:00Z", 100)["minute_utc"]
+        close_minute = minute_row("2024-07-03T17:00:00Z", 101)["minute_utc"]
+        sessions.return_value = [{
+            "trading_date": "2024-07-03",
+            "open_minute_utc": open_minute,
+            "close_minute_utc": close_minute,
+            "is_early_close": True,
+        }]
+        rows = [
+            minute_row("2024-07-03T13:30:00Z", 100),
+            minute_row("2024-07-03T16:59:00Z", 101),
+            minute_row("2024-07-03T17:00:00Z", 102),
+            minute_row("2024-07-04T13:30:00Z", 103),
+        ]
+
+        filtered = service.filter_minute_rows_for_us_market(rows)
+
+        self.assertEqual(
+            [row["minute_utc"] for row in filtered],
+            [rows[0]["minute_utc"], rows[1]["minute_utc"]],
+        )
+
     @patch.object(service.repository, "upsert_daily_prices")
     @patch.object(service.intraday_repository, "iter_minute_bars")
     def test_daily_prices_are_derived_from_regular_session_only(
@@ -98,6 +125,45 @@ class IntradayBarServiceTests(unittest.TestCase):
                 "2024-01-03T00:00:00Z"
             ),
         )
+
+    @patch.object(service.repository, "upsert_daily_prices")
+    @patch.object(service.repository, "upsert_daily_price_series")
+    @patch.object(service.repository, "delete_daily_prices", return_value=0)
+    @patch.object(service.repository, "get_daily_prices", return_value=[])
+    @patch(
+        "services.backtest.market_calendar.ensure_market_sessions",
+        return_value=[{
+            "trading_date": "2024-01-02",
+            "open_minute_utc": 0,
+            "close_minute_utc": 1,
+            "is_early_close": False,
+        }],
+    )
+    @patch.object(service.intraday_repository, "iter_minute_bars")
+    def test_crypto_derivation_writes_named_us_session_series_only(
+        self,
+        iter_rows,
+        _sessions,
+        _legacy_rows,
+        _delete_legacy,
+        upsert_series,
+        upsert_native,
+    ) -> None:
+        iter_rows.return_value = iter([
+            minute_row("2024-01-02T14:30:00Z", 100, 10),
+            minute_row("2024-01-02T20:59:00Z", 105, 20),
+        ])
+        upsert_series.return_value = 1
+
+        result = service.derive_daily_prices_from_minutes("BTC/USD")
+
+        upsert_native.assert_not_called()
+        self.assertEqual(upsert_series.call_args.args[:2], (
+            "BTC/USD",
+            "US_EQUITY_SESSION",
+        ))
+        self.assertEqual(upsert_series.call_args.args[2][0]["date"], "2024-01-02")
+        self.assertEqual(result["updated_rows"], 1)
 
     @patch.object(service.repository, "get_symbol")
     def test_unsupported_symbol_returns_explicit_intraday_warning(

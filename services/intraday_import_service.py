@@ -54,11 +54,24 @@ def import_symbol_history(
     end_value = end or default_import_end()
     is_crypto = normalized == "BTC/USD"
     effective_feed = "us" if is_crypto and feed == "sip" else feed
+    intraday_repository.upsert_instrument(
+        normalized,
+        asset_class="crypto" if is_crypto else "us_equity",
+    )
+    instrument = intraday_repository.get_instrument(normalized) or {}
+    provider_start = (
+        instrument.get("minute_history_start_date")
+        if instrument.get("minute_history_start_verified")
+        else None
+    )
+    effective_start = start
+    if provider_start and str(start)[:10] < provider_start:
+        effective_start = f"{provider_start}T00:00:00Z"
 
     with _symbol_lock(normalized):
         job = intraday_repository.create_or_resume_import_job(
             normalized,
-            start,
+            effective_start,
             end_value,
             feed=effective_feed,
         )
@@ -67,7 +80,7 @@ def import_symbol_history(
             return {
                 "ok": True,
                 "symbol": normalized,
-                "start": start,
+                "start": effective_start,
                 "end": end_value,
                 "complete": True,
                 "pages_this_run": 0,
@@ -90,7 +103,7 @@ def import_symbol_history(
                     fetch_crypto_bars_page(
                         normalized,
                         timeframe="1Min",
-                        start=start,
+                        start=effective_start,
                         end=end_value,
                         location=effective_feed,
                         limit=ALPACA_IMPORT_PAGE_SIZE,
@@ -100,7 +113,7 @@ def import_symbol_history(
                     else fetch_stock_bars_page(
                         normalized,
                         timeframe="1Min",
-                        start=start,
+                        start=effective_start,
                         end=end_value,
                         feed=effective_feed,
                         limit=ALPACA_IMPORT_PAGE_SIZE,
@@ -114,13 +127,12 @@ def import_symbol_history(
                     asset_class="crypto" if is_crypto else "us_equity",
                 )
                 if rows:
-                    first_date = min(str(row["timestamp"])[:10] for row in rows)
-                    repository.mark_symbol_history_start(
+                    repository.upsert_symbol(
                         normalized,
-                        first_date,
-                        source="alpaca_crypto" if is_crypto else "alpaca",
-                        asset_class="crypto" if is_crypto else "us_equity",
-                        quantity_step=0.0001 if is_crypto else None,
+                        {
+                            "asset_class": "crypto" if is_crypto else "us_equity",
+                            "quantity_step": 0.0001 if is_crypto else None,
+                        },
                     )
                 for row in rows:
                     touched_months.add(str(row["timestamp"])[:7])
@@ -169,7 +181,7 @@ def import_symbol_history(
             return {
                 "ok": True,
                 "symbol": normalized,
-                "start": start,
+                "start": effective_start,
                 "end": end_value,
                 "complete": next_page_token is None,
                 "pages_this_run": pages_this_run,

@@ -53,7 +53,7 @@ class FutubullStrategySourceTests(unittest.TestCase):
     def test_data_prepare_hints_cover_every_declared_trigger_symbol(self):
         expected_counts = {
             "rapid_drop_ratr_rotation.py": 7,
-            "rapid_drop_wtme_rotation.py": 7,
+            "rapid_drop_wtme_rotation.py": 8,
             "sevenstar_etf_rotation.py": 8,
         }
         for filename, expected in expected_counts.items():
@@ -61,7 +61,28 @@ class FutubullStrategySourceTests(unittest.TestCase):
                 source = (FUTUBULL_DIR / filename).read_text(encoding="utf-8")
                 tree = ast.parse(source)
                 strategy = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Strategy")
+                trigger_symbols = next(node for node in strategy.body if isinstance(node, ast.FunctionDef) and node.name == "trigger_symbols")
+                initialize = next(node for node in strategy.body if isinstance(node, ast.FunctionDef) and node.name == "initialize")
                 hints = next(node for node in strategy.body if isinstance(node, ast.FunctionDef) and node.name == "_data_prepare_hints")
+                declared = set()
+                for node in ast.walk(trigger_symbols):
+                    if not isinstance(node, ast.Assign):
+                        continue
+                    if not isinstance(node.value, ast.Call):
+                        continue
+                    if not isinstance(node.value.func, ast.Name) or node.value.func.id != "declare_trig_symbol":
+                        continue
+                    for target in node.targets:
+                        if isinstance(target, ast.Attribute):
+                            declared.add(target.attr)
+                candidates = set()
+                for node in ast.walk(initialize):
+                    if not isinstance(node, ast.Assign):
+                        continue
+                    if not any(isinstance(target, ast.Attribute) and target.attr == "candidates" for target in node.targets):
+                        continue
+                    if isinstance(node.value, ast.List):
+                        candidates.update(item.attr for item in node.value.elts if isinstance(item, ast.Attribute))
                 subjects = set()
                 for node in ast.walk(hints):
                     if not isinstance(node, ast.Call):
@@ -72,6 +93,9 @@ class FutubullStrategySourceTests(unittest.TestCase):
                         if keyword.arg != "symbol" or not isinstance(keyword.value, ast.Attribute):
                             continue
                         subjects.add(keyword.value.attr)
+                candidate_declarations = {name for name in declared if name.startswith("candidate_")}
+                self.assertEqual(candidate_declarations, candidates)
+                self.assertEqual(declared, subjects)
                 self.assertEqual(len(subjects), expected)
 
 

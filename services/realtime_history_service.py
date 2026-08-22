@@ -18,7 +18,6 @@ def strategy_history_requirements(strategy: dict) -> tuple[list[str], int]:
     candidates = [
         str(item["symbol"]).strip().upper()
         for item in definition.get("symbols", [])
-        if "/" not in str(item.get("symbol") or "")
     ]
     symbols = list(candidates)
     minimum = 2
@@ -53,15 +52,16 @@ def prepare_strategy_history(
     refresh: Callable[[str, str], object] | None = None,
 ) -> dict:
     symbols, minimum = strategy_history_requirements(strategy)
+    market = strategy.get("market")
     expected_dates = required_completed_sessions(trading_date, minimum)
     audits: dict[str, dict] = {}
     histories: dict[str, list[dict]] = {}
     failures: list[str] = []
     for symbol in symbols:
-        audit = assess_daily_history(symbol, expected_dates)
+        audit = assess_daily_history(symbol, expected_dates, market=market)
         if not audit["complete"] and refresh is not None:
             refresh(symbol, audit["repair_start_date"] or expected_dates[0])
-            audit = assess_daily_history(symbol, expected_dates)
+            audit = assess_daily_history(symbol, expected_dates, market=market)
         audits[symbol] = audit
         if not audit["complete"]:
             failures.append(
@@ -69,7 +69,11 @@ def prepare_strategy_history(
                 f"缺失 {','.join(audit['missing_sessions'] + audit['incomplete_sessions']) or '所需历史'}"
             )
             continue
-        histories[symbol] = frozen_daily_rows(symbol, before_date=trading_date)
+        histories[symbol] = frozen_daily_rows(
+            symbol,
+            before_date=trading_date,
+            market=market,
+        )
     if failures:
         raise MarketDataIntegrityError("实时决策历史数据不完整：" + "；".join(failures))
     snapshot_ids = sorted(audit["snapshot_id"] for audit in audits.values())
@@ -82,4 +86,5 @@ def prepare_strategy_history(
         "symbols": audits,
         "daily": histories,
         "snapshot_id": f"history:{combined_fingerprint}",
+        "market": market,
     }

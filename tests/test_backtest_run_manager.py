@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -82,6 +83,17 @@ class FailingPreflightEngine:
             "公司行动核验失败。",
             detail={"provider": "test"},
         )
+
+
+class LiveMetricsEngine(FakeEngine):
+    progress_reported = threading.Event()
+    release = threading.Event()
+
+    def run(self):
+        result = super().run()
+        self.progress_reported.set()
+        self.release.wait(timeout=2)
+        return result
 
 
 class LiquidatedEngine(FakeEngine):
@@ -187,6 +199,31 @@ class BacktestRunManagerTests(unittest.TestCase):
             backtest_repository.get_logs(run["id"], level="INFO")[0]["message"],
             "完成",
         )
+
+    @patch("services.backtest.service.BacktestEngine", LiveMetricsEngine)
+    def test_running_status_exposes_live_metrics(self) -> None:
+        LiveMetricsEngine.progress_reported.clear()
+        LiveMetricsEngine.release.clear()
+        run = self.manager.start(
+            self.strategy["id"],
+            {
+                **self.strategy["default_settings"],
+                "start_date": "2024-01-02",
+                "end_date": "2024-01-02",
+                "initial_capital": 100,
+                "benchmark": "none",
+            },
+        )
+        try:
+            self.assertTrue(LiveMetricsEngine.progress_reported.wait(timeout=1))
+            status = self.manager.run_status(run["id"])
+
+            self.assertEqual(status["status"], "running")
+            self.assertEqual(status["metrics"]["total_return"], 0)
+            self.assertEqual(status["metrics"]["trade_count"], 0)
+            self.assertEqual(status["live"]["equity_point_count"], 1)
+        finally:
+            LiveMetricsEngine.release.set()
 
     @patch("services.backtest.service.BacktestEngine", FailingPreflightEngine)
     def test_preflight_failure_does_not_create_run_record(self) -> None:

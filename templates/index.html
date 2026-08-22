@@ -252,7 +252,7 @@
           </div>
           <label class="setting-row">
             <input id="show-weekend-data" type="checkbox" checked>
-            <span>显示周末 K 线</span>
+            <span>显示美股休市日 K 线</span>
           </label>
         </aside>
       </section>
@@ -314,7 +314,7 @@
             <div class="realtime-dashboard-meta-row">
               <div id="realtime-dashboard-meta" class="realtime-dashboard-meta">等待读取内部行情数据库</div>
               <span class="realtime-observation-note">按任务策略模拟最新时点，非正式决策；数值可能与行情页标准指标不同。</span>
-              <span class="realtime-metric-help" title="行情页使用标准指标及所选 K 线价格口径；本面板按任务策略定义的观测构造、参数、过滤和排名方式，使用行情总览内部数据库的最新数据模拟当前时点。策略可使用完整日线、盘中价或自行构造观测，因此两处数值可能不同。正式任务仍只在策略预定时点执行。IEX 与 SIP 数据源暂不统一。" aria-label="观察口径说明">?</span>
+              <span class="realtime-metric-help" title="行情页使用标准指标及所选 K 线价格口径；本面板按任务策略的市场、观测构造、参数、过滤和排名方式，使用行情总览内部数据库的最新数据模拟当前时点。策略可使用完整日线、盘中价或自行构造观测，因此两处数值可能不同。正式任务仍只在策略预定时点执行；股票 IEX/SIP 与加密 Crypto feed 会分别记录。" aria-label="观察口径说明">?</span>
             </div>
             <div id="realtime-dashboard-table" class="realtime-dashboard-table-wrap"></div>
           </section>
@@ -452,6 +452,13 @@
                   <span>策略说明</span>
                   <textarea id="backtest-description" rows="2" placeholder="说明策略目标和适用范围"></textarea>
                 </label>
+                <label class="backtest-field">
+                  <span>策略市场</span>
+                  <select id="backtest-market-type">
+                    <option value="US_EQUITY">美股（NYSE日历 / 美东时间）</option>
+                  </select>
+                </label>
+                <p id="backtest-market-help" class="backtest-help">日线指标只使用NYSE交易日；具体决策时间按美东时间解释。未来市场类型将在此扩展。</p>
 
                 <section class="backtest-editor-section">
                   <div class="backtest-section-title">
@@ -759,8 +766,8 @@ price &lt; close(1) - 2 * atr(14)</pre></section>
 
     <script src="{{ url_for('static', filename='js/chart.js', v='20260822-01') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260730-02') }}"></script>
-    <script src="{{ url_for('static', filename='js/backtest.js', v='20260822-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest.js', v='20260822-02') }}"></script>
     <script src="{{ url_for('static', filename='js/realtime.js', v='20260814-01') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260822-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260822-02') }}"></script>
   </body>
 </html>

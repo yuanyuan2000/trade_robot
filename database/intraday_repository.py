@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import struct
 
-from config import INTRADAY_PRICE_SCALE
+from config import INTRADAY_PRICE_SCALE, KNOWN_MINUTE_HISTORY_STARTS
 from database.intraday_db import (
     INTRADAY_WRITE_LOCK,
     get_intraday_connection,
@@ -56,6 +56,7 @@ def upsert_instrument(
 ) -> int:
     init_intraday_database()
     normalized = normalize_symbol(symbol)
+    known_start = KNOWN_MINUTE_HISTORY_STARTS.get(normalized)
     now = utc_now_iso()
     with INTRADAY_WRITE_LOCK:
         with get_intraday_connection() as conn:
@@ -75,6 +76,21 @@ def upsert_instrument(
                     """,
                     (exchange_timezone, asset_class, now, instrument_id),
                 )
+                if known_start:
+                    conn.execute(
+                        """
+                        UPDATE intraday_instruments
+                        SET minute_history_start_date = ?,
+                            minute_history_start_source = ?,
+                            minute_history_start_verified = 1
+                        WHERE id = ?
+                        """,
+                        (
+                            known_start["date"],
+                            known_start["source"],
+                            instrument_id,
+                        ),
+                    )
                 return instrument_id
 
             next_id = int(
@@ -107,6 +123,21 @@ def upsert_instrument(
                 """,
                 (next_id, now),
             )
+            if known_start:
+                conn.execute(
+                    """
+                    UPDATE intraday_instruments
+                    SET minute_history_start_date = ?,
+                        minute_history_start_source = ?,
+                        minute_history_start_verified = 1
+                    WHERE id = ?
+                    """,
+                    (
+                        known_start["date"],
+                        known_start["source"],
+                        next_id,
+                    ),
+                )
             return next_id
 
 
@@ -117,13 +148,67 @@ def get_instrument(symbol: str) -> dict | None:
         row = conn.execute(
             """
             SELECT id, symbol, exchange_timezone, asset_class,
+                   minute_history_start_date,
+                   minute_history_start_source,
+                   minute_history_start_verified,
                    created_at, updated_at
             FROM intraday_instruments
             WHERE symbol = ?
             """,
             (normalized,),
         ).fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    result = dict(row)
+    result["minute_history_start_verified"] = bool(
+        result["minute_history_start_verified"]
+    )
+    return result
+
+
+def mark_minute_history_start(
+    symbol: str,
+    history_start_date: str,
+    *,
+    source: str,
+    verified: bool = True,
+) -> dict:
+    normalized = normalize_symbol(symbol)
+    datetime.fromisoformat(str(history_start_date))
+    instrument_id = upsert_instrument(normalized)
+    now = utc_now_iso()
+    with INTRADAY_WRITE_LOCK:
+        with get_intraday_connection() as conn:
+            conn.execute(
+                """
+                UPDATE intraday_instruments
+                SET minute_history_start_date = CASE
+                        WHEN minute_history_start_date IS NULL
+                          OR ? < minute_history_start_date
+                        THEN ?
+                        ELSE minute_history_start_date
+                    END,
+                    minute_history_start_source = CASE
+                        WHEN minute_history_start_date IS NULL
+                          OR ? <= minute_history_start_date
+                        THEN ?
+                        ELSE minute_history_start_source
+                    END,
+                    minute_history_start_verified = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    history_start_date,
+                    history_start_date,
+                    history_start_date,
+                    source,
+                    1 if verified else 0,
+                    now,
+                    instrument_id,
+                ),
+            )
+    return get_instrument(normalized)
 
 
 def upsert_minute_bars(
@@ -310,6 +395,15 @@ def get_sync_state(symbol: str) -> dict:
         ).fetchone()
     result = dict(row) if row else {"status": "pending", "row_count": 0}
     result["symbol"] = instrument["symbol"]
+    result["minute_history_start_date"] = instrument.get(
+        "minute_history_start_date"
+    )
+    result["minute_history_start_source"] = instrument.get(
+        "minute_history_start_source"
+    )
+    result["minute_history_start_verified"] = bool(
+        instrument.get("minute_history_start_verified")
+    )
     for key in (
         "earliest_minute_utc",
         "latest_minute_utc",

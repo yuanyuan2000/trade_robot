@@ -138,7 +138,7 @@ class MarketDataIntegrityTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "HISTORY_STALE")
         self.assertIn("SLV", str(raised.exception))
 
-    def test_crypto_candidate_remains_outside_us_equity_history_validation(self) -> None:
+    def test_crypto_candidate_uses_named_us_session_history_in_validation(self) -> None:
         strategy = {
             "design_mode": "visual",
             "selection_mode": "competition",
@@ -161,6 +161,27 @@ class MarketDataIntegrityTests(unittest.TestCase):
             source_provider="alpaca",
             source_timeframe="1Day",
         )
+        repository.upsert_symbol("BTC/USD", {"asset_class": "crypto"})
+        repository.upsert_daily_prices(
+            "BTC/USD",
+            [
+                _daily_row("2026-08-09", 118000),
+                _daily_row("2026-08-10", 119000),
+                _daily_row("2026-08-11", 120000),
+            ],
+            source_provider="alpaca_crypto",
+            source_timeframe="1Day",
+        )
+        repository.upsert_daily_price_series(
+            "BTC/USD",
+            "US_EQUITY_SESSION",
+            [
+                _daily_row("2026-08-10", 119100),
+                _daily_row("2026-08-11", 120100),
+            ],
+            source_provider="alpaca_crypto",
+            source_timeframe="nyse_session_derived_1m",
+        )
         with patch(
             "services.realtime_history_service.required_completed_sessions",
             return_value=["2026-08-10", "2026-08-11"],
@@ -170,7 +191,16 @@ class MarketDataIntegrityTests(unittest.TestCase):
                 trading_date="2026-08-12",
             )
 
-        self.assertEqual(set(snapshot["symbols"]), {"SPY"})
+        self.assertEqual(set(snapshot["symbols"]), {"SPY", "BTC/USD"})
+        self.assertEqual(
+            [row["date"] for row in snapshot["daily"]["BTC/USD"]],
+            ["2026-08-10", "2026-08-11"],
+        )
+        self.assertEqual(snapshot["daily"]["BTC/USD"][-1]["close"], 120100)
+        self.assertEqual(
+            repository.get_daily_prices("BTC/USD")[-1]["close"],
+            120000,
+        )
 
 
 class MarketDataRequestCoordinatorTests(unittest.TestCase):

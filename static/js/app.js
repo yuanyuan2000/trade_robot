@@ -66,7 +66,7 @@ let overviewIndicatorIds = ["", "", ""];
 let overviewSelectedIndicators = [];
 let overviewIndicatorPriceBasis = "all_adjusted";
 let currentRawMarketData = [];
-let currentSymbolSettings = { show_weekend_data: true };
+let currentSymbolSettings = { show_non_us_market_days: true, show_weekend_data: true };
 let currentIntradaySync = { status: "not_initialized", row_count: 0 };
 let currentCorporateActions = [];
 let overviewPage = 1;
@@ -308,7 +308,7 @@ async function loadMarketData(symbol, { includeIntraday = false } = {}) {
     if (requestId !== marketLoadRequestId) return;
 
     currentRawMarketData = payload.data;
-    currentSymbolSettings = payload.symbol_settings || { show_weekend_data: true };
+    currentSymbolSettings = payload.symbol_settings || { show_non_us_market_days: true, show_weekend_data: true };
     currentIntradaySync = payload.intraday_sync || currentIntradaySync;
     currentCorporateActions = payload.corporate_actions || [];
     renderCorporateActionEvents();
@@ -317,7 +317,7 @@ async function loadMarketData(symbol, { includeIntraday = false } = {}) {
     }
     currentSymbol = payload.canonical_symbol || payload.symbol || normalized;
     symbolInput.value = payload.symbol || normalized;
-    showWeekendData.checked = Boolean(currentSymbolSettings.show_weekend_data);
+    showWeekendData.checked = Boolean(currentSymbolSettings.show_non_us_market_days ?? currentSymbolSettings.show_weekend_data);
     renderCurrentMarketData();
     await loadSymbolIndicators();
     updateChartTitle(payload.symbol);
@@ -1335,7 +1335,7 @@ async function updateCurrentMarketData() {
     renderCorporateActionEvents();
     currentSymbolSettings = payload.symbol_settings || currentSymbolSettings;
     currentIntradaySync = payload.intraday_sync || currentIntradaySync;
-    showWeekendData.checked = Boolean(currentSymbolSettings.show_weekend_data);
+    showWeekendData.checked = Boolean(currentSymbolSettings.show_non_us_market_days ?? currentSymbolSettings.show_weekend_data);
     renderCurrentMarketData();
     await loadSymbolIndicators();
     updateChartTitle(payload.symbol);
@@ -1486,9 +1486,10 @@ async function toggleCurrentOverview() {
 }
 
 function renderCurrentMarketData() {
-  const rows = currentSymbolSettings.show_weekend_data
+  const showNonSessions = currentSymbolSettings.show_non_us_market_days ?? currentSymbolSettings.show_weekend_data;
+  const rows = showNonSessions
     ? currentRawMarketData
-    : currentRawMarketData.filter((row) => !isWeekendDate(row.date));
+    : currentRawMarketData.filter((row) => row.is_us_market_session !== false);
   renderCandles(rows);
   clearTrendlineAnalysis();
 }
@@ -1546,7 +1547,7 @@ async function runTrendlineAnalysis() {
       symbol: currentSymbol,
       period: getChartPeriod(),
       limit: "150",
-      show_weekend_data: currentSymbolSettings.show_weekend_data ? "1" : "0",
+      show_non_us_market_days: (currentSymbolSettings.show_non_us_market_days ?? currentSymbolSettings.show_weekend_data) ? "1" : "0",
       adjustment: priceAdjustmentMode.value,
     });
     const response = await fetch(`/api/analysis/trendlines?${params}`);
@@ -1586,7 +1587,7 @@ async function loadStoredTrendlineAnalysis(symbol) {
     }
     if (
       Boolean(snapshot.show_weekend_data)
-      !== Boolean(currentSymbolSettings.show_weekend_data)
+      !== Boolean(currentSymbolSettings.show_non_us_market_days ?? currentSymbolSettings.show_weekend_data)
     ) {
       clearTrendlineAnalysis();
       setStatus(`${symbol} 的图表设置已变化，请重新点击智能识别。`, "neutral");
@@ -1705,7 +1706,7 @@ async function saveSymbolSettings() {
   }
 
   const nextSettings = {
-    show_weekend_data: showWeekendData.checked,
+    show_non_us_market_days: showWeekendData.checked,
   };
   currentSymbolSettings = { ...currentSymbolSettings, ...nextSettings };
   renderCurrentMarketData();
@@ -1722,10 +1723,10 @@ async function saveSymbolSettings() {
       return;
     }
     currentSymbolSettings = payload.symbol_settings;
-    showWeekendData.checked = Boolean(currentSymbolSettings.show_weekend_data);
+    showWeekendData.checked = Boolean(currentSymbolSettings.show_non_us_market_days ?? currentSymbolSettings.show_weekend_data);
     await loadSymbolIndicators();
-    const weekendText = currentSymbolSettings.show_weekend_data ? "显示" : "隐藏";
-    setStatus(`已保存 ${currentSymbol} 设置：${weekendText}周末 K 线。`, "success");
+    const nonSessionText = (currentSymbolSettings.show_non_us_market_days ?? currentSymbolSettings.show_weekend_data) ? "显示" : "隐藏";
+    setStatus(`已保存 ${currentSymbol} 设置：${nonSessionText}美股休市日 K 线。`, "success");
   } catch (error) {
     setStatus(error.message || "标的设置保存失败。", "error");
   }

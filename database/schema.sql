@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     exchange_name TEXT,
     currency TEXT,
     show_weekend_data INTEGER NOT NULL DEFAULT 1,
+    show_non_us_market_days INTEGER NOT NULL DEFAULT 1,
     show_in_overview INTEGER NOT NULL DEFAULT 0,
     display_order INTEGER NOT NULL DEFAULT 0,
     alpaca_symbol TEXT,
@@ -19,6 +20,9 @@ CREATE TABLE IF NOT EXISTS symbols (
     history_start_date TEXT,
     history_start_source TEXT,
     history_start_verified INTEGER NOT NULL DEFAULT 0,
+    daily_history_start_date TEXT,
+    daily_history_start_source TEXT,
+    daily_history_start_verified INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -45,6 +49,30 @@ CREATE TABLE IF NOT EXISTS daily_prices (
 
 CREATE INDEX IF NOT EXISTS idx_daily_prices_symbol_date
 ON daily_prices(symbol, date);
+
+CREATE TABLE IF NOT EXISTS daily_price_series (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    series_code TEXT NOT NULL,
+    date TEXT NOT NULL,
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    volume REAL DEFAULT 0,
+    source_provider TEXT,
+    source_timeframe TEXT,
+    price_basis TEXT NOT NULL DEFAULT 'unknown' CHECK(price_basis IN (
+        'raw', 'split_adjusted', 'total_return_adjusted', 'unknown'
+    )),
+    is_complete INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(symbol, series_code, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_price_series_lookup
+ON daily_price_series(symbol, series_code, date);
 
 CREATE TABLE IF NOT EXISTS instrument_symbols (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,6 +227,7 @@ CREATE TABLE IF NOT EXISTS backtest_strategies (
     selection_mode TEXT NOT NULL CHECK(selection_mode IN ('single', 'distribution', 'competition')),
     code_key TEXT,
     code_version TEXT,
+    market_json TEXT NOT NULL DEFAULT '{"calendar":"XNYS","timezone":"America/New_York","type":"US_EQUITY"}',
     definition_json TEXT NOT NULL,
     default_settings_json TEXT NOT NULL,
     schema_version INTEGER NOT NULL DEFAULT 1,

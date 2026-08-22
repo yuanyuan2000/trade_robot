@@ -92,6 +92,7 @@ from services.realtime_panel_script import (
     validate_panel_settings,
 )
 from services.realtime_presets import ensure_shipped_realtime_tasks
+from services.market_context import annotate_us_market_sessions
 
 
 app = Flask(__name__)
@@ -263,7 +264,11 @@ def trendline_analysis_response(symbol: str):
             symbol,
             period=period,
             limit=limit,
-            show_weekend_data=request.args.get("show_weekend_data"),
+            show_weekend_data=(
+                request.args.get("show_non_us_market_days")
+                if request.args.get("show_non_us_market_days") is not None
+                else request.args.get("show_weekend_data")
+            ),
             adjustment=request.args.get("adjustment", "all"),
         )
         if period.upper() == "1D" and limit == 150:
@@ -311,7 +316,10 @@ def market_data_response(
         kwargs = {"include_intraday": include_intraday}
         if adjustment is not None:
             kwargs["adjustment"] = adjustment
-        return jsonify(get_market_data(symbol, **kwargs))
+        payload = get_market_data(symbol, **kwargs)
+        if payload.get("data"):
+            payload["data"] = annotate_us_market_sessions(payload["data"])
+        return jsonify(payload)
     except ValueError as exc:
         return (
             jsonify(
@@ -636,7 +644,13 @@ def market_overview():
                     settings,
                     mode="all",
                 )
-                daily_rows_by_symbol[symbol] = adjusted["rows"]
+                indicator_rows = annotate_us_market_sessions(adjusted["rows"])
+                if not settings.get("show_non_us_market_days", True):
+                    indicator_rows = [
+                        row for row in indicator_rows
+                        if row.get("is_us_market_session")
+                    ]
+                daily_rows_by_symbol[symbol] = indicator_rows
                 item["indicator_adjustment_warning"] = adjusted.get("warning")
                 indicator_metadata[symbol] = {
                     "price_basis": (
@@ -2030,11 +2044,8 @@ def symbol_view_indicators(symbol: str, view_code: str):
         )
         rows = list(bars_payload.get("data") or [])
         settings = bars_payload.get("symbol_settings") or {}
-        if not settings.get("show_weekend_data", True):
-            rows = [
-                row for row in rows
-                if datetime.strptime(str(row["date"])[:10], "%Y-%m-%d").weekday() < 5
-            ]
+        # get_chart_bars applies the symbol's NYSE non-session setting before
+        # aggregation, so indicator points and rendered bars share one series.
         latest = rows[-1] if rows else {}
         price_basis = (
             "all_adjusted"

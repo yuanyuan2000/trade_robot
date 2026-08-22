@@ -286,7 +286,7 @@ async function openBacktestRunDetail(runId) {
     btWorkspace.hidden = false;
     renderBacktestEditor();
     setBacktestReadOnly(true);
-    renderBacktestMetrics(run.metrics);
+    renderBacktestMetrics(run.metrics, run);
     btChartEmpty.hidden = Boolean(bt.equityPoints.length);
     renderBacktestChart();
     renderBacktestLogs();
@@ -306,6 +306,9 @@ function renderBacktestEditor() {
   const strategy = bt.current;
   btName.value = strategy.name;
   btDescription.value = strategy.description || "";
+  const market = strategy.market || { type: "US_EQUITY", calendar: "XNYS", timezone: "America/New_York" };
+  strategy.market = market;
+  document.getElementById("backtest-market-type").value = market.type || "US_EQUITY";
   document.getElementById("backtest-mode-badge").textContent =
     `${strategy.design_mode === "code" ? "代码" : "非代码"} · ${strategy.selection_mode}`;
   document.getElementById("backtest-revision").textContent = `revision ${strategy.revision}`;
@@ -459,6 +462,11 @@ function collectBacktestStrategy() {
   const strategy = structuredClone(bt.current);
   strategy.name = btName.value.trim();
   strategy.description = btDescription.value.trim();
+  strategy.market = {
+    type: document.getElementById("backtest-market-type").value,
+    calendar: "XNYS",
+    timezone: "America/New_York",
+  };
   strategy.definition.symbols = Array.from(btSymbols.querySelectorAll(".backtest-symbol-row")).map((row) => ({
     symbol: row.querySelector(".bt-symbol-code").value.trim().toUpperCase(),
     max_weight: strategy.code_key === "sevenstar_etf_rotation"
@@ -590,6 +598,7 @@ async function runBacktest() {
       body: JSON.stringify({ settings: bt.current.default_settings }),
     }));
     bt.currentRunId = payload.run.id;
+    renderBacktestMetrics(payload.run.metrics, payload.run);
     connectBacktestEvents(payload.run.id);
   } catch (error) {
     btSetRunning(false);
@@ -662,6 +671,7 @@ function consumeBacktestUpdate(payload) {
       bt.logs.push(log);
     }
   });
+  renderBacktestMetrics(payload.run?.metrics, payload.run);
   btChartEmpty.hidden = Boolean(bt.equityPoints.length);
   renderBacktestChart();
   renderBacktestLogs();
@@ -681,7 +691,7 @@ async function loadBacktestRunResult(runId, knownStatus = "") {
     bt.equityPoints = payload.equity_points || [];
     bt.trades = payload.trades || [];
     bt.logs = await loadAllBacktestLogs(runId);
-    renderBacktestMetrics(payload.run.metrics);
+    renderBacktestMetrics(payload.run.metrics, payload.run);
     btChartEmpty.hidden = Boolean(bt.equityPoints.length);
     renderBacktestChart();
     renderBacktestLogs();
@@ -714,32 +724,38 @@ async function loadAllBacktestLogs(runId) {
   return logs;
 }
 
-function renderBacktestMetrics(metrics) {
-  if (!metrics) {
-    btMetrics.innerHTML = '<div class="backtest-empty">运行完成后显示关键指标</div>';
-    return;
-  }
+function renderBacktestMetrics(metrics, run = {}) {
+  const isRunning = ["queued", "validating", "running", "cancelling"].includes(run.status);
+  const metricValue = (key, formatter) => metrics?.[key] == null
+    ? isRunning ? "运行中" : "—"
+    : formatter(metrics[key]);
+  const returnClass = (key) => {
+    const value = Number(metrics?.[key]);
+    if (!Number.isFinite(value) || value === 0) return "";
+    return value > 0 ? "backtest-return-positive" : "backtest-return-negative";
+  };
+  const outcome = metrics?.liquidated || run.termination_reason === "LIQUIDATED"
+    ? "已爆仓"
+    : isRunning
+      ? "运行中"
+      : run.status === "completed"
+        ? "正常完成"
+        : btRunStatusLabel(run.status);
   const fields = [
-    ["运行结果", metrics.liquidated ? "已爆仓" : "正常完成", metrics.liquidated ? "账户权益不大于零后已强制平仓并提前结束。" : "回测运行至设置的结束日期。"],
-    ["整体杠杆倍率", `${btNumber(metrics.leverage_multiplier ?? 1)}×`, "账户级杠杆倍率；各标的最终有效杠杆还会乘以策略中设置的单标的杠杆。"],
-    ["期末权益", btMoney(metrics.ending_equity), "回测结束时的现金、应收款与持仓市值之和。"],
-    ["总收益率", btPercent(metrics.total_return), "期末权益相对初始资金的累计变化。"],
-    ["年化收益率", btPercent(metrics.annualized_return), "将区间总收益按交易日折算为一年。短区间结果可能不稳定。"],
-    ["最大回撤", btPercent(metrics.max_drawdown), "权益曲线从历史高点到随后低点的最大跌幅。"],
-    ["夏普率", btNumber(metrics.sharpe_ratio), "年化超额收益除以全部收益波动率。"],
-    ["Sortino", btNumber(metrics.sortino_ratio), "年化超额收益除以下行波动率，只惩罚负收益波动。"],
-    ["交易次数", String(metrics.trade_count ?? 0), "回测产生的实际成交笔数。"],
-    ["累计手续费", btMoney(metrics.total_commission), "所有成交收取的每股手续费与最低手续费之和。"],
-    ["滑点成本", btMoney(metrics.total_slippage), "成交价相对参考价的不利价差成本。"],
-    ["胜率", btPercent(metrics.win_rate), "已平仓卖单中 FIFO 已实现盈亏为正的比例；不反映单笔盈亏大小。"],
-    ["换手率", btPercent(metrics.turnover), "成交总额除以平均权益，反映资金周转频率和交易成本敏感度。"],
-    ["超额收益", btPercent(metrics.excess_return), "策略总收益率减去比较基准总收益率。"],
+    ["运行结果", outcome, isRunning ? "回测尚未结束，指标会随进度持续更新。" : metrics?.liquidated ? "账户权益不大于零后已强制平仓并提前结束。" : "回测运行状态。"],
+    ["总收益率", metricValue("total_return", btPercent), "当前权益相对初始资金的累计变化。", returnClass("total_return")],
+    ["年化收益率", metricValue("annualized_return", btPercent), "按当前已完成区间折算为一年，运行中和短区间结果可能不稳定。", returnClass("annualized_return")],
+    ["最大回撤", metricValue("max_drawdown", btPercent), "截至当前，权益曲线从历史高点到随后低点的最大跌幅。"],
+    ["夏普率", metricValue("sharpe_ratio", btNumber), "截至当前，年化超额收益除以全部收益波动率。"],
+    ["Sortino", metricValue("sortino_ratio", btNumber), "截至当前，年化超额收益除以下行波动率，只惩罚负收益波动。"],
+    ["交易次数", metricValue("trade_count", (value) => String(value)), "截至当前，回测产生的实际成交笔数。"],
+    ["胜率", metricValue("win_rate", btPercent), "截至当前，已平仓卖单中 FIFO 已实现盈亏为正的比例；不反映单笔盈亏大小。"],
   ];
-  if (metrics.liquidated && metrics.liquidation?.liquidation_time) {
-    fields.splice(2, 0, ["爆仓时间", metrics.liquidation.liquidation_time, "分钟级风险时钟首次检测到账户权益不大于零的时间。"]);
+  if (metrics?.liquidated && metrics.liquidation?.liquidation_time) {
+    fields.splice(1, 0, ["爆仓时间", metrics.liquidation.liquidation_time, "分钟级风险时钟首次检测到账户权益不大于零的时间。"]);
   }
-  btMetrics.innerHTML = fields.map(([label, value, title]) => `
-    <div class="backtest-metric" title="${btEscape(title)}"><span>${label}</span><strong>${value}</strong></div>
+  btMetrics.innerHTML = fields.map(([label, value, title, valueClass]) => `
+    <div class="backtest-metric" title="${btEscape(title)}"><span>${label}</span><strong${valueClass ? ` class="${valueClass}"` : ""}>${value}</strong></div>
   `).join("");
 }
 

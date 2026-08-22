@@ -19,7 +19,7 @@ from services.realtime_mail import NotificationDispatcher
 from services.realtime_market_data import IEXMarketDataHub
 from services.realtime_panel_script import generate_panel_settings
 from services.market_data_request_coordinator import PRIORITY_FORMAL_DECISION
-from services.market_data_service import refresh_symbol_daily_history
+from services.market_data_service import refresh_strategy_daily_history
 from services.realtime_history_service import prepare_strategy_history
 
 
@@ -62,9 +62,10 @@ def _validate_local_history(strategy: dict) -> None:
     prepare_strategy_history(
         strategy,
         trading_date=cutoff.isoformat(),
-        refresh=lambda symbol, start_date: refresh_symbol_daily_history(
+        refresh=lambda symbol, start_date: refresh_strategy_daily_history(
             symbol,
             start_date=start_date,
+            market_type=strategy["market"]["type"],
             priority=PRIORITY_FORMAL_DECISION,
         ),
     )
@@ -479,7 +480,13 @@ class RealtimeTaskManager:
             return
         try:
             run = realtime_repository.get_run(run_id)
-            result = self.evaluator.evaluate(task, run, trading_date=trading_date, event=event)
+            result = self.evaluator.evaluate(
+                task,
+                run,
+                trading_date=trading_date,
+                event=event,
+                scheduled_at=scheduled_at,
+            )
             # A run is immutable: edits made to the task while it is active
             # take effect only after stop/start, including notification rules.
             run_task = {

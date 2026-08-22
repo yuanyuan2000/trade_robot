@@ -14,7 +14,8 @@ from services.backtest.portfolio import D, Lot, Portfolio, Position
 from services.backtest.validation import validate_strategy_payload
 from services.realtime_market_data import IEXMarketDataHub
 from services.market_data_request_coordinator import PRIORITY_FORMAL_DECISION
-from services.market_data_service import refresh_symbol_daily_history
+from services.market_data_service import refresh_strategy_daily_history
+from services.market_context import market_sessions
 from services.realtime_history_service import prepare_strategy_history
 
 
@@ -82,7 +83,7 @@ def _current_daily_row(symbol: str, payload: dict) -> dict:
         "low": float(source.get("low", payload["signal_price"])),
         "close": float(source.get("close", payload["signal_price"])),
         "volume": float(source.get("volume") or 0),
-        "source_provider": "alpaca",
+        "source_provider": "alpaca_crypto" if "/" in symbol else "alpaca",
         "source_timeframe": "1Day" if daily_is_complete_bar else "1Min",
         "price_basis": "raw",
         "is_complete": 0 if payload.get("event") not in {"CLOSE"} else 1,
@@ -95,6 +96,7 @@ def _build_dataset(
     trading_date: str,
     *,
     history_daily: dict[str, list[dict]] | None = None,
+    market_session: dict | None = None,
 ) -> HistoricalDataSet:
     definition = strategy["definition"]
     symbols = [str(item["symbol"]).upper() for item in definition.get("symbols", [])]
@@ -115,7 +117,7 @@ def _build_dataset(
         daily[symbol] = [dict(row) for row in rows]
         live_payload = payload["symbols"].get(symbol)
         if not live_payload:
-            raise RuntimeError(f"{symbol} 缺少 IEX 实时行情。")
+            raise RuntimeError(f"{symbol} 缺少正式事件实时行情。")
         daily[symbol] = [row for row in daily[symbol] if row.get("date") != trading_date]
         daily[symbol].append({**_current_daily_row(symbol, live_payload), "date": trading_date})
     actions = backtest_repository.get_corporate_actions(
@@ -123,21 +125,22 @@ def _build_dataset(
         start_date=(date.fromisoformat(trading_date) - timedelta(days=370)).isoformat(),
         end_date=trading_date,
     )
-    market_session = {
+    market_session = dict(market_session or {
         "trading_date": trading_date,
         "open_minute_utc": int(datetime.fromisoformat(f"{trading_date}T09:30:00").replace(tzinfo=NEW_YORK).astimezone(UTC).timestamp()) // 60,
         "close_minute_utc": int(datetime.fromisoformat(f"{trading_date}T16:00:00").replace(tzinfo=NEW_YORK).astimezone(UTC).timestamp()) // 60,
         "is_early_close": False,
-    }
+    })
     cumulative: dict[str, dict[str, float]] = {}
     for symbol in symbols:
         volume = payload["symbols"][symbol].get("cumulative_volume")
         if volume is not None:
             cumulative[symbol] = {f"{trading_date}|{payload['event']}": float(volume)}
     manifest = {
-        "data_contract_version": 1,
-        "source": "alpaca",
-        "feed": "iex",
+        "data_contract_version": 3,
+        "source": payload.get("source") or "alpaca",
+        "feed": payload.get("feed") or "iex",
+        "market": strategy.get("market"),
         "symbols": {symbol: {"daily_rows": len(daily[symbol])} for symbol in symbols},
         "market_sessions": [market_session],
         "timezone": "America/New_York",
@@ -159,7 +162,15 @@ class RealtimeDecisionEvaluator:
     def __init__(self, hub: IEXMarketDataHub):
         self.hub = hub
 
-    def evaluate(self, task: dict, run: dict, *, trading_date: str, event: str) -> dict:
+    def evaluate(
+        self,
+        task: dict,
+        run: dict,
+        *,
+        trading_date: str,
+        event: str,
+        scheduled_at: datetime | None = None,
+    ) -> dict:
         strategy = validate_strategy_payload(deepcopy(run["strategy_snapshot"]))
         definition = strategy["definition"]
         candidate_symbols = [str(item["symbol"]).upper() for item in definition.get("symbols", [])]
@@ -176,19 +187,62 @@ class RealtimeDecisionEvaluator:
         history_snapshot = prepare_strategy_history(
             strategy,
             trading_date=trading_date,
-            refresh=lambda symbol, start_date: refresh_symbol_daily_history(
+            refresh=lambda symbol, start_date: refresh_strategy_daily_history(
                 symbol,
                 start_date=start_date,
+                market_type=strategy["market"]["type"],
                 priority=PRIORITY_FORMAL_DECISION,
             ),
         )
+        session_rows = market_sessions(
+            trading_date,
+            trading_date,
+            strategy["market"],
+        )
+        if not session_rows:
+            raise RuntimeError(f"{trading_date} 不是策略市场交易日。")
+        market_session = session_rows[0]
+        effective_target_at = scheduled_at
+        if effective_target_at is None and event not in {"OPEN", "CLOSE"}:
+            requested = datetime.fromisoformat(
+                f"{trading_date}T{event}:00"
+            ).replace(tzinfo=NEW_YORK).astimezone(UTC)
+            open_at = datetime.fromtimestamp(
+                int(market_session["open_minute_utc"]) * 60,
+                tz=UTC,
+            )
+            close_at = datetime.fromtimestamp(
+                int(market_session["close_minute_utc"]) * 60,
+                tz=UTC,
+            )
+            effective_target_at = requested
+            if not open_at <= requested < close_at:
+                offset = None
+                if strategy["design_mode"] == "code" and market_session.get("is_early_close"):
+                    strategy_type = get_code_strategy(strategy["code_key"])
+                    offset = strategy_type.early_close_offsets(
+                        definition.get("params", {})
+                    ).get(event)
+                if offset is not None:
+                    effective_target_at = close_at - timedelta(minutes=int(offset))
         allow_partial = strategy["selection_mode"] == "competition"
+        previous_session_closes = {
+            symbol: {
+                "date": rows[-1]["date"],
+                "close": rows[-1]["close"],
+            }
+            for symbol, rows in history_snapshot["daily"].items()
+            if rows
+        }
         payload = self.hub.event_snapshot(
             symbols,
             trading_date=trading_date,
             event=event,
             include_cumulative_volume=include_volume,
             allow_missing=allow_partial,
+            market_session=market_session,
+            effective_target_at=effective_target_at,
+            previous_session_closes=previous_session_closes,
         )
         payload["trading_date"] = trading_date
         payload["event"] = event
@@ -197,9 +251,7 @@ class RealtimeDecisionEvaluator:
         if missing_auxiliary:
             raise RuntimeError("代码策略所需辅助标的行情缺失：" + "、".join(missing_auxiliary))
         if allow_partial:
-            required_candidates = [
-                symbol for symbol in candidate_symbols if "/" not in symbol
-            ]
+            required_candidates = list(candidate_symbols)
             missing_candidates = [
                 symbol for symbol in required_candidates if symbol not in available
             ]
@@ -211,7 +263,7 @@ class RealtimeDecisionEvaluator:
                 symbol for symbol in candidate_symbols if symbol in available
             ]
             if len(available_candidates) < 2:
-                raise RuntimeError("competition 模式至少需要两个标的取得有效 IEX 行情。")
+                raise RuntimeError("competition 模式至少需要两个标的取得有效正式事件行情。")
             strategy["definition"]["symbols"] = [
                 item for item in definition.get("symbols", [])
                 if str(item["symbol"]).upper() in set(available_candidates)
@@ -222,6 +274,7 @@ class RealtimeDecisionEvaluator:
             payload,
             trading_date,
             history_daily=history_snapshot["daily"],
+            market_session=market_session,
         )
         settings = {
             **strategy.get("default_settings", {}),
@@ -280,8 +333,8 @@ class RealtimeDecisionEvaluator:
             "run_id": run["id"],
             "trading_date": trading_date,
             "event": event,
-            "source": "alpaca",
-            "feed": "iex",
+            "source": payload.get("source") or "alpaca",
+            "feed": payload.get("feed") or "iex",
             "recommendations": recommendations,
             "orders": [intent.__dict__ for intent in intents],
             "trades": trades,

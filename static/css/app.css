@@ -2359,6 +2359,14 @@ td {
   white-space: nowrap;
 }
 
+.backtest-metric strong.backtest-return-positive {
+  color: var(--success);
+}
+
+.backtest-metric strong.backtest-return-negative {
+  color: var(--danger);
+}
+
 .backtest-chart-wrap {
   position: relative;
   min-height: 340px;

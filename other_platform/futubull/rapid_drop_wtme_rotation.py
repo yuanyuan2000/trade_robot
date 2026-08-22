@@ -5,13 +5,13 @@ class Strategy(StrategyBase):
         self.trigger_symbols()
         self.global_variables()
         self.custom_indicator()
-        self.candidates = [self.candidate_1, self.candidate_2, self.candidate_3, self.candidate_4, self.candidate_5, self.candidate_6, self.candidate_7]
+        self.candidates = [self.candidate_1, self.candidate_2, self.candidate_3, self.candidate_4, self.candidate_5, self.candidate_6, self.candidate_7, self.candidate_8]
         self.risk_off = []
         self.last_risk_date = -1
         self.last_selection_date = -1
 
     def trigger_symbols(self):
-        # 回测参数中依次绑定：GLD、SLV、XLE、SPY、QQQ、SOXX、FXI；也可换成同市场标的。
+        # 回测参数中前 7 个可依次绑定 GLD、SLV、XLE、SPY、QQQ、SOXX、FXI，第 8 个自行绑定。
         self.candidate_1 = declare_trig_symbol(is_trade_symbol=True)
         self.candidate_2 = declare_trig_symbol(is_trade_symbol=True)
         self.candidate_3 = declare_trig_symbol(is_trade_symbol=True)
@@ -19,6 +19,7 @@ class Strategy(StrategyBase):
         self.candidate_5 = declare_trig_symbol(is_trade_symbol=True)
         self.candidate_6 = declare_trig_symbol(is_trade_symbol=True)
         self.candidate_7 = declare_trig_symbol(is_trade_symbol=True)
+        self.candidate_8 = declare_trig_symbol(is_trade_symbol=True)
 
     def global_variables(self):
         self.wtme_period = show_variable(13, GlobalType.INT)
@@ -67,6 +68,10 @@ class Strategy(StrategyBase):
             bar_high(symbol=self.candidate_7, bar_type=BarType.D1, select=500, session_type=THType.RTH)
             bar_low(symbol=self.candidate_7, bar_type=BarType.D1, select=500, session_type=THType.RTH)
             bar_close(symbol=self.candidate_7, bar_type=BarType.D1, select=500, session_type=THType.RTH)
+            bar_close(symbol=self.candidate_8, bar_type=BarType.M1, select=2, session_type=THType.RTH)
+            bar_high(symbol=self.candidate_8, bar_type=BarType.D1, select=500, session_type=THType.RTH)
+            bar_low(symbol=self.candidate_8, bar_type=BarType.D1, select=500, session_type=THType.RTH)
+            bar_close(symbol=self.candidate_8, bar_type=BarType.D1, select=500, session_type=THType.RTH)
 
     def handle_data(self):
         if not self._parameters_valid():

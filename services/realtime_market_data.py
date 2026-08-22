@@ -5,7 +5,11 @@ import threading
 from zoneinfo import ZoneInfo
 
 from config import ALPACA_API_KEY, ALPACA_SECRET
-from services.alpaca_data_client import fetch_latest_stock_bars, fetch_stock_bars
+from services.alpaca_data_client import (
+    fetch_crypto_bars_page,
+    fetch_latest_stock_bars,
+    fetch_stock_bars,
+)
 from services.market_data_request_coordinator import (
     PRIORITY_FORMAL_DECISION,
     market_data_request_coordinator,
@@ -26,10 +30,11 @@ def _minute_timestamp(value: datetime) -> datetime:
 
 
 class IEXMarketDataHub:
-    """Event-time IEX data owner for formal realtime decisions.
+    """Event-time Alpaca data owner for formal realtime decisions.
 
     There is intentionally no background polling. Each scheduled action takes
     an exact REST snapshot, even when market-overview automatic refresh is off.
+    US stocks use IEX and supported crypto symbols use Alpaca Crypto.
     """
 
     def __init__(self, *, poll_seconds: float = 15.0):
@@ -94,8 +99,11 @@ class IEXMarketDataHub:
         now: datetime | None = None,
         include_cumulative_volume: bool = False,
         allow_missing: bool = False,
+        market_session: dict | None = None,
+        effective_target_at: datetime | None = None,
+        previous_session_closes: dict[str, dict] | None = None,
     ) -> dict:
-        """Fetch only the IEX bars needed by one scheduled event.
+        """Fetch only the Alpaca bars needed by one scheduled event.
 
         The returned manifest is part of the audit record.  For exact minute
         events, the signal is the last complete minute before the scheduled
@@ -104,44 +112,64 @@ class IEXMarketDataHub:
         """
         now = _as_utc(now or datetime.now(UTC))
         current_day = datetime.fromisoformat(trading_date).replace(tzinfo=NEW_YORK)
-        open_at = current_day.replace(hour=9, minute=30, second=0, microsecond=0).astimezone(UTC)
-        close_at = current_day.replace(hour=16, minute=0, second=0, microsecond=0).astimezone(UTC)
-        target_at = close_at if event == "CLOSE" else open_at if event == "OPEN" else current_day.replace(
-            hour=int(event[:2]), minute=int(event[3:]), second=0, microsecond=0
-        ).astimezone(UTC)
+        open_at = (
+            datetime.fromtimestamp(int(market_session["open_minute_utc"]) * 60, tz=UTC)
+            if market_session
+            else current_day.replace(hour=9, minute=30, second=0, microsecond=0).astimezone(UTC)
+        )
+        close_at = (
+            datetime.fromtimestamp(int(market_session["close_minute_utc"]) * 60, tz=UTC)
+            if market_session
+            else current_day.replace(hour=16, minute=0, second=0, microsecond=0).astimezone(UTC)
+        )
+        target_at = (
+            _as_utc(effective_target_at).astimezone(UTC)
+            if effective_target_at is not None
+            else close_at if event == "CLOSE"
+            else open_at if event == "OPEN"
+            else current_day.replace(
+                hour=int(event[:2]), minute=int(event[3:]), second=0, microsecond=0
+            ).astimezone(UTC)
+        )
         end_at = min(max(now, target_at + timedelta(minutes=1)), close_at + timedelta(minutes=2))
         result: dict[str, dict] = {}
         missing: list[str] = []
         for symbol in sorted({str(item).strip().upper() for item in symbols}):
-            # BTC/USD and other slash symbols belong to Alpaca's crypto
-            # endpoint, not the free stock IEX feed.  Do not turn this into a
-            # misleading generic response-format error.
-            if "/" in symbol:
-                missing.append(f"{symbol}: IEX 股票行情不支持该加密货币代码")
-                continue
+            is_crypto = "/" in symbol
             try:
                 def fetch_event_pages() -> dict:
-                    minute_page = fetch_stock_bars(
-                        symbol,
-                        timeframe="1Min",
-                        start=open_at.isoformat().replace("+00:00", "Z"),
-                        end=end_at.isoformat().replace("+00:00", "Z"),
-                        feed="iex",
-                        limit=1000,
-                        max_pages=1,
-                    )
-                    daily_page = fetch_stock_bars(
-                        symbol,
-                        timeframe="1Day",
-                        # Include prior sessions: the OPEN signal is the last
-                        # completed daily close, never the current session's
-                        # partial bar.
-                        start=(current_day - timedelta(days=10)).date().isoformat(),
-                        end=(current_day + timedelta(days=1)).date().isoformat(),
-                        feed="iex",
-                        limit=10,
-                        max_pages=1,
-                    )
+                    if is_crypto:
+                        minute_page = fetch_crypto_bars_page(
+                            symbol,
+                            timeframe="1Min",
+                            start=(open_at - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+                            end=end_at.isoformat().replace("+00:00", "Z"),
+                            location="us",
+                            limit=1000,
+                        )
+                        daily_page = {"data": []}
+                    else:
+                        minute_page = fetch_stock_bars(
+                            symbol,
+                            timeframe="1Min",
+                            start=open_at.isoformat().replace("+00:00", "Z"),
+                            end=end_at.isoformat().replace("+00:00", "Z"),
+                            feed="iex",
+                            limit=1000,
+                            max_pages=1,
+                        )
+                        daily_page = fetch_stock_bars(
+                            symbol,
+                            timeframe="1Day",
+                            # Include prior sessions: the OPEN signal is the last
+                            # completed daily close, never the current session's
+                            # partial bar.
+                            start=(current_day - timedelta(days=10)).date().isoformat(),
+                            end=(current_day + timedelta(days=1)).date().isoformat(),
+                            feed="iex",
+                            limit=10,
+                            max_pages=1,
+                        )
                     return {
                         "minute_rows": minute_page.get("data", []),
                         "daily_rows": daily_page.get("data", []),
@@ -173,17 +201,57 @@ class IEXMarketDataHub:
             if event == "OPEN":
                 previous_daily = [row for row in daily_rows if str(row.get("timestamp", ""))[:10] < trading_date]
                 previous_daily.sort(key=lambda item: str(item.get("timestamp", "")))
-                signal_row = previous_daily[-1] if previous_daily else None
-                fill_row = next((row for row in parsed_minutes if row["timestamp"] == open_at), None)
+                previous_session = (previous_session_closes or {}).get(symbol)
+                signal_row = (
+                    None
+                    if is_crypto
+                    else (previous_daily[-1] if previous_daily else None)
+                )
+                fill_row = next(
+                    (
+                        row for row in parsed_minutes
+                        if datetime.fromisoformat(
+                            row["timestamp"].replace("Z", "+00:00")
+                        ) == open_at
+                    ),
+                    None,
+                )
                 if fill_row is None and parsed_minutes:
-                    fill_row = parsed_minutes[0]
-                signal_price = float(signal_row["close"]) if signal_row else None
+                    fill_row = next(
+                        (
+                            row for row in parsed_minutes
+                            if datetime.fromisoformat(
+                                row["timestamp"].replace("Z", "+00:00")
+                            ) >= open_at
+                        ),
+                        None,
+                    )
+                signal_price = (
+                    float(previous_session["close"])
+                    if is_crypto and previous_session
+                    else float(signal_row["close"]) if signal_row
+                    else None
+                )
                 fill_price = float(fill_row["open"]) if fill_row else None
-                signal_time = f"{trading_date} 09:29:59 America/New_York"
+                signal_time = (
+                    f"{previous_session['date']} CLOSE America/New_York"
+                    if is_crypto and previous_session
+                    else f"{trading_date} 09:29:59 America/New_York"
+                )
             elif event == "CLOSE":
                 # A close event must be backed by Alpaca's complete daily bar;
                 # a last minute close is not silently substituted.
-                signal_row = parsed_daily[-1] if parsed_daily else None
+                signal_row = (
+                    next(
+                        (
+                            row for row in reversed(parsed_minutes)
+                            if datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")) < close_at
+                        ),
+                        None,
+                    )
+                    if is_crypto
+                    else (parsed_daily[-1] if parsed_daily else None)
+                )
                 signal_price = float(signal_row["close"]) if signal_row else None
                 fill_price = None
                 signal_time = str(signal_row.get("timestamp")) if signal_row else None
@@ -208,6 +276,20 @@ class IEXMarketDataHub:
                             f"{int(signal_age // 60)} 分钟"
                         )
                         continue
+            if is_crypto and event == "CLOSE" and signal_row is not None:
+                expected_minute = close_at - timedelta(minutes=1)
+                signal_age = (
+                    expected_minute
+                    - datetime.fromisoformat(
+                        signal_row["timestamp"].replace("Z", "+00:00")
+                    )
+                ).total_seconds()
+                if signal_age > MAX_SIGNAL_STALENESS_SECONDS:
+                    missing.append(
+                        f"{symbol}: {event} 前最新完整分钟已滞后 "
+                        f"{int(signal_age // 60)} 分钟"
+                    )
+                    continue
             if signal_price is None:
                 missing.append(f"{symbol}: 缺少 {trading_date} {event} 的信号行情")
                 continue
@@ -228,18 +310,24 @@ class IEXMarketDataHub:
                 "daily": day_row,
                 "daily_is_complete": bool(parsed_daily),
                 "cumulative_volume": cumulative_volume,
-                "source": "alpaca",
-                "feed": "iex",
+                "source": "alpaca_crypto" if is_crypto else "alpaca",
+                "feed": "us" if is_crypto else "iex",
                 "requested_at": pages["fetched_at"],
             }
         if missing and not allow_missing:
-            raise RuntimeError("IEX 行情不完整：" + "；".join(missing[:8]))
+            raise RuntimeError("正式事件行情不完整：" + "；".join(missing[:8]))
         if allow_missing and not result:
-            raise RuntimeError("competition 模式没有任何标的取得有效 IEX 行情：" + "；".join(missing[:8]))
+            raise RuntimeError("competition 模式没有任何标的取得有效行情：" + "；".join(missing[:8]))
+        source_types = {
+            value["source"] for value in result.values()
+        }
+        feeds = {value["feed"] for value in result.values()}
         return {
             "symbols": result,
-            "source": "alpaca",
-            "feed": "iex",
+            "source": (
+                next(iter(source_types)) if len(source_types) == 1 else "alpaca_mixed"
+            ),
+            "feed": next(iter(feeds)) if len(feeds) == 1 else "mixed",
             "timeframe": "1Min",
             "trading_date": trading_date,
             "event": event,

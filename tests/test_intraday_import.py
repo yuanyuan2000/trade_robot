@@ -93,6 +93,31 @@ class IntradayImportTests(unittest.TestCase):
             "2020-01-02T14:30:00Z",
         )
 
+    @patch.object(importer.repository, "upsert_symbol")
+    @patch.object(importer, "fetch_crypto_bars_page")
+    def test_btc_import_clamps_to_verified_minute_history_start(
+        self,
+        fetch_page,
+        _upsert_symbol,
+    ) -> None:
+        fetch_page.return_value = {
+            "data": [],
+            "next_page_token": None,
+            "rate_limit": {"remaining": 149},
+        }
+
+        result = importer.import_symbol_history(
+            "BTC/USD",
+            start="2020-01-01",
+            end="2021-01-02T00:00:00Z",
+        )
+
+        self.assertEqual(result["start"], "2021-01-01T00:00:00Z")
+        self.assertEqual(
+            fetch_page.call_args.kwargs["start"],
+            "2021-01-01T00:00:00Z",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

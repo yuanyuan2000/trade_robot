@@ -385,7 +385,7 @@ class RealtimeDashboardTests(unittest.TestCase):
         self.assertNotIn('class="realtime-dashboard-summary"', html)
         self.assertIn('class="realtime-back-icon"', html)
         self.assertIn("按任务策略模拟最新时点，非正式决策", html)
-        self.assertIn("IEX 与 SIP 数据源暂不统一", html)
+        self.assertIn("股票 IEX/SIP 与加密 Crypto feed 会分别记录", html)
         script = (Path(__file__).parents[1] / "static" / "js" / "realtime.js").read_text(encoding="utf-8")
         self.assertNotIn("任务快照候选池 · 每 60 秒轮询内部数据", script)
         self.assertIn('`已过滤 ${summary.filtered ?? 0}`', script)

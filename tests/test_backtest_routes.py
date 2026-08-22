@@ -44,6 +44,31 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertIn('id="backtest-syntax-help-open"', html)
         self.assertIn("bt-result-select-hitbox", script)
 
+    def test_backtest_metric_panel_uses_live_retained_fields_only(self) -> None:
+        script = (Path(app_module.app.static_folder) / "js" / "backtest.js").read_text(encoding="utf-8")
+        start = script.index("function renderBacktestMetrics")
+        end = script.index("function renderBacktestChart", start)
+        renderer = script[start:end]
+
+        for label in ("运行结果", "总收益率", "年化收益率", "最大回撤", "夏普率", "Sortino", "交易次数", "胜率"):
+            self.assertIn(f'["{label}"', renderer)
+        for label in ("整体杠杆倍率", "期末权益", "累计手续费", "滑点成本", "换手率", "超额收益"):
+            self.assertNotIn(f'["{label}"', renderer)
+        self.assertIn('? isRunning ? "运行中" : "—"', renderer)
+        self.assertIn("renderBacktestMetrics(payload.run?.metrics, payload.run)", script)
+
+    def test_backtest_returns_use_directional_colors(self) -> None:
+        script = (Path(app_module.app.static_folder) / "js" / "backtest.js").read_text(encoding="utf-8")
+        stylesheet = (Path(app_module.app.static_folder) / "css" / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn('value > 0 ? "backtest-return-positive" : "backtest-return-negative"', script)
+        self.assertIn('returnClass("total_return")', script)
+        self.assertIn('returnClass("annualized_return")', script)
+        self.assertIn(".backtest-metric strong.backtest-return-positive", stylesheet)
+        self.assertIn("color: var(--success);", stylesheet)
+        self.assertIn(".backtest-metric strong.backtest-return-negative", stylesheet)
+        self.assertIn("color: var(--danger);", stylesheet)
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.database_path = Path(self.temp_dir.name) / "market.sqlite"
@@ -67,6 +92,11 @@ class BacktestRouteTests(unittest.TestCase):
         )
         self.assertEqual(created_response.status_code, 201)
         strategy = created_response.get_json()["strategy"]
+        self.assertEqual(strategy["market"], {
+            "type": "US_EQUITY",
+            "calendar": "XNYS",
+            "timezone": "America/New_York",
+        })
 
         validated = self.client.post(
             f"/api/backtest/strategies/{strategy['id']}/validate"
@@ -81,6 +111,10 @@ class BacktestRouteTests(unittest.TestCase):
         )
         self.assertEqual(updated.status_code, 200)
         self.assertEqual(updated.get_json()["strategy"]["revision"], 2)
+        self.assertEqual(
+            updated.get_json()["strategy"]["market"]["type"],
+            "US_EQUITY",
+        )
 
         conflict = self.client.patch(
             f"/api/backtest/strategies/{strategy['id']}",

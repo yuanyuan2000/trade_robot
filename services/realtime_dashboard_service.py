@@ -16,6 +16,11 @@ from services.backtest.engine import CodeEventContext
 from services.backtest.portfolio import Portfolio
 from services.backtest.validation import validate_strategy_payload
 from services.realtime_panel_script import validate_panel_script
+from services.market_context import (
+    filter_rows_for_market,
+    market_sessions,
+    normalize_market_config,
+)
 
 
 _CACHE_SECONDS = 30.0
@@ -59,19 +64,41 @@ def _cache_signature(
     )
 
 
-def _dataset_for_overview(overview: dict) -> tuple[HistoricalDataSet, dict, str]:
-    current_date = datetime.now(timezone.utc).astimezone(_NEW_YORK).date().isoformat()
+def _dataset_for_overview(
+    overview: dict,
+    strategy: dict,
+) -> tuple[HistoricalDataSet, dict, str]:
+    current_day = datetime.now(timezone.utc).astimezone(_NEW_YORK).date()
+    market = normalize_market_config(strategy.get("market"))
+    sessions = market_sessions(
+        (current_day - timedelta(days=14)).isoformat(),
+        current_day.isoformat(),
+        market,
+    )
+    current_date = str(sessions[-1]["trading_date"])
+    is_current_session = current_date == current_day.isoformat()
     daily: dict[str, list[dict]] = {}
     event_prices: dict[str, EventPrice] = {}
     cumulative: dict[str, dict[str, float]] = {}
     symbols: list[str] = []
     for item in overview.get("items", []):
         symbol = str(item["symbol"]).upper()
-        latest_price = item.get("latest_price")
-        rows = repository.get_daily_prices(symbol, include_metadata=True)
-        if latest_price is None or not rows:
+        rows = repository.get_strategy_daily_prices(
+            symbol,
+            market["type"],
+            include_metadata=True,
+        )
+        rows = filter_rows_for_market(rows, market)
+        if not rows:
             continue
         latest_row = dict(rows[-1])
+        latest_price = (
+            item.get("latest_price")
+            if is_current_session
+            else latest_row.get("close")
+        )
+        if latest_price is None:
+            continue
         history = [dict(row) for row in rows[:-1]]
         synthetic = {
             **latest_row,
@@ -88,7 +115,11 @@ def _dataset_for_overview(overview: dict) -> tuple[HistoricalDataSet, dict, str]
         event_prices[symbol] = EventPrice(
             signal_price=float(latest_price),
             fill_price=None,
-            signal_time=item.get("latest_price_updated_at") or item.get("latest_date") or current_date,
+            signal_time=(
+                item.get("latest_price_updated_at") or item.get("latest_date") or current_date
+                if is_current_session
+                else latest_row.get("date") or current_date
+            ),
             fill_time=None,
         )
         volume = float(latest_row.get("volume") or 0)
@@ -112,7 +143,7 @@ def _dataset_for_overview(overview: dict) -> tuple[HistoricalDataSet, dict, str]
         cumulative_volumes=cumulative,
         availability_start={symbol: rows[0]["date"] for symbol, rows in daily.items()},
         corporate_actions=actions,
-        manifest={"source": "database", "as_of": current_date},
+        manifest={"source": "database", "as_of": current_date, "market": market},
     )
     return dataset, event_prices, current_date
 
@@ -325,7 +356,7 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
         if not force and cached and cached[1] == signature and time.monotonic() - cached[0] < _CACHE_SECONDS:
             return deepcopy(cached[2])
 
-    dataset, event_prices, trading_date = _dataset_for_overview(overview)
+    dataset, event_prices, trading_date = _dataset_for_overview(overview, strategy)
     candidates = {
         str(item["symbol"]).upper()
         for item in strategy["definition"].get("symbols", [])
@@ -386,7 +417,7 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
     ranked = sorted(
         (
             row for row in rows
-            if row["eligible"] and row.get("score") is not None
+            if row["is_candidate"] and row["eligible"] and row.get("score") is not None
         ),
         key=lambda row: (-float(row["score"]), row["symbol"]),
     )

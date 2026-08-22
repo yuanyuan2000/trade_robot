@@ -5,7 +5,12 @@ from pathlib import Path
 import sqlite3
 import threading
 
-from config import DATA_DIR, INTRADAY_DATABASE_PATH, INTRADAY_SCHEMA_PATH
+from config import (
+    DATA_DIR,
+    INTRADAY_DATABASE_PATH,
+    INTRADAY_SCHEMA_PATH,
+    KNOWN_MINUTE_HISTORY_STARTS,
+)
 
 
 INTRADAY_WRITE_LOCK = threading.RLock()
@@ -55,6 +60,39 @@ def init_intraday_database() -> None:
                     "ALTER TABLE intraday_instruments "
                     "ADD COLUMN asset_class TEXT NOT NULL DEFAULT 'us_equity'"
                 )
+            if "minute_history_start_date" not in columns:
+                conn.execute(
+                    "ALTER TABLE intraday_instruments "
+                    "ADD COLUMN minute_history_start_date TEXT"
+                )
+            if "minute_history_start_source" not in columns:
+                conn.execute(
+                    "ALTER TABLE intraday_instruments "
+                    "ADD COLUMN minute_history_start_source TEXT"
+                )
+            if "minute_history_start_verified" not in columns:
+                conn.execute(
+                    "ALTER TABLE intraday_instruments "
+                    "ADD COLUMN minute_history_start_verified "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            conn.executemany(
+                """
+                UPDATE intraday_instruments
+                SET minute_history_start_date = ?,
+                    minute_history_start_source = ?,
+                    minute_history_start_verified = 1
+                WHERE symbol = ?
+                  AND (
+                      minute_history_start_date IS NULL
+                      OR minute_history_start_verified = 0
+                  )
+                """,
+                [
+                    (details["date"], details["source"], symbol)
+                    for symbol, details in KNOWN_MINUTE_HISTORY_STARTS.items()
+                ],
+            )
 
 
 def checkpoint_intraday_database(mode: str = "FULL") -> None:

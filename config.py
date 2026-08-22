@@ -60,4 +60,11 @@ FULL_HISTORY_START_DATE = "2020-01-01"
 FULL_HISTORY_OUTPUT_SIZE = 5000
 REQUEST_TIMEOUT_SECONDS = 20
 
+# Provider-level minute history limits are distinct from daily-history limits.
+# They are used by importers and strict intraday backtests alike.
+KNOWN_MINUTE_HISTORY_STARTS = {
+    "MAGS": {"date": "2023-04-11", "source": "alpaca"},
+    "BTC/USD": {"date": "2021-01-01", "source": "alpaca_crypto"},
+}
+
 MAX_DB_PAGE_SIZE = 50

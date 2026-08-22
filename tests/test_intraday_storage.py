@@ -54,6 +54,22 @@ class IntradayStorageTests(unittest.TestCase):
         self.assertEqual(state["row_count"], 1)
         self.assertEqual(state["status"], "success")
 
+    def test_daily_and_minute_history_starts_are_separate(self) -> None:
+        instrument = repository.get_instrument("BTC/USD")
+        if instrument is None:
+            repository.upsert_instrument("BTC/USD", asset_class="crypto")
+            instrument = repository.get_instrument("BTC/USD")
+
+        self.assertEqual(
+            instrument["minute_history_start_date"],
+            "2021-01-01",
+        )
+        self.assertEqual(
+            instrument["minute_history_start_source"],
+            "alpaca_crypto",
+        )
+        self.assertTrue(instrument["minute_history_start_verified"])
+
     def test_monthly_fingerprint_is_compact_and_stable(self) -> None:
         repository.upsert_minute_bars(
             "SPY",

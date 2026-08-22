@@ -15,6 +15,11 @@ from services.backtest.corporate_actions import (
 )
 from services.backtest.errors import BacktestDataError, BacktestValidationError
 from services.backtest.market_calendar import ensure_market_sessions
+from services.market_context import (
+    calendar_contract,
+    normalize_market_config,
+    strategy_daily_series,
+)
 from services.indicator_service import (
     WTME_DEFAULT_EPSILON,
     calculate_macd_components,
@@ -530,13 +535,19 @@ def load_historical_dataset(
     early_close_offsets: dict[str, int] | None = None,
     cumulative_volume_events: Iterable[str] = (),
     optional_symbols: Iterable[str] = (),
+    market: dict | str | None = None,
 ) -> HistoricalDataSet:
+    market_config = normalize_market_config(market)
     symbols = list(dict.fromkeys([*universe, *additional_symbols]))
     optional_symbols = set(optional_symbols)
     if not universe:
         raise BacktestValidationError("回测标的池不能为空。")
     daily = {
-        symbol: repository.get_daily_prices(symbol, include_metadata=True)
+        symbol: repository.get_strategy_daily_prices(
+            symbol,
+            market_config["type"],
+            include_metadata=True,
+        )
         for symbol in symbols
     }
     empty_required = [
@@ -556,7 +567,31 @@ def load_historical_dataset(
                 "end_date": end_date,
             },
         )
-    market_sessions = ensure_market_sessions(start_date, end_date)
+    earliest_daily = min(
+        str(rows[0]["date"])
+        for rows in daily.values()
+        if rows
+    )
+    all_market_sessions = ensure_market_sessions(
+        min(earliest_daily, start_date),
+        end_date,
+    )
+    all_session_dates = {
+        str(item["trading_date"]) for item in all_market_sessions
+    }
+    calendar_first = min(all_session_dates) if all_session_dates else start_date
+    daily = {
+        symbol: [
+            row for row in rows
+            if str(row["date"]) in all_session_dates
+            or str(row["date"]) < calendar_first
+        ]
+        for symbol, rows in daily.items()
+    }
+    market_sessions = [
+        item for item in all_market_sessions
+        if start_date <= str(item["trading_date"]) <= end_date
+    ]
     sessions = [item["trading_date"] for item in market_sessions]
     if not sessions:
         raise BacktestDataError("所选回测区间没有交易日数据。")
@@ -747,6 +782,47 @@ def load_historical_dataset(
             if event not in {"OPEN", "CLOSE"}
         }
     )
+    daily_availability_start = dict(availability_start)
+    minute_history_metadata: dict[str, dict] = {}
+    intraday_join_dates: dict[str, str] = {}
+    if exact_events:
+        for symbol in universe:
+            sync_state = intraday_repository.get_sync_state(symbol)
+            minute_history_metadata[symbol] = {
+                "minute_history_start_date": sync_state.get(
+                    "minute_history_start_date"
+                ),
+                "minute_history_start_source": sync_state.get(
+                    "minute_history_start_source"
+                ),
+                "minute_history_start_verified": bool(
+                    sync_state.get("minute_history_start_verified")
+                ),
+            }
+            minute_start = (
+                sync_state.get("minute_history_start_date")
+                if sync_state.get("minute_history_start_verified")
+                else None
+            )
+            daily_start = availability_start.get(symbol)
+            if not minute_start or not daily_start:
+                continue
+            combined_start = max(daily_start, str(minute_start))
+            daily_dates = {row["date"] for row in daily[symbol]}
+            joined_session = next(
+                (
+                    trading_date
+                    for trading_date in sessions
+                    if trading_date >= combined_start
+                    and trading_date in daily_dates
+                ),
+                None,
+            )
+            availability_start[symbol] = joined_session
+            if joined_session and (
+                joined_session > daily_start or joined_session > sessions[0]
+            ):
+                intraday_join_dates[symbol] = joined_session
     early_close_offsets = dict(early_close_offsets or {})
     cumulative_volume_events = set(cumulative_volume_events)
     session_by_date = {item["trading_date"]: item for item in market_sessions}
@@ -960,6 +1036,7 @@ def load_historical_dataset(
             for key, value in sorted(cumulative_volumes.get(symbol, {}).items())
         ]
         manifest_symbols[symbol] = {
+            "daily_series": strategy_daily_series(symbol, market_config),
             "daily_first": (
                 relevant_daily[0]["date"] if relevant_daily else None
             ),
@@ -972,7 +1049,16 @@ def load_historical_dataset(
             "minute_sha256": _sha256(relevant_minute),
             "cumulative_volume_points": len(relevant_cumulative_volumes),
             "cumulative_volume_sha256": _sha256(relevant_cumulative_volumes),
-            "history_start_date": symbol_settings[symbol].get("history_start_date"),
+            "daily_history_start_date": (
+                relevant_daily[0]["date"] if relevant_daily else None
+            ),
+            "daily_eligible_start_date": daily_availability_start.get(symbol),
+            **minute_history_metadata.get(symbol, {}),
+            "intraday_join_date": intraday_join_dates.get(symbol),
+            # Compatibility alias for older exported manifests.
+            "history_start_date": (
+                relevant_daily[0]["date"] if relevant_daily else None
+            ),
             "eligible_start_date": availability_start.get(symbol),
             "asset_class": symbol_settings[symbol].get("asset_class") or "us_equity",
             "quantity_step": symbol_settings[symbol].get("quantity_step"),
@@ -1003,7 +1089,8 @@ def load_historical_dataset(
         for item in market_sessions
     ]
     manifest = {
-        "data_contract_version": 2,
+        "data_contract_version": 3,
+        "market": calendar_contract(market_config),
         "symbols": {
             symbol: manifest_symbols[symbol]
             for symbol in symbols
@@ -1016,7 +1103,7 @@ def load_historical_dataset(
         "early_close_event_offsets": early_close_offsets,
         "delayed_intraday_events": delayed_intraday_events,
         "minimum_lookback": minimum_lookback,
-        "timezone": "America/New_York",
+        "timezone": market_config["timezone"],
         "early_close_sessions": [
             item["trading_date"]
             for item in market_sessions

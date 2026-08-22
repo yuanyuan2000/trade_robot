@@ -198,18 +198,32 @@ def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
     metadata = metadata or {}
     now = utc_now_iso()
     with get_connection() as conn:
+        symbol_columns = {
+            str(row["name"])
+            for row in conn.execute('PRAGMA table_info("symbols")').fetchall()
+        }
+        display_columns = (
+            "show_weekend_data, show_non_us_market_days"
+            if "show_non_us_market_days" in symbol_columns
+            else "show_weekend_data"
+        )
+        display_defaults = (
+            "1, 1"
+            if "show_non_us_market_days" in symbol_columns
+            else "1"
+        )
         next_order = conn.execute(
             "SELECT COALESCE(MAX(display_order), 0) + 1 AS next_order FROM symbols"
         ).fetchone()["next_order"]
         conn.execute(
-            """
+            f"""
             INSERT INTO symbols
-                (symbol, name, exchange_name, currency, show_weekend_data,
+                (symbol, name, exchange_name, currency, {display_columns},
                  show_in_overview, display_order, asset_class, quantity_step,
                  alpaca_asset_id, cusip, isin,
                  history_start_date, history_start_source,
                  history_start_verified, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, {display_defaults}, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 name = COALESCE(excluded.name, symbols.name),
                 exchange_name = COALESCE(excluded.exchange_name, symbols.exchange_name),
@@ -256,6 +270,38 @@ def upsert_symbol(symbol: str, metadata: dict | None = None) -> int:
             ),
         )
         row = conn.execute("SELECT id FROM symbols WHERE symbol = ?", (symbol,)).fetchone()
+        daily_start = metadata.get(
+            "daily_history_start_date",
+            metadata.get("history_start_date"),
+        )
+        if daily_start:
+            conn.execute(
+                """
+                UPDATE symbols
+                SET daily_history_start_date = COALESCE(
+                        daily_history_start_date, ?
+                    ),
+                    daily_history_start_source = COALESCE(
+                        daily_history_start_source, ?
+                    ),
+                    daily_history_start_verified = MAX(
+                        daily_history_start_verified, ?
+                    )
+                WHERE symbol = ?
+                """,
+                (
+                    daily_start,
+                    metadata.get(
+                        "daily_history_start_source",
+                        metadata.get("history_start_source"),
+                    ),
+                    1 if metadata.get(
+                        "daily_history_start_verified",
+                        metadata.get("history_start_verified"),
+                    ) else 0,
+                    symbol,
+                ),
+            )
     return int(row["id"])
 
 
@@ -296,11 +342,14 @@ def get_symbol(symbol: str) -> dict:
         row = conn.execute(
             """
             SELECT id, symbol, name, exchange_name, currency,
-                   show_weekend_data, show_in_overview,
+                   show_weekend_data, show_non_us_market_days, show_in_overview,
                    alpaca_symbol, alpaca_asset_id, alpaca_supported,
                    alpaca_checked_at, alpaca_error, asset_class, cusip, isin,
                    quantity_step, history_start_date,
                    history_start_source, history_start_verified,
+                   daily_history_start_date,
+                   daily_history_start_source,
+                   daily_history_start_verified,
                    created_at, updated_at
             FROM symbols
             WHERE id = ?
@@ -308,7 +357,11 @@ def get_symbol(symbol: str) -> dict:
             (symbol_id,),
         ).fetchone()
     data = dict(row)
-    data["show_weekend_data"] = bool(data["show_weekend_data"])
+    data["show_non_us_market_days"] = bool(
+        data.get("show_non_us_market_days", data["show_weekend_data"])
+    )
+    # Compatibility alias for older clients and exported settings.
+    data["show_weekend_data"] = data["show_non_us_market_days"]
     data["show_in_overview"] = bool(data["show_in_overview"])
     data["alpaca_supported"] = (
         bool(data["alpaca_supported"])
@@ -316,11 +369,21 @@ def get_symbol(symbol: str) -> dict:
         else None
     )
     data["history_start_verified"] = bool(data["history_start_verified"])
+    data["daily_history_start_date"] = (
+        data["daily_history_start_date"] or data["history_start_date"]
+    )
+    data["daily_history_start_source"] = (
+        data["daily_history_start_source"] or data["history_start_source"]
+    )
+    data["daily_history_start_verified"] = bool(
+        data["daily_history_start_verified"]
+        or data["history_start_verified"]
+    )
     data["display_symbol"] = get_symbol_display_name(data["symbol"])
     return data
 
 
-def mark_symbol_history_start(
+def mark_daily_history_start(
     symbol: str,
     history_start_date: str,
     *,
@@ -350,12 +413,30 @@ def mark_symbol_history_start(
                     ELSE history_start_source
                 END,
                 history_start_verified = ?,
+                daily_history_start_date = CASE
+                    WHEN daily_history_start_date IS NULL
+                      OR ? < daily_history_start_date
+                    THEN ?
+                    ELSE daily_history_start_date
+                END,
+                daily_history_start_source = CASE
+                    WHEN daily_history_start_date IS NULL
+                      OR ? <= daily_history_start_date
+                    THEN ?
+                    ELSE daily_history_start_source
+                END,
+                daily_history_start_verified = ?,
                 asset_class = COALESCE(?, asset_class),
                 quantity_step = COALESCE(?, quantity_step),
                 updated_at = ?
             WHERE symbol = ?
             """,
             (
+                history_start_date,
+                history_start_date,
+                history_start_date,
+                source,
+                1 if verified else 0,
                 history_start_date,
                 history_start_date,
                 history_start_date,
@@ -368,6 +449,26 @@ def mark_symbol_history_start(
             ),
         )
     return get_symbol(normalized)
+
+
+def mark_symbol_history_start(
+    symbol: str,
+    history_start_date: str,
+    *,
+    source: str,
+    verified: bool = True,
+    asset_class: str | None = None,
+    quantity_step: float | None = None,
+) -> dict:
+    """Compatibility wrapper; new code should use the explicit daily name."""
+    return mark_daily_history_start(
+        symbol,
+        history_start_date,
+        source=source,
+        verified=verified,
+        asset_class=asset_class,
+        quantity_step=quantity_step,
+    )
 
 
 def set_alpaca_capability(
@@ -406,7 +507,11 @@ def set_alpaca_capability(
     return get_symbol(normalized)
 
 
-def get_symbol_price_snapshot(symbol: str) -> dict:
+def get_symbol_price_snapshot(
+    symbol: str,
+    *,
+    show_non_us_market_days: bool = True,
+) -> dict:
     year_start = f"{date.today().year}-01-01"
     with get_connection() as conn:
         latest_rows = conn.execute(
@@ -441,6 +546,32 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
             """,
             (symbol,),
         ).fetchone()
+        recent_date_rows = conn.execute(
+            """
+            SELECT date
+            FROM daily_prices
+            WHERE symbol = ?
+            ORDER BY date DESC
+            LIMIT 20
+            """,
+            (symbol,),
+        ).fetchall()
+
+    latest_us_session_date = None
+    if recent_date_rows and not show_non_us_market_days:
+        from services.market_context import market_session_dates
+
+        recent_dates = [str(row["date"]) for row in recent_date_rows]
+        allowed = market_session_dates(
+            (
+                date.fromisoformat(min(recent_dates)) - timedelta(days=14)
+            ).isoformat(),
+            max(recent_dates),
+        )
+        latest_us_session_date = next(
+            (value for value in recent_dates if value in allowed),
+            None,
+        )
 
     latest = dict(latest_rows[0]) if latest_rows else None
     previous = dict(latest_rows[1]) if len(latest_rows) > 1 else None
@@ -494,6 +625,11 @@ def get_symbol_price_snapshot(symbol: str) -> dict:
             if latest_weekday_row
             else None
         ),
+        "latest_us_market_session_date": (
+            latest_us_session_date
+            if not show_non_us_market_days
+            else (latest["date"] if latest else None)
+        ),
         "latest_price_updated_at": latest["price_updated_at"] if latest else None,
         "latest_price_is_complete": bool(latest["is_complete"]) if latest else None,
         "latest_price_is_provisional": not bool(latest["is_complete"]) if latest else None,
@@ -524,6 +660,7 @@ def list_market_overview(page: int = 1, page_size: int = 100) -> dict:
         rows = conn.execute(
             """
             SELECT id, symbol, name, show_weekend_data,
+                   show_non_us_market_days,
                    display_order, updated_at
             FROM symbols
             WHERE show_in_overview = 1
@@ -534,13 +671,19 @@ def list_market_overview(page: int = 1, page_size: int = 100) -> dict:
     items = []
     for row in rows:
         item = dict(row)
-        item["show_weekend_data"] = bool(item["show_weekend_data"])
+        item["show_non_us_market_days"] = bool(
+            item.get("show_non_us_market_days", item["show_weekend_data"])
+        )
+        item["show_weekend_data"] = item["show_non_us_market_days"]
         item["display_symbol"] = get_symbol_display_name(item["symbol"])
-        item.update(get_symbol_price_snapshot(item["symbol"]))
+        item.update(get_symbol_price_snapshot(
+            item["symbol"],
+            show_non_us_market_days=item["show_non_us_market_days"],
+        ))
         item["analysis_latest_date"] = (
             item["latest_date"]
-            if item["show_weekend_data"]
-            else item["latest_weekday_date"]
+            if item["show_non_us_market_days"]
+            else item["latest_us_market_session_date"]
         )
         items.append(item)
 
@@ -770,8 +913,14 @@ def set_symbol_overview_visibility(symbol: str, show_in_overview: bool) -> dict:
 def update_symbol_settings(symbol: str, payload: dict) -> dict:
     symbol_id = upsert_symbol(symbol)
     allowed: dict[str, object] = {}
-    if "show_weekend_data" in payload:
-        allowed["show_weekend_data"] = 1 if bool(payload["show_weekend_data"]) else 0
+    display_non_sessions = payload.get(
+        "show_non_us_market_days",
+        payload.get("show_weekend_data"),
+    )
+    if display_non_sessions is not None:
+        rendered = 1 if bool(display_non_sessions) else 0
+        allowed["show_non_us_market_days"] = rendered
+        allowed["show_weekend_data"] = rendered
     if "show_in_overview" in payload:
         allowed["show_in_overview"] = 1 if bool(payload["show_in_overview"]) else 0
 
@@ -1318,13 +1467,159 @@ def upsert_daily_prices(
             payload,
         )
     if payload:
-        mark_symbol_history_start(
+        mark_daily_history_start(
             symbol,
             min(str(row[1]) for row in payload),
             source=source_provider or str(rows[0].get("source_provider") or "database"),
             verified=True,
         )
     return len(payload)
+
+
+def upsert_daily_price_series(
+    symbol: str,
+    series_code: str,
+    rows: list[dict],
+    *,
+    source_provider: str | None = None,
+    source_timeframe: str | None = None,
+) -> int:
+    normalized_series = str(series_code or "").strip().upper()
+    if not normalized_series:
+        raise ValueError("Daily price series code is required")
+    now = utc_now_iso()
+
+    def price_basis(row: dict) -> str:
+        explicit = str(row.get("price_basis") or "").strip().lower()
+        if explicit in {"raw", "split_adjusted", "total_return_adjusted", "unknown"}:
+            return explicit
+        provider = str(row.get("source_provider") or source_provider or "").lower()
+        return "raw" if provider in {"alpaca", "alpaca_crypto"} else "unknown"
+
+    payload = [
+        (
+            symbol,
+            normalized_series,
+            row["date"],
+            row["open"],
+            row["high"],
+            row["low"],
+            row["close"],
+            row.get("volume", 0),
+            row.get("source_provider", source_provider),
+            row.get("source_timeframe", source_timeframe),
+            price_basis(row),
+            1 if row.get("is_complete", True) else 0,
+            now,
+            now,
+        )
+        for row in rows
+    ]
+    with get_connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO daily_price_series
+                (symbol, series_code, date, open, high, low, close, volume,
+                 source_provider, source_timeframe, price_basis,
+                 is_complete, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, series_code, date) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                close = excluded.close,
+                volume = excluded.volume,
+                source_provider = excluded.source_provider,
+                source_timeframe = excluded.source_timeframe,
+                price_basis = excluded.price_basis,
+                is_complete = excluded.is_complete,
+                updated_at = excluded.updated_at
+            """,
+            payload,
+        )
+    return len(payload)
+
+
+def get_daily_price_series(
+    symbol: str,
+    series_code: str,
+    start_date: str | None = None,
+    *,
+    include_metadata: bool = False,
+) -> list[dict]:
+    params: list[str] = [symbol, str(series_code).strip().upper()]
+    where = "symbol = ? AND series_code = ?"
+    if start_date:
+        where += " AND date >= ?"
+        params.append(start_date)
+    fields = "date, open, high, low, close, volume"
+    if include_metadata:
+        fields += ", source_provider, source_timeframe, price_basis, is_complete, updated_at"
+    try:
+        with get_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {fields}
+                FROM daily_price_series
+                WHERE {where}
+                ORDER BY date ASC
+                """,
+                params,
+            ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        return []
+    return [dict(row) for row in rows]
+
+
+def get_strategy_daily_prices(
+    symbol: str,
+    market_type: str = "US_EQUITY",
+    *,
+    include_metadata: bool = False,
+) -> list[dict]:
+    normalized = normalize_symbol_key(symbol)
+    if str(market_type).strip().upper() == "US_EQUITY" and "/" in normalized:
+        rows = get_daily_price_series(
+            normalized,
+            "US_EQUITY_SESSION",
+            include_metadata=include_metadata,
+        )
+        if rows:
+            return rows
+        # Compatibility with databases created before named series existed.
+        legacy = get_daily_prices(normalized, include_metadata=True)
+        session_rows = [
+            row for row in legacy
+            if row.get("source_timeframe") == "nyse_session_derived_1m"
+        ]
+        if not session_rows:
+            # Supplied/test databases and legacy imports may not carry source
+            # metadata. The market-calendar filter still applies downstream.
+            session_rows = legacy
+        if not include_metadata:
+            return [
+                {key: row[key] for key in ("date", "open", "high", "low", "close", "volume")}
+                for row in session_rows
+            ]
+        return session_rows
+    return get_daily_prices(normalized, include_metadata=include_metadata)
+
+
+def get_legacy_session_daily_start(symbol: str) -> str | None:
+    """Return the first legacy strategy-derived row still in native storage."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT MIN(date) AS first_date
+            FROM daily_prices
+            WHERE symbol = ?
+              AND source_timeframe = 'nyse_session_derived_1m'
+            """,
+            (normalize_symbol_key(symbol),),
+        ).fetchone()
+    return str(row["first_date"]) if row and row["first_date"] else None
 
 
 def delete_daily_prices(

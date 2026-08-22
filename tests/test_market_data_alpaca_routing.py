@@ -135,36 +135,30 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         update.assert_called_once_with("GLD", initialize_intraday=True)
 
-    @patch.object(service.repository, "get_symbol")
     def test_verified_late_inception_counts_as_initialized_history(
-        self, get_symbol
+        self,
     ) -> None:
-        get_symbol.return_value = {
-            "history_start_date": "2021-01-01",
-            "history_start_verified": True,
-        }
         sync_state = {
             "row_count": 2_600_000,
             "earliest_minute_at": "2021-01-01T06:00:00Z",
             "latest_complete_minute_at": "2026-07-31T17:53:00Z",
+            "minute_history_start_date": "2021-01-01",
+            "minute_history_start_verified": True,
         }
 
         self.assertTrue(
             service._has_initialized_intraday_history("BTC/USD", sync_state)
         )
 
-    @patch.object(service.repository, "get_symbol")
     def test_unverified_late_start_does_not_hide_missing_history(
-        self, get_symbol
+        self,
     ) -> None:
-        get_symbol.return_value = {
-            "history_start_date": "2021-01-01",
-            "history_start_verified": False,
-        }
         sync_state = {
             "row_count": 2_600_000,
             "earliest_minute_at": "2021-01-01T06:00:00Z",
             "latest_complete_minute_at": "2026-07-31T17:53:00Z",
+            "minute_history_start_date": "2021-01-01",
+            "minute_history_start_verified": False,
         }
 
         self.assertFalse(
@@ -309,6 +303,52 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         )
         import_history.assert_not_called()
         get_sync_state.assert_not_called()
+
+    @patch.object(service, "_merge_live_iex_daily_snapshots", return_value=0)
+    @patch.object(service, "refresh_symbol_daily_history")
+    @patch.object(
+        service.repository,
+        "get_legacy_session_daily_start",
+        return_value="2021-01-04",
+    )
+    @patch.object(service, "_ensure_alpaca_capability")
+    def test_overview_repairs_legacy_crypto_native_daily_even_when_sessions_complete(
+        self,
+        capability,
+        _legacy_start,
+        refresh_daily,
+        _merge_live,
+    ) -> None:
+        capability.return_value = {
+            "alpaca_supported": True,
+            "alpaca_symbol": "BTC/USD",
+        }
+        refresh_daily.return_value = {
+            "updated_rows": 100,
+            "source": "yahoo",
+        }
+        alias = {
+            "common_symbol": "BTC/USD",
+            "display_name": "BTC/USD",
+            "yahoo_symbol": "BTC-USD",
+            "twelvedata_symbol": "BTC/USD",
+        }
+        results = {"BTC/USD": {"status": "pending"}}
+
+        pending = service._sync_overview_daily_from_alpaca(
+            [alias],
+            date(2026, 8, 1),
+            results,
+            history_audits={"BTC/USD": {"complete": True}},
+        )
+
+        self.assertEqual(pending, [])
+        refresh_daily.assert_called_once_with(
+            "BTC/USD",
+            start_date=date(2021, 1, 4),
+            priority=service.PRIORITY_OVERVIEW,
+        )
+        self.assertEqual(results["BTC/USD"]["source"], "yahoo")
 
     @patch.object(service.repository, "get_symbol")
     @patch.object(service.repository, "get_daily_prices")

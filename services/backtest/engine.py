@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Callable
 
 from database import intraday_repository
@@ -202,6 +202,7 @@ class BacktestEngine:
             early_close_offsets=self.early_close_offsets,
             cumulative_volume_events=self.cumulative_volume_events,
             optional_symbols=self.auxiliary_symbols,
+            market=self.strategy.get("market"),
         )
         self._validate_supplied_dataset(additional)
         portfolio_kwargs = {
@@ -342,6 +343,32 @@ class BacktestEngine:
                 "events": self.events,
             },
         )
+        for symbol in self.tradable_symbols:
+            details = self.dataset.manifest.get("symbols", {}).get(symbol, {})
+            join_date = details.get("intraday_join_date")
+            if not join_date:
+                continue
+            parsed = date.fromisoformat(join_date)
+            rendered_date = f"{parsed.year}年{parsed.month}月{parsed.day}日"
+            self._log(
+                "INFO",
+                "SYMBOL_INTRADAY_JOIN",
+                f"{symbol}从{rendered_date}加入回测。",
+                event_time=f"{join_date} OPEN",
+                symbol=symbol,
+                context={
+                    "join_date": join_date,
+                    "daily_eligible_start_date": details.get(
+                        "daily_eligible_start_date"
+                    ),
+                    "minute_history_start_date": details.get(
+                        "minute_history_start_date"
+                    ),
+                    "minute_history_start_source": details.get(
+                        "minute_history_start_source"
+                    ),
+                },
+            )
         pending_close: list[OrderIntent] = []
         peak = float(self.settings["initial_capital"])
 

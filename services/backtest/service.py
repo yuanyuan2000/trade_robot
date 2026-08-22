@@ -18,6 +18,7 @@ from services.backtest.errors import (
     BacktestError,
     BacktestValidationError,
 )
+from services.backtest.metrics import calculate_metrics
 from services.intraday_import_service import import_symbol_history
 from services.market_data_integrity import latest_completed_session_dates
 from services.market_data_service import refresh_symbol_daily_history
@@ -252,13 +253,19 @@ def _compact_number(value: object) -> str:
 
 
 def build_run_configuration_summary(strategy: dict, settings: dict) -> str:
+    market = strategy.get("market") or {
+        "type": "US_EQUITY",
+        "calendar": "XNYS",
+        "timezone": "America/New_York",
+    }
     common = (
         f"{settings['start_date']}至{settings['end_date']}，初始资金"
         f"${settings['initial_capital']:,.2f}，{settings['leverage_multiplier']:g}倍杠杆，"
         f"每股手续费${settings['commission_per_share']:g}/最低${settings['minimum_commission']:g}，"
         f"滑点{settings['slippage_bps']:g}bps，"
         f"{'允许' if settings['allow_fractional_shares'] else '不允许'}碎股，"
-        f"基准{settings['benchmark']}"
+        f"基准{settings['benchmark']}，"
+        f"市场美股({market['calendar']})/美东时间"
     )
     if strategy["design_mode"] == "code":
         strategy_type = get_code_strategy(strategy["code_key"])
@@ -354,6 +361,7 @@ class BacktestRunManager:
             "equity_points": [],
             "trades": [],
             "logs": [],
+            "metrics": None,
             "last_db_update": 0.0,
             "dataset": preflight.dataset,
         }
@@ -381,10 +389,34 @@ class BacktestRunManager:
 
             def progress(payload: dict) -> None:
                 now_monotonic = time.monotonic()
+                equity_points = list(engine.equity_points)
+                trades = list(engine.trades)
+                portfolio = getattr(engine, "portfolio", None)
+                live_metrics = calculate_metrics(
+                    equity_points,
+                    trades,
+                    initial_capital=settings["initial_capital"],
+                    risk_free_rate=settings["risk_free_rate"],
+                    total_commission=float(
+                        getattr(portfolio, "total_commission", 0)
+                    ),
+                    total_slippage=float(
+                        getattr(portfolio, "total_slippage", 0)
+                    ),
+                    termination_reason=getattr(
+                        engine, "termination_reason", None
+                    ),
+                    liquidation=getattr(engine, "liquidation", None),
+                    leverage_multiplier=settings["leverage_multiplier"],
+                    max_observed_gross_leverage=getattr(
+                        engine, "max_observed_gross_leverage", 0
+                    ),
+                )
                 with self._lock:
-                    state["equity_points"] = list(engine.equity_points)
-                    state["trades"] = list(engine.trades)
+                    state["equity_points"] = equity_points
+                    state["trades"] = trades
                     state["logs"] = list(engine.logs)
+                    state["metrics"] = live_metrics
                     state["version"] += 1
                 if now_monotonic - state["last_db_update"] >= 0.5:
                     backtest_repository.update_run(
@@ -434,6 +466,7 @@ class BacktestRunManager:
                 state["equity_points"] = list(result.equity_points)
                 state["trades"] = list(result.trades)
                 state["logs"] = list(result.logs)
+                state["metrics"] = dict(result.metrics)
                 state["version"] += 1
         except BacktestCancelled as exc:
             if engine is not None:
@@ -550,6 +583,8 @@ class BacktestRunManager:
         with self._lock:
             state = self._states.get(run_id)
             if state:
+                if not run.get("metrics") and state["metrics"] is not None:
+                    run["metrics"] = deepcopy(state["metrics"])
                 run["live"] = {
                     "equity_point_count": len(state["equity_points"]),
                     "trade_count": len(state["trades"]),

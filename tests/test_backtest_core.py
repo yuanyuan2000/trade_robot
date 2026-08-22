@@ -283,6 +283,53 @@ class DataPreflightTests(unittest.TestCase):
             "is_early_close": False,
         }
 
+    @patch("services.backtest.data.repository.get_symbol", return_value={
+        "asset_class": "crypto",
+        "quantity_step": 0.0001,
+    })
+    @patch("services.backtest.data.ensure_corporate_actions", return_value=[])
+    @patch("services.backtest.data.ensure_market_sessions")
+    @patch("services.backtest.data.repository.get_strategy_daily_prices")
+    def test_us_strategy_daily_history_excludes_weekend_and_holiday(
+        self,
+        get_daily,
+        get_sessions,
+        _actions,
+        _symbol,
+    ) -> None:
+        get_daily.return_value = daily_rows(
+            ["2023-12-29", "2023-12-30", "2024-01-01", "2024-01-02"],
+            [100, 900, 800, 103],
+        )
+        get_sessions.return_value = [
+            {
+                "trading_date": day,
+                "open_minute_utc": _epoch_minute(day, "09:30"),
+                "close_minute_utc": _epoch_minute(day, "16:00"),
+                "is_early_close": False,
+            }
+            for day in ("2023-12-29", "2024-01-02")
+        ]
+
+        dataset = load_historical_dataset(
+            universe=["BTC/USD"],
+            additional_symbols=[],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+            intraday_events=[],
+            minimum_lookback=1,
+            market={"type": "US_EQUITY"},
+        )
+
+        self.assertEqual(
+            [row["date"] for row in dataset.daily["BTC/USD"]],
+            ["2023-12-29", "2024-01-02"],
+        )
+        self.assertEqual(
+            dataset.manifest["symbols"]["BTC/USD"]["daily_series"],
+            "US_EQUITY_SESSION",
+        )
+
     @patch(
         "services.backtest.data.ensure_market_sessions"
     )

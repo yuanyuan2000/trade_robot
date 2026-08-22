@@ -105,6 +105,10 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         ON symbol_aliases(twelvedata_symbol)
         """
     )
+    had_show_non_us_market_days = any(
+        row["name"] == "show_non_us_market_days"
+        for row in conn.execute('PRAGMA table_info("symbols")').fetchall()
+    )
     ensure_column(
         conn,
         table_name="symbols",
@@ -122,6 +126,12 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         table_name="symbols",
         column_name="display_order",
         definition="INTEGER NOT NULL DEFAULT 0",
+    )
+    ensure_column(
+        conn,
+        table_name="symbols",
+        column_name="show_non_us_market_days",
+        definition="INTEGER NOT NULL DEFAULT 1",
     )
     ensure_column(conn, "symbols", "alpaca_symbol", "TEXT")
     ensure_column(conn, "symbols", "alpaca_asset_id", "TEXT")
@@ -145,6 +155,14 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         "history_start_verified",
         "INTEGER NOT NULL DEFAULT 0",
     )
+    ensure_column(conn, "symbols", "daily_history_start_date", "TEXT")
+    ensure_column(conn, "symbols", "daily_history_start_source", "TEXT")
+    ensure_column(
+        conn,
+        "symbols",
+        "daily_history_start_verified",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
     conn.execute(
         """
         UPDATE symbols
@@ -152,6 +170,13 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         WHERE display_order IS NULL OR display_order = 0
         """
     )
+    if not had_show_non_us_market_days:
+        conn.execute(
+            """
+            UPDATE symbols
+            SET show_non_us_market_days = show_weekend_data
+            """
+        )
     ensure_column(
         conn,
         table_name="daily_prices",
@@ -223,8 +248,51 @@ def migrate_database(conn: sqlite3.Connection) -> None:
           )
         """
     )
+    conn.execute(
+        """
+        UPDATE symbols
+        SET daily_history_start_date = history_start_date,
+            daily_history_start_source = history_start_source,
+            daily_history_start_verified = history_start_verified
+        WHERE history_start_date IS NOT NULL
+          AND (
+              daily_history_start_date IS NULL
+              OR history_start_date < daily_history_start_date
+          )
+        """
+    )
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS daily_price_series (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            series_code TEXT NOT NULL,
+            date TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL DEFAULT 0,
+            source_provider TEXT,
+            source_timeframe TEXT,
+            price_basis TEXT NOT NULL DEFAULT 'unknown',
+            is_complete INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(symbol, series_code, date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_daily_price_series_lookup
+        ON daily_price_series(symbol, series_code, date);
+        INSERT OR IGNORE INTO daily_price_series (
+            symbol, series_code, date, open, high, low, close, volume,
+            source_provider, source_timeframe, price_basis, is_complete,
+            created_at, updated_at
+        )
+        SELECT symbol, 'US_EQUITY_SESSION', date, open, high, low, close, volume,
+               source_provider, source_timeframe, price_basis, is_complete,
+               created_at, updated_at
+        FROM daily_prices
+        WHERE source_timeframe = 'nyse_session_derived_1m';
         CREATE TABLE IF NOT EXISTS instrument_symbols (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             instrument_key TEXT NOT NULL,
@@ -332,6 +400,16 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         table_name="backtest_equity_points",
         column_name="receivables",
         definition="REAL NOT NULL DEFAULT 0",
+    )
+    ensure_column(
+        conn,
+        table_name="backtest_strategies",
+        column_name="market_json",
+        definition=(
+            "TEXT NOT NULL DEFAULT "
+            "'{\"calendar\":\"XNYS\",\"timezone\":\"America/New_York\","
+            "\"type\":\"US_EQUITY\"}'"
+        ),
     )
     conn.execute(
         """

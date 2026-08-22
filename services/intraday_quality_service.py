@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from statistics import median
 from zoneinfo import ZoneInfo
 
-from config import FULL_HISTORY_START_DATE
+from config import FULL_HISTORY_START_DATE, KNOWN_MINUTE_HISTORY_STARTS
 from database.intraday_db import intraday_database_info, intraday_quick_check
 from database.intraday_repository import (
     get_storage_quality_summary,
@@ -13,10 +13,6 @@ from database.intraday_repository import (
 
 
 VALIDATION_SYMBOLS = ["GLD", "SPY", "NVDA", "MU", "XLE"]
-KNOWN_PROVIDER_HISTORY_STARTS = {
-    "MAGS": "2023-04-11",
-    "BTC/USD": "2021-01-01",
-}
 NEW_YORK = ZoneInfo("America/New_York")
 
 
@@ -57,9 +53,9 @@ def validate_intraday_storage(symbols: list[str] | None = None) -> dict:
             item.update(regular_session_quality(symbol))
         first_at = item.get("first_at")
         last_at = item.get("last_at")
-        expected_start = KNOWN_PROVIDER_HISTORY_STARTS.get(
-            symbol, FULL_HISTORY_START_DATE
-        )
+        expected_start = KNOWN_MINUTE_HISTORY_STARTS.get(
+            symbol, {}
+        ).get("date", FULL_HISTORY_START_DATE)
         start_grace = (
             datetime.fromisoformat(expected_start).date()
             + timedelta(days=7)

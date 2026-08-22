@@ -208,12 +208,8 @@ def _has_initialized_intraday_history(symbol: str, sync_state: dict) -> bool:
         earliest_at.replace("Z", "+00:00")
     ).date()
     required_start = first_required_data_date(date.fromisoformat(FULL_HISTORY_START_DATE))
-    try:
-        settings = repository.get_symbol(symbol)
-    except Exception:
-        settings = {}
-    history_start = settings.get("history_start_date")
-    if settings.get("history_start_verified") and history_start:
+    history_start = sync_state.get("minute_history_start_date")
+    if sync_state.get("minute_history_start_verified") and history_start:
         required_start = max(required_start, date.fromisoformat(history_start))
     return earliest_date <= required_start
 
@@ -424,6 +420,17 @@ def _update_full_market_data_uncoordinated(
         )
         import_result = minute_result["import_result"]
         derived = minute_result["derived"]
+        native_daily_refresh = None
+        if normalized == "BTC/USD":
+            legacy_start = repository.get_legacy_session_daily_start(normalized)
+            native_daily_refresh = refresh_symbol_daily_history(
+                normalized,
+                start_date=(
+                    legacy_start
+                    or _overview_sync_start_date(normalized)
+                ),
+                priority=priority,
+            )
         rows = repository.get_daily_prices(
             normalized, start_date.isoformat(), include_metadata=True
         )
@@ -454,6 +461,7 @@ def _update_full_market_data_uncoordinated(
             "symbol_settings": settings,
             "intraday_sync": import_result["sync_state"],
             "derived_daily": derived,
+            "native_daily_refresh": native_daily_refresh,
             "data": adjusted["rows"],
             "adjustment": adjusted["adjustment"],
             "corporate_actions": adjusted["actions"],
@@ -559,6 +567,49 @@ def refresh_symbol_daily_history(
         ("daily-history", normalized, start_value.isoformat()),
         priority=priority,
         callback=execute,
+    )
+
+
+def refresh_strategy_daily_history(
+    symbol: str,
+    *,
+    start_date: str | date,
+    market_type: str = "US_EQUITY",
+    priority: int = PRIORITY_MANUAL,
+) -> dict:
+    """Refresh the daily series selected by a strategy market contract."""
+    normalized = normalize_symbol(symbol)
+    start_value = (
+        start_date if isinstance(start_date, date)
+        else date.fromisoformat(str(start_date)[:10])
+    )
+    if str(market_type).upper() == "US_EQUITY" and "/" in normalized:
+        def execute() -> dict:
+            imported = import_symbol_history(
+                normalized,
+                start=f"{start_value.isoformat()}T00:00:00Z",
+            )
+            derived = derive_daily_prices_from_minutes(
+                normalized,
+                start_at=f"{start_value.isoformat()}T00:00:00Z",
+            )
+            return {
+                "symbol": normalized,
+                "source": "alpaca_crypto",
+                "series": "US_EQUITY_SESSION",
+                "import_result": imported,
+                "derived": derived,
+            }
+
+        return market_data_request_coordinator.run(
+            ("strategy-daily-history", normalized, "US_EQUITY", start_value.isoformat()),
+            priority=priority,
+            callback=execute,
+        )
+    return refresh_symbol_daily_history(
+        normalized,
+        start_date=start_value,
+        priority=priority,
     )
 
 
@@ -753,13 +804,22 @@ def _sync_overview_daily_from_alpaca(
             if "/" not in alpaca_symbol:
                 live_symbol_map[alpaca_symbol] = normalized
             audit = (history_audits or {}).get(normalized)
-            if audit and audit.get("complete"):
+            legacy_start = (
+                repository.get_legacy_session_daily_start(normalized)
+                if normalized == "BTC/USD"
+                else None
+            )
+            if audit and audit.get("complete") and not legacy_start:
                 updated_rows = 0
                 source = "database"
                 sync_status = "history-current"
             else:
                 symbol_start = date.fromisoformat(
-                    str((audit or {}).get("repair_start_date") or start_date)[:10]
+                    str(
+                        legacy_start
+                        or (audit or {}).get("repair_start_date")
+                        or start_date
+                    )[:10]
                 )
 
                 refresh_result = refresh_symbol_daily_history(

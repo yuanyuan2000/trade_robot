@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from database import repository
 from services.backtest.market_calendar import ensure_market_sessions
+from services.market_context import filter_rows_for_market, normalize_market_config
 
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -58,17 +59,23 @@ def assess_daily_history(
     expected_dates: list[str],
     *,
     respect_verified_start: bool = False,
+    market: dict | str | None = None,
 ) -> dict:
     normalized = str(symbol).strip().upper()
-    rows = repository.get_daily_prices(normalized, include_metadata=True)
+    market_config = normalize_market_config(market)
+    rows = repository.get_strategy_daily_prices(
+        normalized,
+        market_config["type"],
+        include_metadata=True,
+    )
     expected = list(expected_dates)
     if respect_verified_start:
         try:
             settings = repository.get_symbol(normalized)
         except Exception:
             settings = {}
-        history_start = settings.get("history_start_date")
-        if settings.get("history_start_verified") and history_start:
+        history_start = settings.get("daily_history_start_date")
+        if settings.get("daily_history_start_verified") and history_start:
             expected = [value for value in expected if value >= str(history_start)]
 
     by_date = {str(row["date"]): dict(row) for row in rows}
@@ -123,11 +130,21 @@ def assess_daily_history(
     }
 
 
-def frozen_daily_rows(symbol: str, *, before_date: str) -> list[dict[str, Any]]:
-    return [
-        dict(row) for row in repository.get_daily_prices(
-            str(symbol).strip().upper(), include_metadata=True
-        )
+def frozen_daily_rows(
+    symbol: str,
+    *,
+    before_date: str,
+    market: dict | str | None = None,
+) -> list[dict[str, Any]]:
+    market_config = normalize_market_config(market)
+    rows = repository.get_strategy_daily_prices(
+        str(symbol).strip().upper(),
+        market_config["type"],
+        include_metadata=True,
+    )
+    completed = [
+        dict(row) for row in rows
         if str(row["date"]) < str(before_date)
         and bool(row.get("is_complete", True))
     ]
+    return filter_rows_for_market(completed, market_config)

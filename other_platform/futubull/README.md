@@ -49,7 +49,7 @@ Python，部分富途客户端版本的编辑器解析器仍可能误报语法�
 | 文件 | 候选运行标的默认绑定 | 额外运行标的 |
 | --- | --- | --- |
 | `rapid_drop_ratr_rotation.py` | SPY、GLD、NVDA、MU、XLE | 无 |
-| `rapid_drop_wtme_rotation.py` | GLD、SLV、XLE、SPY、QQQ、SOXX、FXI | 无 |
+| `rapid_drop_wtme_rotation.py` | GLD、SLV、XLE、SPY、QQQ、SOXX、FXI、第 8 个自定 | 无 |
 | `sevenstar_etf_rotation.py` | GLD、USO、SPY、QQQ、DIA、IWM、TLT | BIL（防御标的） |
 
 所有运行标的都使用 `declare_trig_symbol(is_trade_symbol=True)`，所以在启动回测时从富途
@@ -82,7 +82,7 @@ Python，部分富途客户端版本的编辑器解析器仍可能误报语法�
 - 10:00 使用此前 `N` 根完整日线和当前决策价组成 `N` 个观测；
 - 当前观测固定为“昨日收盘到当前决策价”，其 TR 为两者差的绝对值，不读取当天未来
   才能确定的最高价或最低价；
-- 默认 `N=13`、半衰期 `h=6`、`epsilon=1e-8`，选择 7 个候选中 WTME 最高的未过滤标的；
+- 默认 `N=13`、半衰期 `h=6`、`epsilon=1e-8`，选择 8 个候选中 WTME 最高的未过滤标的；
 - 分数完全相同时按代码升序决定；目标未变时不重复再平衡。
 
 WTME 策略与本目录行情副图指标现在均默认使用 `13/6`；策略参数仍可在富途回测参数面板

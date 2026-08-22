@@ -8,6 +8,7 @@ from typing import Any
 
 from services.backtest.dsl import compile_expression
 from services.backtest.errors import BacktestValidationError
+from services.market_context import normalize_market_config
 
 
 STRATEGY_MODES = {"visual", "code"}
@@ -354,6 +355,7 @@ def validate_strategy_payload(payload: dict, *, creating: bool = False) -> dict:
         "selection_mode": selection_mode,
         "code_key": code_key,
         "code_version": code_version,
+        "market": normalize_market_config(payload.get("market")),
         "definition": definition,
         "default_settings": validate_settings(payload.get("default_settings")),
         "schema_version": schema_version,

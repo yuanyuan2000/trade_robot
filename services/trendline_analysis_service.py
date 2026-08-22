@@ -20,6 +20,7 @@ import pandas as pd
 from scipy.signal import find_peaks
 
 from services.market_data_service import get_market_data
+from services.market_context import annotate_us_market_sessions
 
 
 Direction = Literal["up", "down"]
@@ -1667,12 +1668,15 @@ def _prepare_trendline_analysis(
 
     payload = get_market_data(symbol, adjustment=adjustment)
     raw_rows = payload.get("data") or []
+    raw_rows = annotate_us_market_sessions(raw_rows)
     include_weekends = resolve_show_weekend_data(
         show_weekend_data,
         payload.get("symbol_settings") or {},
     )
     if not include_weekends:
-        raw_rows = [row for row in raw_rows if not is_weekend_date(row["date"])]
+        raw_rows = [
+            row for row in raw_rows if row.get("is_us_market_session")
+        ]
     candles = aggregate_rows(raw_rows, clean_period)
     window_start = max(0, len(candles) - window_size)
     window = candles[window_start:]
@@ -1714,6 +1718,7 @@ def get_trendline_analysis_signature(
         "period": prepared["period"],
         "requested_window_size": prepared["requested_window_size"],
         "show_weekend_data": prepared["show_weekend_data"],
+        "show_non_us_market_days": prepared["show_weekend_data"],
         "data_count": len(candles),
         "latest_data_date": candles[-1]["date"] if candles else None,
         "data_fingerprint": prepared["data_fingerprint"],
@@ -1748,6 +1753,7 @@ def analyze_symbol_trendlines(symbol: str, period: str = "1D",
             "period": clean_period,
             "requested_window_size": window_size,
             "show_weekend_data": include_weekends,
+            "show_non_us_market_days": include_weekends,
             "window_start_index": 0,
             "window_size": len(candles),
             "data_count": len(candles),
@@ -1785,6 +1791,7 @@ def analyze_symbol_trendlines(symbol: str, period: str = "1D",
         "canonical_symbol": payload.get("canonical_symbol") or symbol,
         "source": payload.get("source"),
         "show_weekend_data": include_weekends,
+        "show_non_us_market_days": include_weekends,
         "period": clean_period,
         "requested_window_size": window_size,
         "window_start_index": window_start,
@@ -1802,7 +1809,12 @@ def resolve_show_weekend_data(value: str | bool | None, settings: dict) -> bool:
         return value
     if isinstance(value, str):
         return value.lower() in {"1", "true", "yes", "on"}
-    return bool(settings.get("show_weekend_data", True))
+    return bool(
+        settings.get(
+            "show_non_us_market_days",
+            settings.get("show_weekend_data", True),
+        )
+    )
 
 
 def is_weekend_date(date_text: str) -> bool:

@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from database import intraday_repository, repository
 from services.alpaca_data_client import fetch_asset
 from services.corporate_action_adjustment_service import adjusted_daily_payload
+from services.market_context import annotate_us_market_sessions, market_sessions
 
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -86,6 +87,41 @@ def _regular_session_parts(row: dict):
     if not REGULAR_OPEN_MINUTE <= minute_of_day < REGULAR_CLOSE_MINUTE:
         return None
     return local_dt, minute_of_day
+
+
+def filter_minute_rows_for_us_market(rows: Iterable[dict]) -> list[dict]:
+    """Keep only minutes inside actual XNYS sessions, including early closes."""
+    values = [dict(row) for row in rows]
+    if not values:
+        return []
+    local_dates = [
+        datetime.fromtimestamp(
+            int(row["minute_utc"]) * 60,
+            tz=timezone.utc,
+        ).astimezone(NEW_YORK).date()
+        for row in values
+    ]
+    sessions = market_sessions(
+        (min(local_dates) - timedelta(days=7)).isoformat(),
+        max(local_dates).isoformat(),
+    )
+    by_date = {
+        str(item["trading_date"]): item for item in sessions
+    }
+    return [
+        row for row in values
+        if (
+            (session := by_date.get(
+                datetime.fromtimestamp(
+                    int(row["minute_utc"]) * 60,
+                    tz=timezone.utc,
+                ).astimezone(NEW_YORK).date().isoformat()
+            ))
+            and int(session["open_minute_utc"])
+            <= int(row["minute_utc"])
+            < int(session["close_minute_utc"])
+        )
+    ]
 
 
 def _merge_group(rows: list[dict], label: str, end_label: str | None = None) -> dict:
@@ -211,7 +247,12 @@ def get_chart_bars(
                 "adjustment": "raw",
                 "warning": f"公司行动复权失败，当前显示原始行情：{exc}",
             }
-        bars = aggregate_daily_rows(adjusted["rows"], spec)[-requested_limit:]
+        source_rows = annotate_us_market_sessions(adjusted["rows"])
+        if not settings.get("show_non_us_market_days", True):
+            source_rows = [
+                row for row in source_rows if row.get("is_us_market_session")
+            ]
+        bars = aggregate_daily_rows(source_rows, spec)[-requested_limit:]
         return {
             "ok": True,
             "symbol": normalized,
@@ -254,7 +295,12 @@ def get_chart_bars(
         )
         if not page:
             break
-        raw_rows.extend(page)
+        page_for_aggregation = (
+            page
+            if settings.get("show_non_us_market_days", True)
+            else filter_minute_rows_for_us_market(page)
+        )
+        raw_rows.extend(page_for_aggregation)
         before_minute = min(row["minute_utc"] for row in page)
         reached_end = len(page) < 20_000
         if len(raw_rows) >= next_aggregate_at or reached_end:
@@ -391,14 +437,23 @@ def derive_daily_prices_from_minutes(
             source_timeframe="nyse_session_derived_1m",
         )
         daily_rows = [row for row in daily_rows if row["date"] in allowed_dates]
-    updated = repository.upsert_daily_prices(
-        normalized,
-        daily_rows,
-        source_provider="alpaca_crypto" if is_crypto else "alpaca",
-        source_timeframe=(
-            "nyse_session_derived_1m" if is_crypto else "derived_1m"
-        ),
-    )
+    if is_crypto:
+        # Keep the 24/7 native daily series used by the market-data UI separate
+        # from the NYSE-session bars used by US-market strategies.
+        updated = repository.upsert_daily_price_series(
+            normalized,
+            "US_EQUITY_SESSION",
+            daily_rows,
+            source_provider="alpaca_crypto",
+            source_timeframe="nyse_session_derived_1m",
+        )
+    else:
+        updated = repository.upsert_daily_prices(
+            normalized,
+            daily_rows,
+            source_provider="alpaca",
+            source_timeframe="derived_1m",
+        )
     return {
         "symbol": normalized,
         "updated_rows": updated,
