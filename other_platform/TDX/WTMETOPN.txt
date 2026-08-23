@@ -1,0 +1,7 @@
+{公式名称：WTMETOPN}
+{公式类型：条件选股公式；只在日线周期使用}
+{从“WTME池”按当前急跌状态与 WTME 动态选前 TOPN 名}
+{TOPN 在编辑器参数1-4表的第1行设置，缺省值为1}
+
+IRANK:=INSORT('WTME池','WTMES',6,0);
+XG:INBLOCK('WTME池') AND WTMES.ELIG=1 AND IRANK<=TOPN;
