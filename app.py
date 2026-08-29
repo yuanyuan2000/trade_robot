@@ -57,6 +57,10 @@ from services.trendline_analysis_service import (
     analyze_symbol_trendlines,
     get_trendline_analysis_signature,
 )
+from services.key_zone_analysis_service import (
+    KEY_ZONE_ALGORITHM_VERSION,
+    analyze_symbol_key_zones,
+)
 from services.backtest.errors import BacktestError
 from services.backtest.service import (
     code_strategy_catalog,
@@ -608,6 +612,96 @@ def run_market_data_update(
                     "updated_at": now_utc().isoformat(),
                 }
             )
+
+
+@app.route("/api/analysis/key-zones")
+def key_zone_analysis_query():
+    return key_zone_analysis_response(request.args.get("symbol", ""))
+
+
+@app.route("/api/analysis/key-zones/<path:symbol>")
+def key_zone_analysis(symbol: str):
+    return key_zone_analysis_response(symbol)
+
+
+def key_zone_analysis_response(symbol: str):
+    """Run and persist on-demand key zones outside the overview snapshots."""
+    try:
+        period = request.args.get("period", "1D")
+        limit = int(request.args.get("limit", "150"))
+        payload = analyze_symbol_key_zones(
+            symbol,
+            period=period,
+            limit=limit,
+            show_weekend_data=(
+                request.args.get("show_non_us_market_days")
+                if request.args.get("show_non_us_market_days") is not None
+                else request.args.get("show_weekend_data")
+            ),
+            adjustment=request.args.get("adjustment", "all"),
+        )
+        canonical_symbol = (
+            payload.get("canonical_symbol")
+            or payload.get("symbol")
+            or symbol
+        )
+        repository.save_key_zone_analysis_snapshot(
+            canonical_symbol,
+            payload,
+            KEY_ZONE_ALGORITHM_VERSION,
+        )
+        return jsonify(payload)
+    except ValueError as exc:
+        return jsonify({
+            "ok": False,
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": str(exc),
+                "detail": None,
+            },
+        }), 400
+    except MarketDataError as exc:
+        return jsonify({"ok": False, "error": exc.to_dict()}), 502
+    except Exception as exc:
+        app.logger.exception("Unexpected key-zone analysis error")
+        return jsonify({
+            "ok": False,
+            "error": {
+                "code": "UNKNOWN_ERROR",
+                "message": "系统识别水平支撑/压力区时发生未知错误。",
+                "detail": str(exc),
+            },
+        }), 500
+
+
+@app.route("/api/analysis/key-zone-snapshot")
+def key_zone_analysis_snapshot():
+    try:
+        show_value = (
+            request.args.get("show_non_us_market_days")
+            if request.args.get("show_non_us_market_days") is not None
+            else request.args.get("show_weekend_data")
+        )
+        show_weekend_data = str(show_value or "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        snapshot = repository.get_latest_key_zone_analysis_snapshot(
+            request.args.get("symbol", ""),
+            KEY_ZONE_ALGORITHM_VERSION,
+            period=request.args.get("period", "1D"),
+            window_size=int(request.args.get("limit", "150")),
+            show_weekend_data=show_weekend_data,
+            adjustment=request.args.get("adjustment", "all"),
+        )
+        return jsonify({"ok": True, "snapshot": snapshot})
+    except ValueError as exc:
+        return jsonify({
+            "ok": False,
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": str(exc),
+            },
+        }), 400
 
 
 @app.route("/api/market-overview")

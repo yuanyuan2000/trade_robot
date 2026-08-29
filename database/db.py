@@ -395,6 +395,46 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS key_zone_analysis_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            period TEXT NOT NULL,
+            window_size INTEGER NOT NULL,
+            show_weekend_data INTEGER NOT NULL,
+            adjustment TEXT NOT NULL,
+            algorithm_version TEXT NOT NULL,
+            latest_data_date TEXT,
+            data_fingerprint TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            computed_at TEXT NOT NULL,
+            UNIQUE(
+                symbol,
+                period,
+                window_size,
+                show_weekend_data,
+                adjustment,
+                algorithm_version,
+                data_fingerprint
+            )
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_key_zone_snapshots_lookup
+        ON key_zone_analysis_snapshots(
+            symbol,
+            period,
+            window_size,
+            show_weekend_data,
+            adjustment,
+            algorithm_version,
+            computed_at DESC
+        )
+        """
+    )
     ensure_column(
         conn,
         table_name="backtest_equity_points",

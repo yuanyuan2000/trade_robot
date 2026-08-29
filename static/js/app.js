@@ -336,12 +336,12 @@ async function loadMarketData(symbol, { includeIntraday = false } = {}) {
         "success",
       );
     }
-    if (currentWorkspaceMode === "analysis") {
-      await loadStoredTrendlineAnalysis(currentSymbol);
-    }
     if (getChartPeriod() !== "1D") {
       await loadPeriodMarketData(getChartPeriod(), { silent: true });
       await loadSymbolIndicators();
+    }
+    if (currentWorkspaceMode === "analysis") {
+      await loadStoredTrendlineAnalysis(currentSymbol);
     }
   } catch (error) {
     if (requestId !== marketLoadRequestId) return;
@@ -1531,22 +1531,23 @@ function renderCorporateActionEvents() {
   marketUpdateProgress.hidden = false;
 }
 
-async function runTrendlineAnalysis() {
+async function runSmartAnalysis() {
   if (!currentSymbol) {
     setStatus("请先输入并加载一个标的。", "error");
     return;
   }
   if (/^(?:[1-9]\d{0,2}m|[1-9]\d?h)$/.test(getChartPeriod())) {
-    setStatus("智能趋势线当前仍仅支持日线周期；分时K线可正常使用 MA/EMA 指标。", "warning");
-    return;
-  }
-  if (analysisAlgorithm.value !== "trendlines") {
-    setStatus("当前算法暂未实现。", "error");
+    setStatus("智能分析当前仅支持日线、3日、周线和月线周期；分时K线可正常使用指标。", "warning");
     return;
   }
 
+  const keyZonesSelected = analysisAlgorithm.value === "key_zones";
+  const analysisName = keyZonesSelected ? "水平支撑/压力区" : "直线趋势线";
+  const endpoint = keyZonesSelected
+    ? "/api/analysis/key-zones"
+    : "/api/analysis/trendlines";
   runAnalysisButton.disabled = true;
-  setStatus(`正在识别 ${currentSymbol} 最新150根${getChartPeriodLabel()}的直线趋势线...`, "neutral");
+  setStatus(`正在识别 ${currentSymbol} 最新150根${getChartPeriodLabel()}的${analysisName}...`, "neutral");
   try {
     const params = new URLSearchParams({
       symbol: currentSymbol,
@@ -1555,14 +1556,29 @@ async function runTrendlineAnalysis() {
       show_non_us_market_days: (currentSymbolSettings.show_non_us_market_days ?? currentSymbolSettings.show_weekend_data) ? "1" : "0",
       adjustment: priceAdjustmentMode.value,
     });
-    const response = await fetch(`/api/analysis/trendlines?${params}`);
+    const response = await fetch(`${endpoint}?${params}`);
     const payload = await parseJsonResponse(response);
     if (!payload.ok) {
-      setStatus(payload.error?.message || "趋势线识别失败。", "error");
+      setStatus(payload.error?.message || `${analysisName}识别失败。`, "error");
       clearTrendlineAnalysis();
       return;
     }
+    if (keyZonesSelected) {
+      const zones = payload.zones || [];
+      clearChartTrendlines();
+      setChartKeyZones(zones);
+      renderKeyZoneLegend(zones);
+      const suffix = payload.message ? ` ${payload.message}` : "";
+      setStatus(
+        zones.length
+          ? `已识别并展示 ${zones.length} 个水平支撑/压力区；色带仅覆盖形成证据区间。`
+          : `未识别出满足阈值的水平支撑/压力区。${suffix}`,
+        zones.length ? "success" : "warning",
+      );
+      return;
+    }
     const trendlines = decorateTrendlines(payload.trends || []);
+    clearChartKeyZones();
     setChartTrendlines(trendlines);
     renderTrendlineLegend(trendlines);
     const count = trendlines.length;
@@ -1573,21 +1589,34 @@ async function runTrendlineAnalysis() {
     );
   } catch (error) {
     clearTrendlineAnalysis();
-    setStatus(error.message || "趋势线识别失败。", "error");
+    setStatus(error.message || `${analysisName}识别失败。`, "error");
   } finally {
     runAnalysisButton.disabled = false;
   }
 }
 
 async function loadStoredTrendlineAnalysis(symbol) {
+  const keyZonesSelected = analysisAlgorithm.value === "key_zones";
   try {
-    const params = new URLSearchParams({ symbol });
-    const response = await fetch(`/api/analysis-overview/snapshot?${params}`);
+    const params = new URLSearchParams({
+      symbol,
+      period: getChartPeriod(),
+      limit: "150",
+      show_non_us_market_days: (currentSymbolSettings.show_non_us_market_days ?? currentSymbolSettings.show_weekend_data) ? "1" : "0",
+      adjustment: priceAdjustmentMode.value,
+    });
+    const endpoint = keyZonesSelected
+      ? "/api/analysis/key-zone-snapshot"
+      : "/api/analysis-overview/snapshot";
+    const response = await fetch(`${endpoint}?${params}`);
     const result = await parseJsonResponse(response);
     const snapshot = result.ok ? result.snapshot : null;
     if (!snapshot?.payload) {
       clearTrendlineAnalysis();
-      setStatus(`${symbol} 尚无分析快照，可点击智能识别立即计算。`, "neutral");
+      setStatus(
+        `${symbol} 尚无${keyZonesSelected ? "支撑/压力区" : "趋势线"}快照，可点击智能识别立即计算。`,
+        "neutral",
+      );
       return;
     }
     if (
@@ -1598,7 +1627,22 @@ async function loadStoredTrendlineAnalysis(symbol) {
       setStatus(`${symbol} 的图表设置已变化，请重新点击智能识别。`, "neutral");
       return;
     }
+    if (keyZonesSelected) {
+      const zones = snapshot.payload.zones || [];
+      clearChartTrendlines();
+      setChartKeyZones(zones);
+      renderKeyZoneLegend(getChartKeyZones());
+      const stale = snapshot.latest_data_date !== currentRawMarketData.at(-1)?.date;
+      setStatus(
+        stale
+          ? `已显示 ${symbol} 的上次支撑/压力区结果；行情已有更新，可重新识别。`
+          : `已加载 ${symbol} 的支撑/压力区分析，共 ${zones.length} 个。`,
+        stale ? "warning" : "success",
+      );
+      return;
+    }
     const trendlines = decorateTrendlines(snapshot.payload.trends || []);
+    clearChartKeyZones();
     setChartTrendlines(trendlines);
     renderTrendlineLegend(trendlines);
     const stale = snapshot.latest_data_date !== currentRawMarketData.at(-1)?.date;
@@ -1610,7 +1654,10 @@ async function loadStoredTrendlineAnalysis(symbol) {
     );
   } catch (error) {
     clearTrendlineAnalysis();
-    setStatus(error.message || "趋势线快照加载失败。", "warning");
+    setStatus(
+      error.message || `${keyZonesSelected ? "支撑/压力区" : "趋势线"}快照加载失败。`,
+      "warning",
+    );
   }
 }
 
@@ -1618,8 +1665,49 @@ function clearTrendlineAnalysis() {
   if (typeof clearChartTrendlines === "function") {
     clearChartTrendlines();
   }
+  if (typeof clearChartKeyZones === "function") {
+    clearChartKeyZones();
+  }
   trendlineLegend.innerHTML = "";
   trendlineLegend.hidden = true;
+}
+
+function renderKeyZoneLegend(zones) {
+  const sortedZones = [...zones].sort((left, right) => {
+    const scoreDifference = Number(right.score || 0) - Number(left.score || 0);
+    if (scoreDifference !== 0) return scoreDifference;
+    return Number(left.distance_from_current_atr || 0)
+      - Number(right.distance_from_current_atr || 0);
+  });
+  if (!sortedZones.length || currentWorkspaceMode !== "analysis") {
+    trendlineLegend.innerHTML = "";
+    trendlineLegend.hidden = true;
+    return;
+  }
+  const roleLabels = { support: "支撑区", resistance: "压力区" };
+  const statusLabels = { active: "有效", challenging: "测试中", retesting: "待回测", broken: "已破位" };
+  trendlineLegend.innerHTML = sortedZones.map((zone) => {
+    const visible = zone.visible !== false;
+    const visibilityClass = visible ? "" : " is-hidden";
+    const swatchClass = ["challenging", "retesting"].includes(zone.status)
+      ? "is-challenging"
+      : (zone.current_role === "support" ? "is-support" : "is-resistance");
+    const name = `${roleLabels[zone.current_role] || zone.current_role} ${statusLabels[zone.status] || zone.status}`;
+    return `
+      <div class="trendline-row${visibilityClass}" data-key-zone-id="${escapeHtml(zone.id)}">
+        <button class="legend-button${visibilityClass}" type="button" data-action="toggle-key-zone" title="${visible ? "隐藏" : "显示"}">
+          ${eyeIcon(visible)}
+        </button>
+        <span class="key-zone-swatch ${swatchClass}"></span>
+        <span class="trendline-name" title="${escapeHtml(`${formatOverviewPrice(zone.zone_low)}–${formatOverviewPrice(zone.zone_high)}`)}">${escapeHtml(name)}</span>
+        <span class="trendline-value">${Number(zone.score || 0).toFixed(1)}<span class="trendline-point">${Number(zone.distance_from_current_atr || 0).toFixed(2)}ATR</span></span>
+      </div>
+    `;
+  }).join("");
+  trendlineLegend.hidden = false;
+  if (typeof updateTrendlineLegendPlacement === "function") {
+    updateTrendlineLegendPlacement();
+  }
 }
 
 function renderTrendlineLegend(trendlines) {
@@ -1730,6 +1818,9 @@ async function saveSymbolSettings() {
     currentSymbolSettings = payload.symbol_settings;
     showWeekendData.checked = Boolean(currentSymbolSettings.show_non_us_market_days ?? currentSymbolSettings.show_weekend_data);
     await loadSymbolIndicators();
+    if (currentWorkspaceMode === "analysis") {
+      await loadStoredTrendlineAnalysis(currentSymbol);
+    }
     const nonSessionText = (currentSymbolSettings.show_non_us_market_days ?? currentSymbolSettings.show_weekend_data) ? "显示" : "隐藏";
     setStatus(`已保存 ${currentSymbol} 设置：${nonSessionText}美股休市日 K 线。`, "success");
   } catch (error) {
@@ -2373,8 +2464,33 @@ customIndicatorForm.addEventListener("submit", createAndAddIndicator);
 customIndicatorType.addEventListener("change", updateCustomIndicatorFields);
 updateDataButton.addEventListener("click", updateCurrentMarketData);
 overviewSymbolToggle.addEventListener("click", toggleCurrentOverview);
-runAnalysisButton.addEventListener("click", runTrendlineAnalysis);
+runAnalysisButton.addEventListener("click", runSmartAnalysis);
+analysisAlgorithm.addEventListener("change", async () => {
+  clearTrendlineAnalysis();
+  const name = analysisAlgorithm.value === "key_zones"
+    ? "水平支撑/压力区"
+    : "直线趋势线";
+  if (currentSymbol && currentWorkspaceMode === "analysis") {
+    setStatus(`正在加载${name}的上次识别结果...`, "neutral");
+    await loadStoredTrendlineAnalysis(currentSymbol);
+  }
+});
 trendlineLegend.addEventListener("click", (event) => {
+  const zoneButton = event.target.closest("button[data-action='toggle-key-zone']");
+  if (zoneButton) {
+    const row = zoneButton.closest(".trendline-row");
+    const zoneId = row?.dataset.keyZoneId;
+    if (!zoneId || typeof setChartKeyZoneVisible !== "function") {
+      return;
+    }
+    const zone = getChartKeyZones().find((item) => item.id === zoneId);
+    if (!zone) {
+      return;
+    }
+    setChartKeyZoneVisible(zoneId, zone.visible === false);
+    renderKeyZoneLegend(getChartKeyZones());
+    return;
+  }
   const button = event.target.closest("button[data-action='toggle-trendline']");
   if (!button) {
     return;
@@ -2405,6 +2521,9 @@ priceAdjustmentMode.addEventListener("change", async () => {
   try {
     await loadPeriodMarketData(getChartPeriod());
     await loadSymbolIndicators();
+    if (currentWorkspaceMode === "analysis") {
+      await loadStoredTrendlineAnalysis(currentSymbol);
+    }
   } catch (error) {
     setStatus(error.message || "切换复权方式失败。", "error");
   }
@@ -2418,7 +2537,7 @@ document.addEventListener("chart-period-change", async (event) => {
     await loadPeriodMarketData(event.detail.period);
     await loadSymbolIndicators();
     if (currentWorkspaceMode === "analysis" && currentSymbol) {
-      setStatus("K线周期已切换，请重新点击智能识别。", "neutral");
+      await loadStoredTrendlineAnalysis(currentSymbol);
     }
   } catch (error) {
     renderCandles([]);

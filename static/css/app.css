@@ -927,6 +927,30 @@ button:disabled {
   border-top-style: dashed;
 }
 
+.key-zone-swatch {
+  width: 26px;
+  height: 10px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(101, 113, 127, 0.8);
+  border-radius: 3px;
+  background: rgba(101, 113, 127, 0.16);
+}
+
+.key-zone-swatch.is-support {
+  border-color: rgba(35, 116, 90, 0.9);
+  background: rgba(35, 116, 90, 0.2);
+}
+
+.key-zone-swatch.is-resistance {
+  border-color: rgba(181, 71, 71, 0.9);
+  background: rgba(181, 71, 71, 0.2);
+}
+
+.key-zone-swatch.is-challenging {
+  border-color: rgba(245, 158, 11, 0.9);
+  background: rgba(245, 158, 11, 0.22);
+}
+
 .trendline-name {
   overflow: hidden;
   max-width: 148px;

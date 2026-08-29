@@ -815,6 +815,100 @@ def get_latest_trendline_analysis_snapshot(
     }
 
 
+def save_key_zone_analysis_snapshot(
+        symbol: str,
+        payload: dict,
+        algorithm_version: str,
+) -> dict:
+    normalized = normalize_symbol_key(symbol)
+    computed_at = utc_now_iso()
+    period = str(payload.get("period") or "1D")
+    window_size = int(payload.get("requested_window_size") or 150)
+    show_weekend_data = 1 if payload.get("show_weekend_data") else 0
+    adjustment = str(payload.get("adjustment") or "all")
+    fingerprint = str(payload.get("data_fingerprint") or "")
+    latest_data_date = payload.get("latest_data_date")
+    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO key_zone_analysis_snapshots (
+                symbol, period, window_size, show_weekend_data,
+                adjustment, algorithm_version, latest_data_date,
+                data_fingerprint, payload_json, computed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(
+                symbol, period, window_size, show_weekend_data,
+                adjustment, algorithm_version, data_fingerprint
+            ) DO UPDATE SET
+                latest_data_date = excluded.latest_data_date,
+                payload_json = excluded.payload_json,
+                computed_at = excluded.computed_at
+            """,
+            (
+                normalized,
+                period,
+                window_size,
+                show_weekend_data,
+                adjustment,
+                algorithm_version,
+                latest_data_date,
+                fingerprint,
+                payload_json,
+                computed_at,
+            ),
+        )
+    return {
+        "symbol": normalized,
+        "computed_at": computed_at,
+        "algorithm_version": algorithm_version,
+    }
+
+
+def get_latest_key_zone_analysis_snapshot(
+        symbol: str,
+        algorithm_version: str,
+        period: str = "1D",
+        window_size: int = 150,
+        show_weekend_data: bool = False,
+        adjustment: str = "all",
+) -> dict | None:
+    normalized = normalize_symbol_key(symbol)
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT symbol, show_weekend_data, adjustment, latest_data_date,
+                   payload_json, computed_at
+            FROM key_zone_analysis_snapshots
+            WHERE symbol = ? AND algorithm_version = ?
+              AND period = ? AND window_size = ?
+              AND show_weekend_data = ? AND adjustment = ?
+            ORDER BY computed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (
+                normalized,
+                algorithm_version,
+                str(period or "1D").upper(),
+                int(window_size),
+                1 if show_weekend_data else 0,
+                str(adjustment or "all"),
+            ),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "symbol": row["symbol"],
+        "show_weekend_data": bool(row["show_weekend_data"]),
+        "adjustment": row["adjustment"],
+        "latest_data_date": row["latest_data_date"],
+        "payload": json.loads(row["payload_json"]),
+        "computed_at": row["computed_at"],
+    }
+
+
 def update_symbol_display_order(symbols: list[str]) -> dict:
     normalized_symbols = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
     if not normalized_symbols:

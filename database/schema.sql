@@ -219,6 +219,40 @@ ON trendline_analysis_snapshots(
     computed_at DESC
 );
 
+CREATE TABLE IF NOT EXISTS key_zone_analysis_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    period TEXT NOT NULL,
+    window_size INTEGER NOT NULL,
+    show_weekend_data INTEGER NOT NULL,
+    adjustment TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    latest_data_date TEXT,
+    data_fingerprint TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    UNIQUE(
+        symbol,
+        period,
+        window_size,
+        show_weekend_data,
+        adjustment,
+        algorithm_version,
+        data_fingerprint
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_key_zone_snapshots_lookup
+ON key_zone_analysis_snapshots(
+    symbol,
+    period,
+    window_size,
+    show_weekend_data,
+    adjustment,
+    algorithm_version,
+    computed_at DESC
+);
+
 CREATE TABLE IF NOT EXISTS backtest_strategies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL COLLATE NOCASE UNIQUE,

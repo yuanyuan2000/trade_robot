@@ -10,6 +10,7 @@ const chartState = {
   indicators: [],
   indicatorSeries: [],
   trendlines: [],
+  keyZones: [],
   period: "1D",
   firstVisible: 0,
   visibleCount: 0,
@@ -21,6 +22,7 @@ const chartState = {
   hoverX: null,
   hoverY: null,
   hoverTrendlineId: null,
+  hoverKeyZoneId: null,
   dpr: 1,
   defaultVisibleCount: 150,
   layout: {
@@ -118,6 +120,73 @@ function setChartTrendlineVisible(lineId, visible) {
 
 function getChartTrendlines() {
   return chartState.trendlines.map((line) => ({ ...line }));
+}
+
+function setChartKeyZones(zones) {
+  const normalized = Array.isArray(zones)
+    ? zones.map((zone) => ({
+      visible: true,
+      ...zone,
+      visible: zone.visible !== false,
+      project_center_to_current: false,
+    }))
+    : [];
+  const nearestByRole = new Map();
+  for (const zone of normalized) {
+    const role = zone.current_role;
+    const distance = Number(zone.distance_from_current_atr);
+    if (
+      zone.active === false
+      || !["support", "resistance"].includes(role)
+      || !Number.isFinite(distance)
+      || distance >= 5
+    ) {
+      continue;
+    }
+    const current = nearestByRole.get(role);
+    if (!current || distance < Number(current.distance_from_current_atr)) {
+      nearestByRole.set(role, zone);
+    }
+  }
+  for (const zone of nearestByRole.values()) {
+    zone.project_center_to_current = true;
+  }
+  chartState.keyZones = normalized;
+  chartState.hoverKeyZoneId = null;
+  hideTrendlineTooltip();
+  drawChart();
+}
+
+function clearChartKeyZones() {
+  setChartKeyZones([]);
+}
+
+function setChartKeyZoneVisible(zoneId, visible) {
+  const zone = chartState.keyZones.find((item) => item.id === zoneId);
+  if (!zone) {
+    return;
+  }
+  zone.visible = Boolean(visible);
+  drawChart();
+}
+
+function getChartKeyZones() {
+  return chartState.keyZones.map((zone) => ({ ...zone }));
+}
+
+function getKeyZoneDisplayBounds(zone) {
+  return {
+    start: Number(
+      zone.display_start_index
+      ?? zone.start_index
+      ?? zone.formation_index,
+    ),
+    end: Number(
+      zone.display_end_index
+      ?? zone.latest_confirmed_index
+      ?? zone.projection_end_index,
+    ),
+  };
 }
 
 function bindPeriodButtons() {
@@ -384,6 +453,7 @@ function drawChart() {
   const priceRange = getPriceRange(visible);
   drawValueAxes(ctx, plot, visible, priceRange, theme);
   drawTimeAxis(ctx, oscillatorPlot || plot, visible, theme);
+  drawKeyZones(ctx, plot, priceRange, theme);
   drawCandleSeries(ctx, plot, visible, priceRange, theme);
   drawIndicators(ctx, plot, priceRange);
   if (oscillatorPlot) {
@@ -946,6 +1016,95 @@ function drawTrendlines(ctx, plot, priceRange, theme) {
   ctx.setLineDash([]);
 }
 
+function drawKeyZones(ctx, plot, priceRange, theme) {
+  if (!chartState.keyZones.length) {
+    return;
+  }
+  const slot = plot.width / chartState.visibleCount;
+  const visibleStart = chartState.firstVisible;
+  const visibleEnd = chartState.firstVisible + chartState.visibleCount - 1;
+  for (const zone of chartState.keyZones) {
+    if (zone.visible === false) {
+      continue;
+    }
+    const { start: startIndex, end: endIndex } = getKeyZoneDisplayBounds(zone);
+    const low = Number(zone.zone_low);
+    const high = Number(zone.zone_high);
+    const center = Number(zone.center);
+    if (![startIndex, endIndex, low, high, center].every(Number.isFinite)) {
+      continue;
+    }
+    const currentIndex = chartState.candles.length - 1;
+    const projectsToCurrent = (
+      zone.project_center_to_current === true
+      && endIndex < currentIndex
+    );
+    const evidenceVisible = endIndex >= visibleStart && startIndex <= visibleEnd;
+    const projectionVisible = (
+      projectsToCurrent
+      && currentIndex >= visibleStart
+      && endIndex < visibleEnd
+    );
+    if (!evidenceVisible && !projectionVisible) {
+      continue;
+    }
+    const colors = getKeyZoneColors(zone, theme);
+    if (evidenceVisible) {
+      const from = clamp(startIndex, visibleStart, visibleEnd);
+      const to = clamp(endIndex, visibleStart, visibleEnd);
+      const left = indexToX(from, plot, slot) - slot / 2;
+      const right = indexToX(to, plot, slot) + slot / 2;
+      const top = priceToY(high, plot, priceRange);
+      const bottom = priceToY(low, plot, priceRange);
+      ctx.save();
+      ctx.fillStyle = colors.fill;
+      ctx.fillRect(left, top, Math.max(1, right - left), Math.max(1, bottom - top));
+      ctx.strokeStyle = colors.stroke;
+      ctx.lineWidth = zone.id === chartState.hoverKeyZoneId ? 2.2 : 1.2;
+      ctx.setLineDash(zone.status === "broken" ? [6, 4] : []);
+      ctx.strokeRect(left, top, Math.max(1, right - left), Math.max(1, bottom - top));
+      ctx.setLineDash([5, 4]);
+      ctx.globalAlpha = 0.86;
+      drawLine(ctx, left, priceToY(center, plot, priceRange), right, priceToY(center, plot, priceRange));
+      ctx.restore();
+    }
+    if (projectionVisible) {
+      const projectionStart = Math.max(endIndex, visibleStart);
+      const projectionEnd = Math.min(currentIndex, visibleEnd);
+      const left = endIndex >= visibleStart
+        ? indexToX(projectionStart, plot, slot) + slot / 2
+        : plot.left;
+      const right = indexToX(projectionEnd, plot, slot) + slot / 2;
+      ctx.save();
+      ctx.strokeStyle = colors.stroke;
+      ctx.lineWidth = zone.id === chartState.hoverKeyZoneId ? 2 : 1.3;
+      ctx.setLineDash([5, 4]);
+      ctx.globalAlpha = 0.78;
+      drawLine(
+        ctx,
+        left,
+        priceToY(center, plot, priceRange),
+        right,
+        priceToY(center, plot, priceRange),
+      );
+      ctx.restore();
+    }
+  }
+}
+
+function getKeyZoneColors(zone, theme) {
+  if (zone.status === "broken") {
+    return { fill: "rgba(107, 114, 128, 0.08)", stroke: "rgba(107, 114, 128, 0.58)" };
+  }
+  if (zone.status === "challenging" || zone.status === "retesting") {
+    return { fill: "rgba(245, 158, 11, 0.15)", stroke: "rgba(245, 158, 11, 0.82)" };
+  }
+  if (zone.current_role === "support") {
+    return { fill: "rgba(35, 116, 90, 0.12)", stroke: theme.up || "#23745a" };
+  }
+  return { fill: "rgba(181, 71, 71, 0.12)", stroke: theme.danger || "#b54747" };
+}
+
 function drawTrendlineTouches(ctx, plot, priceRange, slot, line, theme) {
   if (line.visible === false || !Array.isArray(line.touch_indices)) {
     return;
@@ -1130,6 +1289,7 @@ function updateHover(offsetX, offsetY) {
     chartState.hoverX = null;
     chartState.hoverY = null;
     chartState.hoverTrendlineId = null;
+    chartState.hoverKeyZoneId = null;
     hideTooltip();
     drawChart();
     return;
@@ -1143,6 +1303,7 @@ function updateHover(offsetX, offsetY) {
     chartState.hoverX = null;
     chartState.hoverY = null;
     chartState.hoverTrendlineId = null;
+    chartState.hoverKeyZoneId = null;
     hideTooltip();
     drawChart();
     return;
@@ -1155,10 +1316,22 @@ function updateHover(offsetX, offsetY) {
   const priceRange = getPriceRange(visible);
   const inOscillator = Boolean(oscillatorPlot && offsetY >= oscillatorPlot.top);
   const trendlineHit = inOscillator ? null : findTrendlineHit(offsetX, offsetY, plot, priceRange);
+  const keyZoneHit = inOscillator || trendlineHit
+    ? null
+    : findKeyZoneHit(offsetX, offsetY, plot, priceRange);
   chartState.hoverTrendlineId = trendlineHit?.id || null;
+  chartState.hoverKeyZoneId = keyZoneHit?.id || null;
   if (trendlineHit) {
     hideOhlcvTooltip();
     showTrendlineTooltip(trendlineHit, offsetX, offsetY);
+    renderIndicatorLegend();
+    drawChart();
+    return;
+  }
+
+  if (keyZoneHit) {
+    hideOhlcvTooltip();
+    showKeyZoneTooltip(keyZoneHit, offsetX, offsetY);
     renderIndicatorLegend();
     drawChart();
     return;
@@ -1306,6 +1479,41 @@ function findTrendlineHit(pointerX, pointerY, plot, priceRange) {
   return best;
 }
 
+function findKeyZoneHit(pointerX, pointerY, plot, priceRange) {
+  const slot = plot.width / chartState.visibleCount;
+  let best = null;
+  let bestDistance = Infinity;
+  for (const zone of chartState.keyZones) {
+    if (zone.visible === false) {
+      continue;
+    }
+    const bounds = getKeyZoneDisplayBounds(zone);
+    const start = Math.max(chartState.firstVisible, bounds.start);
+    const end = Math.min(
+      chartState.firstVisible + chartState.visibleCount - 1,
+      bounds.end,
+    );
+    const low = Number(zone.zone_low);
+    const high = Number(zone.zone_high);
+    if (![start, end, low, high].every(Number.isFinite) || end < start) {
+      continue;
+    }
+    const left = indexToX(start, plot, slot) - slot / 2;
+    const right = indexToX(end, plot, slot) + slot / 2;
+    const top = priceToY(high, plot, priceRange);
+    const bottom = priceToY(low, plot, priceRange);
+    if (pointerX < left || pointerX > right || pointerY < top - 3 || pointerY > bottom + 3) {
+      continue;
+    }
+    const centerDistance = Math.abs(pointerY - priceToY(Number(zone.center), plot, priceRange));
+    if (centerDistance < bestDistance) {
+      best = zone;
+      bestDistance = centerDistance;
+    }
+  }
+  return best;
+}
+
 function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
   const dx = x2 - x1;
   const dy = y2 - y1;
@@ -1348,6 +1556,50 @@ function showTrendlineTooltip(line, offsetX, offsetY) {
     <div class="trendline-score-grid">
       ${trendlineScoreRows(line)}
     </div>
+  `;
+  positionChartTooltip(chartState.trendlineTooltip, offsetX, offsetY);
+  chartState.trendlineTooltip.hidden = false;
+}
+
+function showKeyZoneTooltip(zone, offsetX, offsetY) {
+  if (!chartState.trendlineTooltip) {
+    return;
+  }
+  const role = zone.current_role === "support" ? "支撑区" : "压力区";
+  const status = {
+    active: "有效",
+    challenging: "测试中",
+    retesting: "突破后待回测",
+    broken: "已破位",
+  }[zone.status] || zone.status;
+  const components = zone.score_components || {};
+  const labels = {
+    tests: "测试证据",
+    prominence: "拐点显著度",
+    rejection: "拒绝质量",
+    span: "时间分布",
+    recency: "新近性",
+    integrity: "区域完整性",
+  };
+  const weights = { tests: 25, prominence: 15, rejection: 20, span: 15, recency: 10, integrity: 15 };
+  const scoreRows = Object.entries(labels).map(([key, label]) => {
+    const quality = Number(components[key] || 0);
+    return `<span>${escapeHtml(label)} · ${weights[key]}%</span><b>${(quality * 100).toFixed(1)}% / ${(quality * weights[key]).toFixed(1)}</b>`;
+  }).join("");
+  const integrityMultiplier = Number(components.integrity_multiplier ?? 1);
+  const integrityMultiplierRow = `
+    <span>完整性总分折减</span><b>×${integrityMultiplier.toFixed(3)}</b>
+  `;
+  chartState.trendlineTooltip.innerHTML = `
+    <strong>${escapeHtml(`${role} · ${status}`)}</strong>
+    <div class="trendline-detail-meta">
+      <span>评分 / 中心</span><b>${Number(zone.score || 0).toFixed(1)} / ${formatPrice(zone.center)}</b>
+      <span>区域范围</span><b>${formatPrice(zone.zone_low)}–${formatPrice(zone.zone_high)}</b>
+      <span>独立测试 / 互换</span><b>${Number(zone.independent_tests || 0)} / ${zone.role_reversal_confirmed ? "已确认" : "无"}</b>
+      <span>形成 / 最近测试</span><b>${escapeHtml(zone.formation_date || "-")} / ${escapeHtml(zone.latest_test_date || "-")}</b>
+      <span>距现价</span><b>${Number(zone.distance_from_current_atr || 0).toFixed(2)} ATR</b>
+    </div>
+    <div class="trendline-score-grid">${scoreRows}${integrityMultiplierRow}</div>
   `;
   positionChartTooltip(chartState.trendlineTooltip, offsetX, offsetY);
   chartState.trendlineTooltip.hidden = false;
@@ -1533,9 +1785,33 @@ function getPriceRange(candles) {
       visibleTrendlineValues.push(trendlinePriceAt(line, start), trendlinePriceAt(line, end));
     }
   }
+  const visibleKeyZoneValues = [];
+  for (const zone of chartState.keyZones) {
+    if (zone.visible === false) {
+      continue;
+    }
+    const bounds = getKeyZoneDisplayBounds(zone);
+    const start = Math.max(chartState.firstVisible, bounds.start);
+    const end = Math.min(
+      chartState.firstVisible + chartState.visibleCount - 1,
+      bounds.end,
+    );
+    if (Number.isFinite(start) && Number.isFinite(end) && end >= start) {
+      visibleKeyZoneValues.push(Number(zone.zone_low), Number(zone.zone_high));
+    }
+    const currentIndex = chartState.candles.length - 1;
+    if (
+      zone.project_center_to_current === true
+      && bounds.end < currentIndex
+      && currentIndex >= chartState.firstVisible
+      && bounds.end < chartState.firstVisible + chartState.visibleCount
+    ) {
+      visibleKeyZoneValues.push(Number(zone.center));
+    }
+  }
 
-  let min = Math.min(...lows, ...visibleIndicatorValues, ...visibleTrendlineValues);
-  let max = Math.max(...highs, ...visibleIndicatorValues, ...visibleTrendlineValues);
+  let min = Math.min(...lows, ...visibleIndicatorValues, ...visibleTrendlineValues, ...visibleKeyZoneValues);
+  let max = Math.max(...highs, ...visibleIndicatorValues, ...visibleTrendlineValues, ...visibleKeyZoneValues);
   if (!Number.isFinite(min) || !Number.isFinite(max)) {
     min = 0;
     max = 1;
