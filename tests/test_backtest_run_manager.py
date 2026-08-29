@@ -208,6 +208,35 @@ class BacktestRunManagerTests(unittest.TestCase):
         self.assertEqual(len(decision_snapshot["logs"]), 1)
         self.assertEqual(decision_snapshot["logs"][0]["event_type"], "RUN_COMPLETE")
 
+    @patch("services.backtest.service.BacktestEngine", FakeEngine)
+    def test_disabled_logs_are_neither_streamed_nor_persisted(self) -> None:
+        run = self.manager.start(
+            self.strategy["id"],
+            {
+                **self.strategy["default_settings"],
+                "start_date": "2024-01-02",
+                "end_date": "2024-01-02",
+                "initial_capital": 100,
+                "benchmark": "none",
+                "generate_logs": False,
+            },
+        )
+        deadline = time.monotonic() + 2
+        status = run
+        while time.monotonic() < deadline:
+            status = self.manager.run_status(run["id"])
+            if status["status"] == "completed":
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["live"]["log_count"], 0)
+        self.assertEqual(backtest_repository.get_logs(run["id"]), [])
+        self.assertEqual(
+            self.manager.events_since(run["id"], equity_after=0, trade_after=0, log_after=0)["logs"],
+            [],
+        )
+
     @patch("services.backtest.service.BacktestEngine", LiveMetricsEngine)
     def test_running_status_exposes_live_metrics(self) -> None:
         LiveMetricsEngine.progress_reported.clear()

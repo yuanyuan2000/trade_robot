@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, getcontext
 from typing import Iterable
@@ -28,11 +29,12 @@ class Lot:
 class Position:
     symbol: str
     quantity: Decimal = ZERO
-    lots: list[Lot] = field(default_factory=list)
+    lots: deque[Lot] = field(default_factory=deque)
+    cost_basis_value: Decimal = ZERO
 
     @property
     def cost_basis(self) -> Decimal:
-        return sum((lot.quantity * lot.unit_cost for lot in self.lots), ZERO)
+        return self.cost_basis_value
 
     @property
     def average_cost(self) -> Decimal:
@@ -433,6 +435,7 @@ class Portfolio:
             Lot(quantity=quantity, unit_cost=(gross + commission) / quantity)
         )
         position.quantity += quantity
+        position.cost_basis_value += gross + commission
         self.cash -= total_cost
         slippage = (fill - reference_price) * quantity
         self.total_commission += commission
@@ -519,11 +522,13 @@ class Portfolio:
             lot.quantity -= consumed
             remaining -= consumed
             if lot.quantity <= EPSILON:
-                position.lots.pop(0)
+                position.lots.popleft()
         position.quantity -= quantity
+        position.cost_basis_value = max(ZERO, position.cost_basis_value - removed_cost)
         if position.quantity <= EPSILON:
             position.quantity = ZERO
             position.lots.clear()
+            position.cost_basis_value = ZERO
         self.cash += gross - commission
         realized = gross - commission - removed_cost
         slippage = (reference_price - fill) * quantity

@@ -5,6 +5,7 @@ const bt = {
   runs: [],
   currentRunId: null,
   currentRunStatus: null,
+  currentRunSettings: null,
   eventSource: null,
   equityPoints: [],
   trades: [],
@@ -307,7 +308,10 @@ async function openBacktestRunDetail(runId) {
     bt.runs = [];
     bt.equityPoints = payload.equity_points || [];
     bt.trades = payload.trades || [];
-    bt.logs = run.logs_deleted_at ? [] : await loadAllBacktestLogs(run.id);
+    bt.currentRunSettings = structuredClone(run.settings || {});
+    bt.logs = run.logs_deleted_at || run.settings?.generate_logs === false
+      ? []
+      : await loadAllBacktestLogs(run.id);
     bt.displayInitialCapital = Number(run.settings?.initial_capital || 100000);
     bt.returnToResults = true;
     btListPage.hidden = true;
@@ -574,6 +578,7 @@ async function saveBacktestStrategy({ announce = true } = {}) {
 function resetBacktestResult() {
   bt.currentRunId = null;
   bt.currentRunStatus = null;
+  bt.currentRunSettings = null;
   bt.equityPoints = [];
   bt.trades = [];
   bt.logs = [];
@@ -599,6 +604,7 @@ function settingsToForm() {
   document.getElementById("backtest-benchmark").value = value.benchmark;
   document.getElementById("backtest-risk-free").value = value.risk_free_rate;
   document.getElementById("backtest-fractional").checked = Boolean(value.allow_fractional_shares);
+  document.getElementById("backtest-generate-logs").checked = value.generate_logs !== false;
 }
 
 function settingsFromForm() {
@@ -614,6 +620,7 @@ function settingsFromForm() {
     benchmark: document.getElementById("backtest-benchmark").value,
     risk_free_rate: Number(document.getElementById("backtest-risk-free").value),
     allow_fractional_shares: document.getElementById("backtest-fractional").checked,
+    generate_logs: document.getElementById("backtest-generate-logs").checked,
     strict_data: true,
   };
 }
@@ -721,6 +728,7 @@ async function loadBacktestRunResult(runId, knownStatus = "") {
     const payload = await btJson(await fetch(`/api/backtest/runs/${runId}/results`));
     bt.currentRunId = runId;
     bt.currentRunStatus = payload.run.status || knownStatus;
+    bt.currentRunSettings = structuredClone(payload.run.settings || {});
     bt.displayInitialCapital = Number(
       payload.run.settings?.initial_capital
       || bt.current?.default_settings?.initial_capital
@@ -729,7 +737,9 @@ async function loadBacktestRunResult(runId, knownStatus = "") {
     bt.chartHoverIndex = null;
     bt.equityPoints = payload.equity_points || [];
     bt.trades = payload.trades || [];
-    bt.logs = await loadAllBacktestLogs(runId);
+    bt.logs = payload.run.settings?.generate_logs === false
+      ? []
+      : await loadAllBacktestLogs(runId);
     renderBacktestMetrics(payload.run.metrics, payload.run);
     btChartEmpty.hidden = Boolean(bt.equityPoints.length);
     renderBacktestChart();
@@ -958,6 +968,18 @@ function renderBacktestChart() {
 }
 
 function renderBacktestLogs() {
+  const loggingEnabled = (
+    bt.currentRunSettings?.generate_logs
+    ?? bt.current?.default_settings?.generate_logs
+    ?? true
+  );
+  document.getElementById("backtest-log-level").disabled = !loggingEnabled;
+  document.getElementById("backtest-download-log").disabled = !loggingEnabled || !bt.logs.length;
+  if (!loggingEnabled) {
+    btLogCount.textContent = "未生成";
+    btLogOutput.innerHTML = '<div class="backtest-empty">本次运行已关闭详细日志；未生成、显示或存储日志。</div>';
+    return;
+  }
   const selected = document.getElementById("backtest-log-level").value;
   const accepted = selected === "DEBUG"
     ? ["DEBUG", "INFO", "WARN", "ERROR"]
@@ -1322,6 +1344,7 @@ function initBacktest() {
     renderBacktestChart();
   });
   document.getElementById("backtest-download-log").addEventListener("click", () => {
+    if (!bt.logs.length) return;
     const lines = bt.logs.map((log) => `[${log.level}] ${log.event_time || "-"} ${log.symbol || ""} ${log.message}`);
     const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);

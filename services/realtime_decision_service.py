@@ -56,7 +56,8 @@ def _restore_portfolio(portfolio: Portfolio, state: dict | None) -> None:
             continue
         average_cost = D(item.get("average_cost", item.get("price", 0)))
         position = Position(symbol=symbol, quantity=quantity)
-        position.lots = [Lot(quantity=quantity, unit_cost=average_cost)]
+        position.lots.append(Lot(quantity=quantity, unit_cost=average_cost))
+        position.cost_basis_value = quantity * average_cost
         portfolio.positions[symbol] = position
     portfolio.realized_pnl = D(state.get("realized_pnl", 0))
 
@@ -283,6 +284,8 @@ class RealtimeDecisionEvaluator:
             "end_date": trading_date,
             "benchmark": "none",
             "strict_data": True,
+            # Realtime explanations and emails consume structured engine logs.
+            "generate_logs": True,
         }
         engine = BacktestEngine(strategy, settings, dataset=dataset)
         saved_strategy_state = (run.get("state") or {}).get("strategy_state")

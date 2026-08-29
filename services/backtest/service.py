@@ -265,6 +265,7 @@ def build_run_configuration_summary(strategy: dict, settings: dict) -> str:
         f"滑点{settings['slippage_bps']:g}bps，"
         f"{'允许' if settings['allow_fractional_shares'] else '不允许'}碎股，"
         f"基准{settings['benchmark']}，"
+        f"{'生成' if settings['generate_logs'] else '不生成'}详细日志，"
         f"市场美股({market['calendar']})/美东时间"
     )
     if strategy["design_mode"] == "code":
@@ -363,11 +364,12 @@ class BacktestRunManager:
             "logs": [],
             "metrics": None,
             "last_db_update": 0.0,
-            "last_metrics_update": 0.0,
+            "last_metrics_progress": -1.0,
             "captured_equity_count": 0,
             "captured_trade_count": 0,
             "captured_log_count": 0,
             "dataset": preflight.dataset,
+            "generate_logs": validated_settings["generate_logs"],
         }
         with self._lock:
             self._states[run["id"]] = state
@@ -397,15 +399,20 @@ class BacktestRunManager:
                     state["captured_equity_count"]:
                 ]
                 new_trades = engine.trades[state["captured_trade_count"]:]
-                new_logs = engine.logs[state["captured_log_count"]:]
+                new_logs = (
+                    engine.logs[state["captured_log_count"]:]
+                    if state["generate_logs"]
+                    else []
+                )
                 state["captured_equity_count"] = len(engine.equity_points)
                 state["captured_trade_count"] = len(engine.trades)
                 state["captured_log_count"] = len(engine.logs)
                 live_metrics = None
+                current_progress = float(payload.get("progress") or 0)
                 if (
                     state["metrics"] is None
-                    or now_monotonic - state["last_metrics_update"] >= 0.25
-                    or float(payload.get("progress") or 0) >= 1
+                    or current_progress - state["last_metrics_progress"] >= 0.005
+                    or current_progress >= 1
                 ):
                     portfolio = getattr(engine, "portfolio", None)
                     live_metrics = calculate_metrics(
@@ -428,7 +435,7 @@ class BacktestRunManager:
                             engine, "max_observed_gross_leverage", 0
                         ),
                     )
-                    state["last_metrics_update"] = now_monotonic
+                    state["last_metrics_progress"] = current_progress
                 with self._lock:
                     state["equity_points"].extend(new_equity_points)
                     state["trades"].extend(new_trades)
@@ -461,11 +468,12 @@ class BacktestRunManager:
                 data_manifest=engine.dataset.manifest,
             )
             result = engine.run()
+            persisted_logs = result.logs if state["generate_logs"] else []
             backtest_repository.replace_run_output(
                 run_id,
                 equity_points=result.equity_points,
                 trades=result.trades,
-                logs=result.logs,
+                logs=persisted_logs,
             )
             backtest_repository.update_run(
                 run_id,
@@ -486,7 +494,7 @@ class BacktestRunManager:
             with self._lock:
                 state["equity_points"] = list(result.equity_points)
                 state["trades"] = list(result.trades)
-                state["logs"] = list(result.logs)
+                state["logs"] = list(persisted_logs)
                 state["metrics"] = dict(result.metrics)
                 state["version"] += 1
         except BacktestCancelled as exc:
@@ -562,8 +570,12 @@ class BacktestRunManager:
     ) -> None:
         equity = list(engine.equity_points) if engine else []
         trades = list(engine.trades) if engine else []
-        logs = list(engine.logs) if engine else []
-        if not logs:
+        logs = (
+            list(engine.logs)
+            if engine and state.get("generate_logs", True)
+            else []
+        )
+        if state.get("generate_logs", True) and not logs:
             logs = [
                 {
                     "event_time": None,

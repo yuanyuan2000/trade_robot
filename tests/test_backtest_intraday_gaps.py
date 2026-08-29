@@ -293,6 +293,10 @@ class BacktestIntradayGapTests(unittest.TestCase):
         }
         with (
             patch(
+                "services.backtest.data.repository.get_daily_price_series",
+                return_value=[],
+            ),
+            patch(
                 "services.backtest.data.repository.get_daily_prices",
                 return_value=daily_rows,
             ),

@@ -780,8 +780,12 @@
             <input id="backtest-fractional" type="checkbox">
             <span>允许碎股（默认关闭）</span>
           </label>
+          <label class="backtest-check-field">
+            <input id="backtest-generate-logs" type="checkbox">
+            <span>生成详细日志（关闭可进一步提升长回测速度）</span>
+          </label>
         </div>
-        <p class="backtest-help">整体杠杆会与每个标的在策略中的单独杠杆相乘，并按策略目标仓位放大实际敞口；暂不计融资利息。账户权益不大于 0 时按分钟行情强制平仓并标记爆仓。手续费按每笔 max(股数×每股手续费, 最低手续费) 计算；买卖双边收取。</p>
+        <p class="backtest-help">整体杠杆会与每个标的在策略中的单独杠杆相乘，并按策略目标仓位放大实际敞口；暂不计融资利息。账户权益不大于 0 时按分钟行情强制平仓并标记爆仓。手续费按每笔 max(股数×每股手续费, 最低手续费) 计算；买卖双边收取。关闭详细日志后不会生成、实时传输或持久化策略审计日志，但权益曲线、成交和指标不受影响。</p>
         <div class="backtest-dialog-actions">
           <button type="button" data-close-dialog="backtest-settings-dialog">取消</button>
           <button id="backtest-settings-submit" class="primary-action" type="submit">保存设置</button>

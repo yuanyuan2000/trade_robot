@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from services.backtest.code_strategies import RapidDropAtrRotationStrategy
 from services.backtest.data import (
+    ExpressionContext,
     HistoricalDataSet,
     _epoch_minute,
     _validate_bar,
@@ -208,6 +209,73 @@ class DslSafetyTests(unittest.TestCase):
             validate_settings({"leverage_multiplier": 0.99})
         with self.assertRaises(BacktestValidationError):
             validate_settings({"leverage_multiplier": 10.01})
+
+    def test_generate_logs_setting_defaults_and_requires_boolean(self) -> None:
+        self.assertTrue(validate_settings({})["generate_logs"])
+        self.assertFalse(validate_settings({"generate_logs": False})["generate_logs"])
+        with self.assertRaises(BacktestValidationError):
+            validate_settings({"generate_logs": 0})
+
+
+class BacktestValidationAndPerformanceTests(unittest.TestCase):
+    def test_intraday_finite_indicators_only_read_the_required_tail(self) -> None:
+        dates = business_dates("2015-01-02", 2100)
+        rows = daily_rows(
+            dates,
+            [100 + index * 0.02 + (index % 11) * 0.1 for index in range(len(dates))],
+        )
+        dataset = HistoricalDataSet(daily={"SPY": rows}, sessions=dates)
+        original = dataset._adjusted_slice
+
+        for row_index in (100, 2000):
+            requested_lengths = []
+
+            def measured(symbol, start, end, as_of_date):
+                requested_lengths.append(end - start)
+                return original(symbol, start, end, as_of_date)
+
+            dataset._adjusted_slice = measured
+            context = ExpressionContext(
+                dataset,
+                symbol="SPY",
+                trading_date=dates[row_index],
+                event="10:00",
+                price=float(rows[row_index]["close"]),
+                position=0,
+            )
+            expression = compile_expression("wtme(13, 6) * r_square(25)")
+            expression.evaluate(context)
+            expression.resolve_inputs(context)
+
+            self.assertEqual(requested_lengths, [13, 25])
+
+        dataset._adjusted_slice = original
+
+    def test_disabling_logs_preserves_financial_results(self) -> None:
+        dates = business_dates("2024-01-02", 6)
+        dataset = HistoricalDataSet(
+            daily={"SPY": daily_rows(dates, [10, 11, 12, 13, 14, 15])},
+            sessions=dates[-3:],
+        )
+        strategy = visual_strategy(
+            rule={"condition": "price > close(1)", "when": "OPEN"}
+        )
+        with_logs = BacktestEngine(
+            strategy,
+            settings(dates[-3], dates[-1], generate_logs=True),
+            dataset=dataset,
+        ).run()
+        without_logs = BacktestEngine(
+            strategy,
+            settings(dates[-3], dates[-1], generate_logs=False),
+            dataset=dataset,
+        ).run()
+
+        self.assertTrue(with_logs.logs)
+        self.assertEqual(without_logs.logs, [])
+        self.assertEqual(without_logs.trades, with_logs.trades)
+        self.assertEqual(without_logs.equity_points, with_logs.equity_points)
+        self.assertEqual(without_logs.metrics, with_logs.metrics)
 
     def test_symbol_leverage_defaults_and_bounds(self) -> None:
         strategy = default_strategy_payload(

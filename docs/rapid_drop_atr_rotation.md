@@ -132,7 +132,8 @@ IEX 行情取得事件快照，并在两个事件之间持久化 `risk_off` 和�
 
 ### 5.2 价格复权与成交价格
 
-历史指标行通过 `daily_before()` 按当前决策日可知的拆股和现金分红进行点时复权，避免
+历史指标行通过 `daily_before(..., limit=所需窗口)` 按当前决策日可知的拆股和现金分红进行
+点时复权；公司行动累计因子和 ATR 序列按标的缓存，避免重复扫描全历史，同时继续避免
 拆股或除息制造虚假急跌/动量。成交、持仓盯市和账户现金仍使用原始价格；现金分红通过
 应收和到账单独计入，避免重复计算收益。
 
@@ -350,7 +351,7 @@ SELL symbol, sizing_mode=TARGET, value_percent=0
 - `M = momentum_lookback_sessions`；
 - `N = atr_period`；
 - `P_select` 为轮动时点以前最后完整分钟收盘；
-- `C_base` 为 `daily_before()` 中倒数第 M 根日线的复权收盘；
+- `C_base` 为有界 `daily_before(..., limit=M)` 中最早一根日线的复权收盘；
 - `ATR_prev(N)` 为截至上一完整交易日的 N 周期 ATR。
 
 当前评分公式为：

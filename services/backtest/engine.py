@@ -63,6 +63,7 @@ class CodeEventContext:
         marks: dict[str, float],
         all_candidate_symbols: list[str],
         log_callback: Callable[..., None],
+        logging_enabled: bool = True,
     ):
         self.dataset = dataset
         self.portfolio = portfolio
@@ -73,6 +74,7 @@ class CodeEventContext:
         self.marks = marks
         self.all_candidate_symbols = all_candidate_symbols
         self._log_callback = log_callback
+        self.logging_enabled = bool(logging_enabled)
 
     def expression_context(self, symbol: str):
         return self.dataset.expression_context(
@@ -93,6 +95,8 @@ class CodeEventContext:
         level: str = "DEBUG",
     ) -> None:
         """Write a structured code-strategy log that can become XLS columns."""
+        if not self.logging_enabled:
+            return
         self._log_callback(
             level,
             event_type,
@@ -103,6 +107,8 @@ class CodeEventContext:
         )
 
     def log_strategy_evaluations(self, evaluations: list[dict]) -> None:
+        if not self.logging_enabled:
+            return
         for item in evaluations:
             payload = {
                 **item,
@@ -162,6 +168,7 @@ class BacktestEngine:
         }
         self.progress_callback = progress_callback
         self.cancellation_check = cancellation_check or (lambda: False)
+        self.logging_enabled = bool(self.settings["generate_logs"])
         self.logs: list[dict] = []
         self.trades: list[dict] = []
         self.equity_points: list[dict] = []
@@ -213,6 +220,10 @@ class BacktestEngine:
             market=self.strategy.get("market"),
         )
         self._validate_supplied_dataset(additional)
+        manifest_symbols = self.dataset.manifest.get("symbols", {})
+        self._manifest_symbols = (
+            manifest_symbols if isinstance(manifest_symbols, dict) else {}
+        )
         portfolio_kwargs = {
             "commission_per_share": self.settings["commission_per_share"],
             "minimum_commission": self.settings["minimum_commission"],
@@ -222,7 +233,9 @@ class BacktestEngine:
                 symbol: details.get("quantity_step") or (
                     0.0001 if symbol == "BTC/USD" else None
                 )
-                for symbol, details in self.dataset.manifest.get("symbols", {}).items()
+                for symbol, details in (
+                    self._manifest_symbols.items()
+                )
                 if details.get("quantity_step") or symbol == "BTC/USD"
             },
         }
@@ -323,6 +336,8 @@ class BacktestEngine:
         symbol: str | None = None,
         context: dict | None = None,
     ) -> None:
+        if not self.logging_enabled:
+            return
         self.logs.append(
             {
                 "sequence": len(self.logs) + 1,
@@ -350,7 +365,7 @@ class BacktestEngine:
             },
         )
         for symbol in self.tradable_symbols:
-            details = self.dataset.manifest.get("symbols", {}).get(symbol, {})
+            details = self._manifest_symbols.get(symbol, {})
             join_date = details.get("intraday_join_date")
             if not join_date:
                 continue
@@ -864,6 +879,7 @@ class BacktestEngine:
                 marks=marks,
                 all_candidate_symbols=self.universe,
                 log_callback=self._log,
+                logging_enabled=self.logging_enabled,
             )
             return list(self.code_strategy.on_event(context))
         if self.strategy["selection_mode"] == "competition":
@@ -908,22 +924,23 @@ class BacktestEngine:
                 position=float(self.portfolio.weight(symbol, marks)),
             )
             matched = bool(compiled.evaluate(context))
-            self._log(
-                "DEBUG",
-                "RULE_EVALUATION",
-                f"{symbol} 规则“{rule['name']}”判断为 {matched}。",
-                event_time=f"{trading_date} {event}",
-                symbol=symbol,
-                context={
-                    "rule_id": rule["id"],
-                    "rule_name": rule["name"],
-                    "condition": rule["condition"],
-                    "price": context.price,
-                    "position": context.position,
-                    "inputs": compiled.resolve_inputs(context),
-                    "matched": matched,
-                },
-            )
+            if self.logging_enabled:
+                self._log(
+                    "DEBUG",
+                    "RULE_EVALUATION",
+                    f"{symbol} 规则“{rule['name']}”判断为 {matched}。",
+                    event_time=f"{trading_date} {event}",
+                    symbol=symbol,
+                    context={
+                        "rule_id": rule["id"],
+                        "rule_name": rule["name"],
+                        "condition": rule["condition"],
+                        "price": context.price,
+                        "position": context.position,
+                        "inputs": compiled.resolve_inputs(context),
+                        "matched": matched,
+                    },
+                )
             if not matched:
                 continue
             if rule["action"] == "HOLD":
@@ -996,20 +1013,21 @@ class BacktestEngine:
                 matched = bool(self._competition_eligibility.evaluate(context))
                 if matched:
                     eligible.add(symbol)
-                self._log(
-                    "DEBUG",
-                    "COMPETITION_ELIGIBILITY",
-                    f"{symbol} 候选条件判断为 {matched}。",
-                    event_time=f"{trading_date} {event}",
-                    symbol=symbol,
-                    context={
-                        "formula": competition["eligibility"],
-                        "inputs": self._competition_eligibility.resolve_inputs(context),
-                        "matched": matched,
-                        "reason": None if matched else "候选条件未通过",
-                        "blocked_by_rule": False,
-                    },
-                )
+                if self.logging_enabled:
+                    self._log(
+                        "DEBUG",
+                        "COMPETITION_ELIGIBILITY",
+                        f"{symbol} 候选条件判断为 {matched}。",
+                        event_time=f"{trading_date} {event}",
+                        symbol=symbol,
+                        context={
+                            "formula": competition["eligibility"],
+                            "inputs": self._competition_eligibility.resolve_inputs(context),
+                            "matched": matched,
+                            "reason": None if matched else "候选条件未通过",
+                            "blocked_by_rule": False,
+                        },
+                    )
             self._competition_eligible_by_date[trading_date] = eligible
         if event != competition["when"]:
             return risk_intents
@@ -1036,24 +1054,25 @@ class BacktestEngine:
             passes_minimum = minimum_score is None or score >= minimum_score
             if passes_minimum:
                 scores.append((score, symbol))
-            self._log(
-                "DEBUG",
-                "COMPETITION_SCORE",
-                (
-                    f"{symbol} 竞争评分 {score:.8f}。"
-                    if passes_minimum
-                    else f"{symbol} 竞争评分 {score:.8f}，低于最低可入选评分 {minimum_score:g}。"
-                ),
-                event_time=f"{trading_date} {event}",
-                symbol=symbol,
-                context={
-                    "score": score,
-                    "formula": competition["score"],
-                    "inputs": self._competition_score.resolve_inputs(context),
-                    "minimum_score": minimum_score,
-                    "passes_minimum_score": passes_minimum,
-                },
-            )
+            if self.logging_enabled:
+                self._log(
+                    "DEBUG",
+                    "COMPETITION_SCORE",
+                    (
+                        f"{symbol} 竞争评分 {score:.8f}。"
+                        if passes_minimum
+                        else f"{symbol} 竞争评分 {score:.8f}，低于最低可入选评分 {minimum_score:g}。"
+                    ),
+                    event_time=f"{trading_date} {event}",
+                    symbol=symbol,
+                    context={
+                        "score": score,
+                        "formula": competition["score"],
+                        "inputs": self._competition_score.resolve_inputs(context),
+                        "minimum_score": minimum_score,
+                        "passes_minimum_score": passes_minimum,
+                    },
+                )
         winner = sorted(scores, key=lambda item: (-item[0], item[1]))[0][1] if scores else None
         selection_intents = [
             OrderIntent(

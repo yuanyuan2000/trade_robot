@@ -31,6 +31,7 @@ DEFAULT_BACKTEST_SETTINGS = {
     "benchmark": "auto",
     "risk_free_rate": 0.045,
     "strict_data": True,
+    "generate_logs": True,
 }
 
 
@@ -95,7 +96,7 @@ def validate_settings(settings: dict | None) -> dict:
         if maximum is not None and number > maximum:
             raise BacktestValidationError(f"{name} 超出允许范围。")
         value[name] = number
-    for name in ("allow_fractional_shares", "strict_data"):
+    for name in ("allow_fractional_shares", "strict_data", "generate_logs"):
         if not isinstance(value[name], bool):
             raise BacktestValidationError(f"{name} 必须是布尔值。")
     if not value["strict_data"]:

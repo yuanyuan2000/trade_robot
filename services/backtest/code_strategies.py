@@ -420,7 +420,9 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
         lookback = self.params["drop_lookback_sessions"]
         evaluations: dict[str, dict] = {}
         for symbol in context.universe:
-            rows = context.dataset.daily_before(symbol, context.trading_date)
+            rows = context.dataset.daily_before(
+                symbol, context.trading_date, limit=lookback
+            )
             event_price = context.event_prices[symbol].signal_price
             start = len(rows) - lookback
             previous_rows = rows[start:]
@@ -447,10 +449,12 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
             atr_changes: list[float] = []
             atr_change_details: list[dict] = []
             if self.params["enable_atr_drop_filter"]:
-                atr_series = self._atr_series(
-                    rows,
+                atr_series = context.dataset.strategy_atr_values_before(
+                    symbol,
+                    context.trading_date,
                     self.params["atr_period"],
                     self.params["atr_weighting"],
+                    limit=len(rows),
                 )
                 for row_index, (previous, current_price) in enumerate(
                     zip(previous_rows, current_prices), start=start
@@ -578,11 +582,20 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
         momentum_lookback = self.params["momentum_lookback_sessions"]
         atr_period = self.params["atr_period"]
         for symbol in context.universe:
-            rows = context.dataset.daily_before(symbol, context.trading_date)
+            rows = context.dataset.daily_before(
+                symbol, context.trading_date, limit=momentum_lookback
+            )
             base = float(rows[-momentum_lookback]["close"])
             base_date = rows[-momentum_lookback]["date"]
             current_price = context.event_prices[symbol].signal_price
-            atr = self._atr_value(rows, atr_period, self.params["atr_weighting"])
+            atr = context.dataset.strategy_atr_value_before(
+                symbol,
+                context.trading_date,
+                atr_period,
+                self.params["atr_weighting"],
+            )
+            if atr is None:
+                raise BacktestDataError("没有足够数据计算策略 ATR。")
             score = None
             if atr > 0:
                 score = (current_price - base) / atr
@@ -857,7 +870,9 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
         lookback = self.params["drop_lookback_sessions"]
         threshold = -self.params["drop_threshold_percent"] / 100
         for symbol in context.universe:
-            rows = context.dataset.daily_before(symbol, context.trading_date)
+            rows = context.dataset.daily_before(
+                symbol, context.trading_date, limit=lookback
+            )
             previous_rows = rows[-lookback:]
             event_price = context.event_prices[symbol].signal_price
             current_prices = [
@@ -935,7 +950,7 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
         evaluations: list[dict] = []
         for symbol in context.universe:
             completed_rows = context.dataset.daily_before(
-                symbol, context.trading_date
+                symbol, context.trading_date, limit=period
             )
             previous_close = float(completed_rows[-1]["close"])
             current_price = context.event_prices[symbol].signal_price
@@ -1387,8 +1402,10 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
     def _profit_triggered(self, context, symbol: str) -> bool:
         if not self.params["enable_profit_protection"]:
             return False
-        rows = context.dataset.daily_before(symbol, context.trading_date)
         lookback = self.params["profit_lookback_days"]
+        rows = context.dataset.daily_before(
+            symbol, context.trading_date, limit=lookback
+        )
         if len(rows) < lookback or symbol not in context.event_prices:
             return False
         max_high = max(float(row["high"]) for row in rows[-lookback:])
@@ -1506,7 +1523,16 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
         return annualized, r_squared, score
 
     def _metrics(self, context, symbol: str) -> dict:
-        rows = context.dataset.daily_before(symbol, context.trading_date)
+        history_limit = max(
+            self.params["lookback_days"],
+            self.params["short_lookback_days"],
+            self.params["profit_lookback_days"],
+            self.params["volume_lookback_days"],
+            3,
+        )
+        rows = context.dataset.daily_before(
+            symbol, context.trading_date, limit=history_limit
+        )
         current = context.event_prices[symbol].signal_price
         prices = [float(row["close"]) for row in rows] + [current]
         filter_codes = []

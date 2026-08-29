@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 import hashlib
@@ -113,66 +114,39 @@ class ExpressionContext:
         self.event = event
         self.price = float(price)
         self.position = float(position)
+        self._function_cache: dict[tuple[str, tuple[float | int, ...]], float] = {}
 
     def resolve_function(self, name: str, *arguments: float | int) -> float:
+        cache_key = (name, tuple(arguments))
+        if cache_key in self._function_cache:
+            return self._function_cache[cache_key]
         period = int(arguments[0])
         if name in {"open", "high", "low", "close", "volume"}:
-            rows = self.dataset.daily_before(self.symbol, self.trading_date)
-            if len(rows) < period:
-                raise BacktestDataError(
-                    f"{self.symbol} 在 {self.trading_date} 之前没有足够数据计算 {name}({period})。"
-                )
-            return float(rows[-period][name])
-        if name in {"ma", "ema", "atr", "rsi"}:
-            rows = self.dataset.indicator_history(
+            value = self.dataset.value_before(
+                self.symbol, self.trading_date, name, period
+            )
+        elif name in {
+            "ma", "ema", "atr", "rsi", "ratr", "r_square", "wtme",
+            "rapid_drop", "macd_line", "macd_signal", "macd_hist",
+        }:
+            value = self.dataset.indicator_value(
                 self.symbol,
                 self.trading_date,
-                include_current=self.event == "CLOSE",
+                self.event,
+                self.price,
+                name,
+                tuple(arguments),
             )
-            values = calculate_indicator_values(rows, name, period)
-        elif name in {"ratr", "r_square", "wtme", "rapid_drop"}:
-            rows = self._point_in_time_rows()
-            values = calculate_indicator_values(
-                rows,
-                "LINEAR_FIT" if name == "r_square" else name,
-                period,
-                half_life=(float(arguments[1]) if name == "wtme" else None),
-                epsilon=(
-                    float(arguments[2])
-                    if name == "wtme" and len(arguments) == 3
-                    else WTME_DEFAULT_EPSILON
-                ),
-                threshold_percent=(
-                    float(arguments[1]) if name == "rapid_drop" else None
-                ),
-            )
-        elif name in {"macd_line", "macd_signal", "macd_hist"}:
-            rows = self.dataset.indicator_history(
-                self.symbol,
-                self.trading_date,
-                include_current=self.event == "CLOSE",
-            )
-            fast_period = int(arguments[0])
-            slow_period = int(arguments[1])
-            signal_period = int(arguments[2]) if len(arguments) == 3 else 9
-            components = calculate_macd_components(
-                rows, fast_period, slow_period, signal_period
-            )
-            component_name = {
-                "macd_line": "line",
-                "macd_signal": "signal",
-                "macd_hist": "histogram",
-            }[name]
-            values = components[component_name]
         else:
             raise BacktestValidationError(f"不支持指标函数 {name}。")
-        value = values[-1] if values else None
         if value is None:
             rendered = ",".join(f"{float(item):g}" for item in arguments)
             raise BacktestDataError(
                 f"{self.symbol} 没有足够数据计算 {name}({rendered})。"
             )
-        return float(value)
+        result = float(value)
+        self._function_cache[cache_key] = result
+        return result
 
     def _point_in_time_rows(self) -> list[dict]:
         if self.event == "CLOSE":
@@ -221,6 +195,10 @@ class HistoricalDataSet:
             symbol: {row["date"]: row for row in rows}
             for symbol, rows in self.daily.items()
         }
+        self.daily_dates = {
+            symbol: [row["date"] for row in rows]
+            for symbol, rows in self.daily.items()
+        }
         self.sessions = list(sessions)
         self.minute = minute or {}
         self.intraday_event_minutes = intraday_event_minutes or {}
@@ -236,8 +214,18 @@ class HistoricalDataSet:
             effective_date = action.get("ex_date") or action["process_date"]
             self.actions_by_date.setdefault(effective_date, []).append(action)
         self._dividend_factors = self._build_dividend_factors()
+        self._build_adjustment_indexes()
+        self._indicator_series_cache: dict[tuple, object] = {}
+        self._strategy_atr_cache: dict[tuple, list[float | None]] = {}
         self.manifest = manifest or {}
         self._session_index = {value: index for index, value in enumerate(self.sessions)}
+        self._market_session_minutes = {
+            item["trading_date"]: (
+                int(item["open_minute_utc"]),
+                int(item["close_minute_utc"]),
+            )
+            for item in self.manifest.get("market_sessions", [])
+        }
 
     def _build_dividend_factors(self) -> dict[tuple[str, str], float]:
         """Build point-in-time price factors without modifying executable bars.
@@ -260,21 +248,101 @@ class HistoricalDataSet:
 
         factors: dict[tuple[str, str], float] = {}
         for (symbol, effective_date), total in totals.items():
-            previous = [
-                row for row in self.daily.get(symbol, [])
-                if row["date"] < effective_date
-            ]
-            if not previous:
+            rows = self.daily.get(symbol, [])
+            end = bisect_left(self.daily_dates.get(symbol, []), effective_date)
+            if end <= 0:
                 # No loaded history predates this event, so there is nothing
                 # in the indicator window to adjust.
                 continue
-            previous_close = float(previous[-1]["close"])
+            previous_close = float(rows[end - 1]["close"])
             if total < 0 or previous_close <= 0 or total >= previous_close:
                 raise BacktestDataError(f"{symbol} {effective_date} 分红复权因子无效。")
             factors[(symbol, effective_date)] = (
                 previous_close - total
             ) / previous_close
         return factors
+
+    def _build_adjustment_indexes(self) -> None:
+        """Index cumulative point-in-time adjustment factors by symbol/date.
+
+        If ``P(t)`` is the cumulative price factor through date ``t``, a raw
+        bar dated ``d`` viewed as of ``t`` is ``raw * P(t) / P(d)``.  The same
+        ratio rule applies to split-adjusted volume with a separate factor.
+        This preserves the existing point-in-time semantics without scanning
+        every corporate action for every historical row.
+        """
+        events: dict[str, dict[str, list[float]]] = {}
+
+        def multipliers(symbol: str, effective_date: str) -> list[float]:
+            return events.setdefault(symbol, {}).setdefault(effective_date, [1.0, 1.0])
+
+        for action in self.corporate_actions:
+            if not action.get("affects_position", True):
+                continue
+            symbol = action["symbol"]
+            effective_date = action.get("ex_date") or action["process_date"]
+            values = multipliers(symbol, effective_date)
+            if action["action_type"] in {"forward_split", "reverse_split"}:
+                old_rate = float(action["old_rate"])
+                new_rate = float(action["new_rate"])
+                if old_rate <= 0 or new_rate <= 0:
+                    raise BacktestDataError(f"{symbol} 拆股比例无效。")
+                split_ratio = new_rate / old_rate
+                values[0] /= split_ratio
+                values[1] *= split_ratio
+
+        for (symbol, effective_date), factor in self._dividend_factors.items():
+            multipliers(symbol, effective_date)[0] *= float(factor)
+
+        self._adjustment_dates: dict[str, list[str]] = {}
+        self._adjustment_price_prefix: dict[str, list[float]] = {}
+        self._adjustment_volume_prefix: dict[str, list[float]] = {}
+        self._row_price_bases: dict[str, list[float]] = {}
+        self._row_volume_bases: dict[str, list[float]] = {}
+        self._canonical_daily: dict[str, list[dict]] = {}
+
+        for symbol, rows in self.daily.items():
+            dated = sorted(events.get(symbol, {}).items())
+            dates: list[str] = []
+            prices: list[float] = []
+            volumes: list[float] = []
+            price = 1.0
+            volume = 1.0
+            for effective_date, (price_step, volume_step) in dated:
+                price *= price_step
+                volume *= volume_step
+                dates.append(effective_date)
+                prices.append(price)
+                volumes.append(volume)
+            self._adjustment_dates[symbol] = dates
+            self._adjustment_price_prefix[symbol] = prices
+            self._adjustment_volume_prefix[symbol] = volumes
+
+            row_price_bases: list[float] = []
+            row_volume_bases: list[float] = []
+            canonical: list[dict] = []
+            for row in rows:
+                row_price, row_volume = self._factors_as_of(symbol, row["date"])
+                row_price_bases.append(row_price)
+                row_volume_bases.append(row_volume)
+                normalized = dict(row)
+                for field in ("open", "high", "low", "close"):
+                    normalized[field] = float(normalized[field]) / row_price
+                normalized["volume"] = float(normalized.get("volume") or 0) / row_volume
+                canonical.append(normalized)
+            self._row_price_bases[symbol] = row_price_bases
+            self._row_volume_bases[symbol] = row_volume_bases
+            self._canonical_daily[symbol] = canonical
+
+    def _factors_as_of(self, symbol: str, trading_date: str) -> tuple[float, float]:
+        dates = self._adjustment_dates.get(symbol, [])
+        index = bisect_right(dates, trading_date) - 1
+        if index < 0:
+            return 1.0, 1.0
+        return (
+            self._adjustment_price_prefix[symbol][index],
+            self._adjustment_volume_prefix[symbol][index],
+        )
 
     def is_eligible(self, symbol: str, trading_date: str) -> bool:
         start = self.availability_start.get(symbol)
@@ -296,12 +364,41 @@ class HistoricalDataSet:
                 f"{symbol} 缺少 {trading_date} {event} 的盘中累计成交量。"
             ) from exc
 
-    def daily_before(self, symbol: str, trading_date: str) -> list[dict]:
-        return [
-            self._adjust_row(symbol, row, trading_date)
-            for row in self.daily[symbol]
-            if row["date"] < trading_date
-        ]
+    def _adjusted_slice(
+        self,
+        symbol: str,
+        start: int,
+        end: int,
+        as_of_date: str,
+    ) -> list[dict]:
+        target_price, target_volume = self._factors_as_of(symbol, as_of_date)
+        result: list[dict] = []
+        rows = self.daily[symbol]
+        price_bases = self._row_price_bases[symbol]
+        volume_bases = self._row_volume_bases[symbol]
+        for index in range(start, end):
+            source = rows[index]
+            price_factor = target_price / price_bases[index]
+            volume_factor = target_volume / volume_bases[index]
+            adjusted = dict(source)
+            if abs(price_factor - 1.0) >= 1e-15:
+                for field in ("open", "high", "low", "close"):
+                    adjusted[field] = float(adjusted[field]) * price_factor
+            if abs(volume_factor - 1.0) >= 1e-15:
+                adjusted["volume"] = float(adjusted.get("volume") or 0) * volume_factor
+            result.append(adjusted)
+        return result
+
+    def daily_before(
+        self,
+        symbol: str,
+        trading_date: str,
+        *,
+        limit: int | None = None,
+    ) -> list[dict]:
+        end = bisect_left(self.daily_dates[symbol], trading_date)
+        start = 0 if limit is None else max(0, end - max(0, int(limit)))
+        return self._adjusted_slice(symbol, start, end, trading_date)
 
     def indicator_history(
         self,
@@ -309,46 +406,249 @@ class HistoricalDataSet:
         trading_date: str,
         *,
         include_current: bool,
+        limit: int | None = None,
     ) -> list[dict]:
-        if include_current:
-            return [
-                self._adjust_row(symbol, row, trading_date)
-                for row in self.daily[symbol]
-                if row["date"] <= trading_date
+        dates = self.daily_dates[symbol]
+        end = (
+            bisect_right(dates, trading_date)
+            if include_current
+            else bisect_left(dates, trading_date)
+        )
+        start = 0 if limit is None else max(0, end - max(0, int(limit)))
+        return self._adjusted_slice(symbol, start, end, trading_date)
+
+    def value_before(
+        self,
+        symbol: str,
+        trading_date: str,
+        field: str,
+        periods_back: int,
+    ) -> float:
+        end = bisect_left(self.daily_dates[symbol], trading_date)
+        index = end - int(periods_back)
+        if index < 0:
+            raise BacktestDataError(
+                f"{symbol} 在 {trading_date} 之前没有足够数据计算 {field}({periods_back})。"
+            )
+        target_price, target_volume = self._factors_as_of(symbol, trading_date)
+        if field == "volume":
+            factor = target_volume / self._row_volume_bases[symbol][index]
+        else:
+            factor = target_price / self._row_price_bases[symbol][index]
+        return float(self.daily[symbol][index][field]) * factor
+
+    def _canonical_indicator_series(
+        self,
+        symbol: str,
+        name: str,
+        arguments: tuple[float | int, ...],
+    ) -> list[float | None]:
+        normalized = name.lower()
+        key = (symbol, normalized, arguments)
+        cached = self._indicator_series_cache.get(key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        rows = self._canonical_daily[symbol]
+        if normalized.startswith("macd_"):
+            fast = int(arguments[0])
+            slow = int(arguments[1])
+            signal = int(arguments[2]) if len(arguments) == 3 else 9
+            components = calculate_macd_components(rows, fast, slow, signal)
+            component = {
+                "macd_line": "line",
+                "macd_signal": "signal",
+                "macd_hist": "histogram",
+            }[normalized]
+            result = components[component]
+        else:
+            period = int(arguments[0])
+            indicator_type = {
+                "r_square": "LINEAR_FIT",
+            }.get(normalized, normalized.upper())
+            result = calculate_indicator_values(
+                rows,
+                indicator_type,
+                period,
+                half_life=(float(arguments[1]) if normalized == "wtme" else None),
+                epsilon=(
+                    float(arguments[2])
+                    if normalized == "wtme" and len(arguments) == 3
+                    else WTME_DEFAULT_EPSILON
+                ),
+                threshold_percent=(
+                    float(arguments[1]) if normalized == "rapid_drop" else None
+                ),
+            )
+        self._indicator_series_cache[key] = result
+        return result
+
+    def indicator_value(
+        self,
+        symbol: str,
+        trading_date: str,
+        event: str,
+        event_price: float,
+        name: str,
+        arguments: tuple[float | int, ...],
+    ) -> float | None:
+        """Return one point-in-time indicator value without rebuilding history."""
+        normalized = name.lower()
+        period = int(arguments[0])
+        include_current = event == "CLOSE"
+
+        # These intraday indicators deliberately include a synthetic unfinished
+        # current bar.  They are finite-window formulas, so only that window is
+        # constructed and evaluated.
+        if not include_current and normalized in {"r_square", "wtme", "rapid_drop"}:
+            completed = self.daily_before(symbol, trading_date, limit=period)
+            if len(completed) < period:
+                return None
+            previous_close = float(completed[-1]["close"])
+            rows = [
+                *completed,
+                {
+                    "date": trading_date,
+                    "open": previous_close,
+                    "high": max(previous_close, float(event_price)),
+                    "low": min(previous_close, float(event_price)),
+                    "close": float(event_price),
+                    "volume": 0.0,
+                    "is_complete": 0,
+                },
             ]
-        return self.daily_before(symbol, trading_date)
+            indicator_type = "LINEAR_FIT" if normalized == "r_square" else normalized.upper()
+            values = calculate_indicator_values(
+                rows,
+                indicator_type,
+                period,
+                half_life=(float(arguments[1]) if normalized == "wtme" else None),
+                epsilon=(
+                    float(arguments[2])
+                    if normalized == "wtme" and len(arguments) == 3
+                    else WTME_DEFAULT_EPSILON
+                ),
+                threshold_percent=(
+                    float(arguments[1]) if normalized == "rapid_drop" else None
+                ),
+            )
+            return values[-1] if values else None
+
+        end = (
+            bisect_right(self.daily_dates[symbol], trading_date)
+            if include_current
+            else bisect_left(self.daily_dates[symbol], trading_date)
+        )
+        if end <= 0:
+            return None
+
+        if not include_current and normalized == "ratr":
+            base_index = end - period
+            if base_index < 0:
+                return None
+            atr_values = self._canonical_indicator_series(symbol, "atr", (period,))
+            atr = atr_values[end - 1]
+            if atr is None or atr <= 0:
+                return None
+            price_factor, _ = self._factors_as_of(symbol, trading_date)
+            current = float(event_price) / price_factor
+            base = float(self._canonical_daily[symbol][base_index]["close"])
+            return (current - base) / float(atr)
+
+        values = self._canonical_indicator_series(symbol, normalized, arguments)
+        value = values[end - 1]
+        if value is None:
+            return None
+        if normalized in {"ma", "ema", "atr", "macd_line", "macd_signal", "macd_hist"}:
+            price_factor, _ = self._factors_as_of(symbol, trading_date)
+            return float(value) * price_factor
+        return float(value)
+
+    def _strategy_atr_series(
+        self,
+        symbol: str,
+        period: int,
+        weighting: str,
+    ) -> list[float | None]:
+        key = (symbol, int(period), str(weighting))
+        cached = self._strategy_atr_cache.get(key)
+        if cached is not None:
+            return cached
+        rows = self._canonical_daily[symbol]
+        result: list[float | None] = [None] * len(rows)
+        true_ranges = [
+            max(
+                float(current["high"]) - float(current["low"]),
+                abs(float(current["high"]) - float(previous["close"])),
+                abs(float(current["low"]) - float(previous["close"])),
+            )
+            for previous, current in zip(rows, rows[1:])
+        ]
+        if len(true_ranges) < period:
+            self._strategy_atr_cache[key] = result
+            return result
+        if weighting == "simple":
+            window_sum = sum(true_ranges[:period])
+            result[period] = window_sum / period
+            for row_index in range(period + 1, len(rows)):
+                window_sum += true_ranges[row_index - 1] - true_ranges[row_index - period - 1]
+                result[row_index] = window_sum / period
+        elif weighting == "linear":
+            denominator = period * (period + 1) / 2
+            window = true_ranges[:period]
+            window_sum = sum(window)
+            weighted_sum = sum(index * value for index, value in enumerate(window, start=1))
+            result[period] = weighted_sum / denominator
+            for row_index in range(period + 1, len(rows)):
+                newest = true_ranges[row_index - 1]
+                weighted_sum = weighted_sum - window_sum + period * newest
+                window_sum += newest - true_ranges[row_index - period - 1]
+                result[row_index] = weighted_sum / denominator
+        else:
+            atr = sum(true_ranges[:period]) / period
+            result[period] = atr
+            alpha = 1 / period if weighting == "wilder" else 2 / (period + 1)
+            for row_index, true_range in enumerate(
+                true_ranges[period:], start=period + 1
+            ):
+                atr = alpha * true_range + (1 - alpha) * atr
+                result[row_index] = atr
+        self._strategy_atr_cache[key] = result
+        return result
+
+    def strategy_atr_values_before(
+        self,
+        symbol: str,
+        trading_date: str,
+        period: int,
+        weighting: str,
+        *,
+        limit: int,
+    ) -> list[float | None]:
+        end = bisect_left(self.daily_dates[symbol], trading_date)
+        start = max(0, end - int(limit))
+        price_factor, _ = self._factors_as_of(symbol, trading_date)
+        return [
+            None if value is None else float(value) * price_factor
+            for value in self._strategy_atr_series(symbol, period, weighting)[start:end]
+        ]
+
+    def strategy_atr_value_before(
+        self,
+        symbol: str,
+        trading_date: str,
+        period: int,
+        weighting: str,
+    ) -> float | None:
+        values = self.strategy_atr_values_before(
+            symbol, trading_date, period, weighting, limit=1
+        )
+        return values[-1] if values else None
 
     def _adjust_row(self, symbol: str, row: dict, as_of_date: str) -> dict:
-        split_factor = 1.0
-        price_factor = 1.0
-        for action in self.corporate_actions:
-            if action["symbol"] != symbol:
-                continue
-            if not action.get("affects_position", True):
-                continue
-            if action["action_type"] not in {"forward_split", "reverse_split"}:
-                continue
-            effective_date = action.get("ex_date") or action["process_date"]
-            if row["date"] < effective_date <= as_of_date:
-                old_rate = float(action["old_rate"])
-                new_rate = float(action["new_rate"])
-                if old_rate <= 0 or new_rate <= 0:
-                    raise BacktestDataError(f"{symbol} 拆股比例无效。")
-                split_factor *= new_rate / old_rate
-        price_factor /= split_factor
-        for (event_symbol, effective_date), factor in self._dividend_factors.items():
-            if (
-                event_symbol == symbol
-                and row["date"] < effective_date <= as_of_date
-            ):
-                price_factor *= factor
-        if abs(price_factor - 1.0) < 1e-15 and abs(split_factor - 1.0) < 1e-15:
-            return dict(row)
-        adjusted = dict(row)
-        for field in ("open", "high", "low", "close"):
-            adjusted[field] = float(adjusted[field]) * price_factor
-        adjusted["volume"] = float(adjusted.get("volume") or 0) * split_factor
-        return adjusted
+        index = bisect_left(self.daily_dates[symbol], row["date"])
+        if index >= len(self.daily[symbol]) or self.daily[symbol][index]["date"] != row["date"]:
+            raise BacktestDataError(f"{symbol} 缺少 {row['date']} 日线数据。")
+        return self._adjusted_slice(symbol, index, index + 1, as_of_date)[0]
 
     def corporate_actions_on(self, trading_date: str) -> list[dict]:
         return list(self.actions_by_date.get(trading_date, []))
@@ -372,13 +672,10 @@ class HistoricalDataSet:
         return self.sessions[index + 1]
 
     def session_minutes(self, trading_date: str) -> tuple[int, int]:
-        for item in self.manifest.get("market_sessions", []):
-            if item.get("trading_date") == trading_date:
-                return int(item["open_minute_utc"]), int(item["close_minute_utc"])
-        return (
+        return self._market_session_minutes.get(trading_date, (
             _epoch_minute(trading_date, "09:30"),
             _epoch_minute(trading_date, "16:00"),
-        )
+        ))
 
     def event_price(self, symbol: str, trading_date: str, event: str) -> EventPrice:
         day = self.day_bar(symbol, trading_date)
@@ -390,13 +687,16 @@ class HistoricalDataSet:
                 fill_time=None,
             )
         if event == "OPEN":
-            previous_rows = self.daily_before(symbol, trading_date)
-            if not previous_rows:
+            try:
+                previous_close = self.value_before(
+                    symbol, trading_date, "close", 1
+                )
+            except BacktestDataError:
                 raise BacktestDataError(
                     f"{symbol} 在 {trading_date} 开盘前没有可用收盘价。"
-                )
+                ) from None
             return EventPrice(
-                signal_price=float(previous_rows[-1]["close"]),
+                signal_price=previous_close,
                 fill_price=float(day["open"]),
                 signal_time=f"{trading_date} 09:29:59 America/New_York",
                 fill_time=f"{trading_date} 09:30 America/New_York",
