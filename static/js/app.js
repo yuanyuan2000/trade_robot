@@ -769,6 +769,8 @@ function renderMarketOverviewTable(items) {
       const provisional = Boolean(reading.is_provisional);
       const formula = indicator.indicator_type === "RATR"
         ? `（收盘价 - ${indicator.params.period} 个交易日前收盘价）/ 前一日 Wilder ATR(${indicator.params.period})`
+        : indicator.indicator_type === "LINEAR_FIT"
+          ? `前 ${indicator.params.period} 根完整 K 线加当前价格，共 ${indicator.params.period + 1} 点的加权对数价格趋势 R²（包含最新未结束 K 线）`
         : indicator.indicator_type === "WTME"
           ? `100 × 加权方向收益 /（加权标准化真实波幅 + ${indicator.params.epsilon}），N=${indicator.params.period}，h=${indicator.params.half_life}`
           : indicator.indicator_type === "RAPID_DROP"
@@ -1219,6 +1221,9 @@ function formatOverviewIndicator(value, indicator) {
   const number = Number(value);
   if (indicator.indicator_type === "RAPID_DROP") {
     return number >= 0.5 ? "1" : "0";
+  }
+  if (indicator.indicator_type === "LINEAR_FIT") {
+    return number.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
   }
   if (["RATR", "WTME", "MACD"].includes(indicator.indicator_type)) {
     return `${number >= 0 ? "+" : ""}${number.toFixed(2)}`;
@@ -1973,6 +1978,8 @@ async function createAndAddIndicator(event) {
   }
   const displayName = indicatorType === "RATR"
     ? `相对ATR${period}`
+    : indicatorType === "LINEAR_FIT"
+      ? (period === 25 ? "R²" : `R²${period}`)
     : indicatorType === "WTME"
       ? `WTME${period}(h=${params.half_life})`
       : indicatorType === "RAPID_DROP"
@@ -2019,7 +2026,7 @@ function updateCustomIndicatorFields() {
     "aria-label",
     isRapidDrop ? "急跌观察变化段数" : "指标周期",
   );
-  const defaults = { ATR: 14, RATR: 14, RSI: 14, WTME: 40, RAPID_DROP: 5 };
+  const defaults = { ATR: 14, RATR: 14, LINEAR_FIT: 25, RSI: 14, WTME: 40, RAPID_DROP: 5 };
   if (defaults[customIndicatorType.value] != null) {
     customIndicatorPeriod.value = String(defaults[customIndicatorType.value]);
   }

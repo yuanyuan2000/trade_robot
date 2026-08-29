@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260822-01') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260829-04') }}">
   </head>
   <body class="theme-dark">
     <aside class="sidebar">
@@ -228,6 +228,7 @@
                 <option value="EMA">EMA</option>
                 <option value="ATR">绝对 ATR（Wilder）</option>
                 <option value="RATR">相对 ATR 动量评分</option>
+                <option value="LINEAR_FIT">R²</option>
                 <option value="WTME">加权真实波幅动量效率（WTME）</option>
                 <option value="RAPID_DROP">急跌过滤（0/1）</option>
                 <option value="RSI">RSI</option>
@@ -548,7 +549,10 @@
                 <canvas id="backtest-equity-chart"></canvas>
                 <div id="backtest-chart-empty" class="backtest-chart-empty">等待回测结果</div>
               </div>
-              <div id="backtest-trade-summary" class="backtest-trade-summary"></div>
+              <div class="backtest-result-footer">
+                <div id="backtest-trade-summary" class="backtest-trade-summary"></div>
+                <button id="backtest-analysis-open" type="button" disabled>精细化分析</button>
+              </div>
             </section>
 
             <section class="panel backtest-log-panel">
@@ -570,6 +574,80 @@
               <div id="backtest-log-output" class="backtest-log-output">
                 <div class="backtest-empty">暂无日志</div>
               </div>
+            </section>
+          </div>
+        </div>
+
+        <div id="backtest-analysis-page" hidden>
+          <header class="backtest-analysis-header">
+            <div class="backtest-toolbar-primary">
+              <button id="backtest-analysis-back" class="tool-icon-button" type="button" aria-label="返回回测结果">←</button>
+              <div>
+                <h2 id="backtest-analysis-title">精细化分析</h2>
+                <p id="backtest-analysis-subtitle">等待回测结果</p>
+              </div>
+            </div>
+            <span id="backtest-analysis-live" class="backtest-badge" hidden>运行中 · 动态更新</span>
+          </header>
+          <div id="backtest-analysis-status" class="status neutral">准备就绪</div>
+
+          <section class="panel backtest-analysis-controls">
+            <div id="backtest-analysis-periods" class="backtest-analysis-periods" aria-label="分析周期">
+              <button type="button" data-months="1">1个月</button>
+              <button type="button" data-months="3" class="active">3个月</button>
+              <button type="button" data-months="6">6个月</button>
+              <button type="button" data-months="12">12个月</button>
+            </div>
+            <button id="backtest-analysis-prev" type="button">上一周期</button>
+            <label><span>起点</span><input id="backtest-analysis-start" type="date"></label>
+            <label><span>终点</span><input id="backtest-analysis-end" type="date"></label>
+            <button id="backtest-analysis-next" type="button">下一周期</button>
+            <span id="backtest-analysis-actual" class="backtest-help"></span>
+          </section>
+
+          <div id="backtest-analysis-metrics" class="backtest-analysis-metrics"></div>
+          <div class="backtest-analysis-grid">
+            <section class="panel backtest-analysis-curve-panel">
+              <div class="backtest-analysis-panel-title">
+                <div><h3>区间收益对比</h3><span>所选区间首个可用收盘点为 0%</span></div>
+                <div class="backtest-analysis-legend-actions">
+                  <button type="button" data-legend-mode="all">全部显示</button>
+                  <button type="button" data-legend-mode="strategy">仅策略</button>
+                  <button type="button" data-legend-mode="core">策略 + 等权</button>
+                </div>
+              </div>
+              <div id="backtest-analysis-legend" class="backtest-analysis-legend"></div>
+              <div class="backtest-analysis-canvas-wrap">
+                <canvas id="backtest-analysis-chart"></canvas>
+                <div id="backtest-analysis-chart-empty" class="backtest-chart-empty">暂无曲线</div>
+              </div>
+            </section>
+
+            <section class="panel backtest-analysis-decision-panel">
+              <div class="backtest-analysis-panel-title">
+                <div><h3>决策过程</h3><span id="backtest-analysis-decision-date">—</span></div>
+                <button id="backtest-analysis-unpin" type="button" hidden>取消锁定</button>
+              </div>
+              <div id="backtest-analysis-decision" class="backtest-analysis-decision">
+                <div class="backtest-empty">移动到收益曲线日期查看决策</div>
+              </div>
+            </section>
+
+            <section class="panel backtest-analysis-candle-panel">
+              <div class="backtest-analysis-panel-title">
+                <div><h3>持仓与买卖点</h3><span>原始价格日 K</span></div>
+                <select id="backtest-analysis-symbol" aria-label="选择回测标的"></select>
+              </div>
+              <div class="backtest-analysis-canvas-wrap backtest-analysis-candle-wrap">
+                <canvas id="backtest-analysis-candles"></canvas>
+                <div id="backtest-analysis-candle-empty" class="backtest-chart-empty">暂无 K 线</div>
+              </div>
+            </section>
+
+            <section class="panel backtest-analysis-trade-panel">
+              <div class="backtest-analysis-panel-title"><div><h3>区间成交</h3><span id="backtest-analysis-trade-symbol">—</span></div></div>
+              <div id="backtest-analysis-trade-summary" class="backtest-analysis-trade-summary"></div>
+              <div id="backtest-analysis-trades" class="backtest-analysis-trades"></div>
             </section>
           </div>
         </div>
@@ -752,22 +830,24 @@
         <div class="backtest-syntax-help-content">
           <section><h4>变量与布尔值</h4><p><code>price</code> 是当前决策价；<code>position</code> 是当前仓位比例（0 到 1）；布尔值使用 <code>true</code>、<code>false</code>。</p></section>
           <section><h4>历史行情</h4><p><code>open(n)</code>、<code>high(n)</code>、<code>low(n)</code>、<code>close(n)</code>、<code>volume(n)</code>。参数 n 表示向前第 n 根已完成日线，例如 <code>close(1)</code>。</p></section>
-          <section><h4>单值指标</h4><p><code>ma(n)</code>、<code>ema(n)</code>、<code>atr(n)</code>、<code>ratr(n)</code>、<code>rsi(n)</code>。常用默认参数：<code>atr(14)</code>、<code>rsi(14)</code>。</p></section>
+          <section><h4>单值指标</h4><p><code>ma(n)</code>、<code>ema(n)</code>、<code>atr(n)</code>、<code>ratr(n)</code>、<code>rsi(n)</code>。<code>r_square(n)</code> 返回前 n 根完整 K 线加当前价格（共 n+1 点）的加权对数价格趋势 R²，默认窗口为 25。</p></section>
           <section><h4>WTME 与急跌过滤</h4><p><code>wtme(n, h)</code> 或 <code>wtme(n, h, epsilon)</code>；默认示例 <code>wtme(40, 15, 0.00000001)</code>。<code>rapid_drop(n, threshold_percent)</code> 命中急跌返回 1，否则返回 0。</p></section>
           <section><h4>MACD</h4><p><code>macd_line(fast, slow)</code> 返回 DIF；<code>macd_signal(fast, slow, signal)</code> 返回 DEA；<code>macd_hist(fast, slow, signal)</code> 返回未加倍柱状值 DIF − DEA。默认参数为 12、26、9。</p></section>
           <section><h4>运算与执行时间</h4><p>支持 <code>+ - * /</code>、<code>&gt; &gt;= &lt; &lt;= = !=</code>、<code>AND OR NOT</code> 和括号。执行时间可填 <code>OPEN</code>、<code>CLOSE</code> 或美东时间 <code>HH:MM</code>。</p></section>
           <section><h4>示例</h4><pre>rsi(14) &lt; 30 AND price &gt; ma(20)
 macd_hist(12, 26, 9) &gt; 0 AND macd_line(12, 26) &gt; macd_signal(12, 26, 9)
 wtme(40, 15) &gt;= 0 AND rapid_drop(5, 5) = 0
+r_square(25) &gt;= 0.8 AND price &gt; ma(20)
 price &lt; close(1) - 2 * atr(14)</pre></section>
         </div>
       </div>
     </dialog>
 
-    <script src="{{ url_for('static', filename='js/chart.js', v='20260822-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/chart.js', v='20260829-02') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260730-02') }}"></script>
-    <script src="{{ url_for('static', filename='js/backtest.js', v='20260822-02') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest.js', v='20260829-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest_analysis.js', v='20260829-05') }}"></script>
     <script src="{{ url_for('static', filename='js/realtime.js', v='20260814-01') }}"></script>
-    <script src="{{ url_for('static', filename='js/app.js', v='20260822-02') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js', v='20260829-02') }}"></script>
   </body>
 </html>

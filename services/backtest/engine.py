@@ -104,6 +104,14 @@ class CodeEventContext:
 
     def log_strategy_evaluations(self, evaluations: list[dict]) -> None:
         for item in evaluations:
+            payload = {
+                **item,
+                "score_formula_display": (
+                    f"{float(item.get('annualized_returns') or 0) * 100:.4g}% × "
+                    f"{float(item.get('r_squared') or 0):.4g}"
+                ),
+                "score_formula_help": "评分 = 长期年化趋势 × R²",
+            }
             formula_mode = item.get("trend_formula_mode")
             formula_label = {
                 "consistent_w2": "一致加权 R²",
@@ -126,7 +134,7 @@ class CodeEventContext:
                 f"{item['etf']} 趋势评分 {item['score']:.8f}{formula_text}"
                 f"{rank_text}{filter_text}。",
                 symbol=item["etf"],
-                context=item,
+                context=payload,
             )
 
 
@@ -302,8 +310,6 @@ class BacktestEngine:
             return {benchmark: 100.0}
         if self.strategy["selection_mode"] == "single":
             return {self.universe[0]: 100.0}
-        if self.strategy["selection_mode"] == "distribution":
-            return dict(self.max_weights)
         equal = 100.0 / len(self.universe)
         return {symbol: equal for symbol in self.universe}
 
@@ -965,6 +971,20 @@ class BacktestEngine:
             eligible: set[str] = set()
             for symbol in active_candidates:
                 if symbol in blocked:
+                    self._log(
+                        "DEBUG",
+                        "COMPETITION_ELIGIBILITY",
+                        f"{symbol} 已由优先规则处理，不进入本次竞争评分。",
+                        event_time=f"{trading_date} {event}",
+                        symbol=symbol,
+                        context={
+                            "formula": competition["eligibility"],
+                            "inputs": {},
+                            "matched": False,
+                            "reason": "优先规则已处理",
+                            "blocked_by_rule": True,
+                        },
+                    )
                     continue
                 context = self.dataset.expression_context(
                     symbol=symbol,
@@ -973,8 +993,23 @@ class BacktestEngine:
                     price=event_prices[symbol].signal_price,
                     position=float(self.portfolio.weight(symbol, marks)),
                 )
-                if bool(self._competition_eligibility.evaluate(context)):
+                matched = bool(self._competition_eligibility.evaluate(context))
+                if matched:
                     eligible.add(symbol)
+                self._log(
+                    "DEBUG",
+                    "COMPETITION_ELIGIBILITY",
+                    f"{symbol} 候选条件判断为 {matched}。",
+                    event_time=f"{trading_date} {event}",
+                    symbol=symbol,
+                    context={
+                        "formula": competition["eligibility"],
+                        "inputs": self._competition_eligibility.resolve_inputs(context),
+                        "matched": matched,
+                        "reason": None if matched else "候选条件未通过",
+                        "blocked_by_rule": False,
+                    },
+                )
             self._competition_eligible_by_date[trading_date] = eligible
         if event != competition["when"]:
             return risk_intents
@@ -1013,6 +1048,8 @@ class BacktestEngine:
                 symbol=symbol,
                 context={
                     "score": score,
+                    "formula": competition["score"],
+                    "inputs": self._competition_score.resolve_inputs(context),
                     "minimum_score": minimum_score,
                     "passes_minimum_score": passes_minimum,
                 },

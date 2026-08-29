@@ -656,7 +656,7 @@ function drawIndicators(ctx, plot, priceRange) {
 }
 
 function isOscillatorIndicator(series) {
-  return ["ATR", "RATR", "WTME", "RAPID_DROP", "RSI", "MACD"].includes(series.indicator_type);
+  return ["ATR", "RATR", "LINEAR_FIT", "WTME", "RAPID_DROP", "RSI", "MACD"].includes(series.indicator_type);
 }
 
 function getVisibleOscillatorSeries() {
@@ -670,6 +670,7 @@ function drawOscillatorIndicators(ctx, plot, seriesList, theme) {
   const ranges = {
     ATR: getIndicatorRange(seriesList, "ATR"),
     RATR: getIndicatorRange(seriesList, "RATR", true),
+    LINEAR_FIT: seriesList.some((series) => series.indicator_type === "LINEAR_FIT") ? { min: 0, max: 1 } : null,
     WTME: getIndicatorRange(seriesList, "WTME", true),
     RAPID_DROP: getIndicatorRange(seriesList, "RAPID_DROP", true),
     RSI: seriesList.some((series) => series.indicator_type === "RSI") ? { min: 0, max: 100 } : null,
@@ -807,6 +808,11 @@ function drawOscillatorAxes(ctx, plot, ranges, theme) {
       ctx.textAlign = "left";
       ctx.fillText(value.toFixed(2), plot.right + 10, y);
     }
+    if (ranges.LINEAR_FIT) {
+      const value = 1 - index / 2;
+      ctx.textAlign = "left";
+      ctx.fillText(value.toFixed(1), plot.left + 8, y);
+    }
     if (ranges.WTME) {
       const value = ranges.WTME.max - (ranges.WTME.max - ranges.WTME.min) * (index / 2);
       ctx.textAlign = "right";
@@ -830,6 +836,10 @@ function drawOscillatorAxes(ctx, plot, ranges, theme) {
   if (ranges.RATR) {
     ctx.textAlign = "right";
     ctx.fillText("相对 ATR", plot.right - 6, plot.top + 4);
+  }
+  if (ranges.LINEAR_FIT) {
+    ctx.textAlign = "left";
+    ctx.fillText("R²", plot.left + 6, plot.top + (ranges.RSI ? 18 : 4));
   }
   if (ranges.WTME) {
     ctx.textAlign = "right";
@@ -1455,6 +1465,8 @@ function renderIndicatorLegend() {
     const value = series.values[valueIndex];
     const displayValue = series.indicator_type === "MACD"
       ? `DIF ${formatIndicatorValue(series.componentValues?.line?.[valueIndex])} · DEA ${formatIndicatorValue(series.componentValues?.signal?.[valueIndex])} · 柱 ${formatIndicatorValue(series.componentValues?.histogram?.[valueIndex])}`
+      : series.indicator_type === "LINEAR_FIT"
+        ? formatIndicatorValue(value)
       : value == null ? "-" : formatPrice(value);
     const visibilityClass = series.visible ? "" : " is-hidden";
     const favoriteClass = series.is_favorite ? " is-favorite" : "";

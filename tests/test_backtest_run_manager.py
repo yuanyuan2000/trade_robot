@@ -199,6 +199,14 @@ class BacktestRunManagerTests(unittest.TestCase):
             backtest_repository.get_logs(run["id"], level="INFO")[0]["message"],
             "完成",
         )
+        range_snapshot = self.manager.analysis_snapshot(run["id"])
+        decision_snapshot = self.manager.analysis_snapshot(
+            run["id"],
+            trading_date="2024-01-02",
+        )
+        self.assertEqual(range_snapshot["logs"], [])
+        self.assertEqual(len(decision_snapshot["logs"]), 1)
+        self.assertEqual(decision_snapshot["logs"][0]["event_type"], "RUN_COMPLETE")
 
     @patch("services.backtest.service.BacktestEngine", LiveMetricsEngine)
     def test_running_status_exposes_live_metrics(self) -> None:

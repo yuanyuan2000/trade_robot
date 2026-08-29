@@ -23,6 +23,7 @@ from services.backtest.validation import (
     validate_settings,
     validate_strategy_payload,
 )
+from services.indicator_service import calculate_indicator_values
 
 
 def business_dates(start: str, count: int) -> list[str]:
@@ -125,7 +126,7 @@ class DslSafetyTests(unittest.TestCase):
     def test_expression_supports_all_shared_indicator_functions(self) -> None:
         expression = compile_expression(
             "ratr(14) > 0 AND wtme(40, 15, 0.00000001) >= 0 "
-            "AND rapid_drop(5, 5) = 0"
+            "AND rapid_drop(5, 5) = 0 AND r_square(25) >= 0"
         )
         context = SimpleNamespace(
             price=100.0,
@@ -134,6 +135,7 @@ class DslSafetyTests(unittest.TestCase):
                 ("ratr", 14): 1.25,
                 ("wtme", 40, 15, 1e-8): 22.5,
                 ("rapid_drop", 5, 5): 0.0,
+                ("r_square", 25): 0.86,
             }[(name, *arguments)],
         )
 
@@ -145,6 +147,7 @@ class DslSafetyTests(unittest.TestCase):
                 "ratr(14)": 1.25,
                 "wtme(40,15,1e-08)": 22.5,
                 "rapid_drop(5,5)": 0.0,
+                "r_square(25)": 0.86,
             },
         )
 
@@ -155,6 +158,8 @@ class DslSafetyTests(unittest.TestCase):
             "wtme(40, 15, 1)",
             "rapid_drop(5)",
             "rapid_drop(5, 0)",
+            "r_square(1)",
+            "linear_fit(25)",
         ):
             with self.subTest(expression=expression):
                 with self.assertRaises(BacktestValidationError):
@@ -812,6 +817,62 @@ class EngineTimingTests(unittest.TestCase):
             trades.append(result.trades)
 
         self.assertEqual(trades[0], trades[1])
+
+    def test_intraday_r_square_uses_signal_price_without_future_daily_close(self) -> None:
+        trading_date = self.run_dates[0]
+        previous_minute = _epoch_minute(trading_date, "14:00") - 1
+        current_minute = previous_minute + 1
+        daily = [dict(row) for row in self.daily]
+        current_day = next(row for row in daily if row["date"] == trading_date)
+        current_day.update({"open": 20.0, "high": 500.0, "low": 1.0, "close": 500.0})
+        dataset = HistoricalDataSet(
+            daily={"SPY": daily},
+            sessions=[trading_date],
+            minute={
+                "SPY": {
+                    previous_minute: {
+                        "open": 11.5, "high": 12.2, "low": 11.4, "close": 12.1,
+                    },
+                    current_minute: {
+                        "open": 20.0, "high": 999.0, "low": 1.0, "close": 999.0,
+                    },
+                }
+            },
+            required_intraday_events=["14:00"],
+        )
+
+        event_price = dataset.event_price("SPY", trading_date, "14:00")
+        context = dataset.expression_context(
+            symbol="SPY",
+            trading_date=trading_date,
+            event="14:00",
+            price=event_price.signal_price,
+            position=0,
+        )
+        completed = dataset.daily_before("SPY", trading_date)
+        synthetic_current = {
+            "date": trading_date,
+            "open": completed[-1]["close"],
+            "high": max(completed[-1]["close"], 12.1),
+            "low": min(completed[-1]["close"], 12.1),
+            "close": 12.1,
+            "volume": 0,
+            "is_complete": 0,
+        }
+        expected = calculate_indicator_values(
+            [*completed, synthetic_current], "LINEAR_FIT", 2
+        )[-1]
+        leaked = calculate_indicator_values(
+            dataset.indicator_history(
+                "SPY", trading_date, include_current=True
+            ),
+            "LINEAR_FIT",
+            2,
+        )[-1]
+
+        self.assertEqual(event_price.signal_price, 12.1)
+        self.assertAlmostEqual(context.resolve_function("r_square", 2), expected)
+        self.assertNotAlmostEqual(expected, leaked, places=6)
 
 
 class CorporateActionTests(unittest.TestCase):

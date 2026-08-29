@@ -9,10 +9,12 @@ import app as app_module
 import database.db as main_db
 from database import repository
 from services.backtest.data import HistoricalDataSet
+from services.backtest.code_strategies import SevenStarEtfRotationStrategy
 from services.indicator_service import (
     attach_overview_indicator_values,
     build_indicator_series,
     calculate_indicator_values,
+    calculate_r_square,
     calculate_macd_components,
     calculate_wilder_rsi,
     calculate_rapid_drop_filter,
@@ -91,6 +93,10 @@ class IndicatorCalculationTests(unittest.TestCase):
     def test_indicator_catalog_accepts_configurable_atr_periods(self) -> None:
         self.assertEqual(repository.validate_indicator("ATR", {"period": 14}), ("ATR", {"period": 14}))
         self.assertEqual(repository.validate_indicator("ratr", {"period": "21"}), ("RATR", {"period": 21}))
+        self.assertEqual(
+            repository.validate_indicator("LINEAR_FIT", {"period": "25"}),
+            ("LINEAR_FIT", {"period": 25}),
+        )
         self.assertEqual(
             repository.validate_indicator(
                 "wtme",
@@ -180,6 +186,34 @@ class IndicatorCalculationTests(unittest.TestCase):
         self.assertEqual(values[:4], [None, None, None, None])
         self.assertAlmostEqual(values[4], (110 - 101) / 2)
 
+    def test_r_square_matches_sevenstar_consistent_r_squared(self) -> None:
+        prices = [100.0, 101.5, 102.0, 104.2, 105.8, 108.1]
+        values = calculate_r_square(simple_rows(prices), 5)
+        _, expected_r_squared, _ = SevenStarEtfRotationStrategy._weighted_trend(
+            prices, 5
+        )
+
+        self.assertEqual(values[:5], [None] * 5)
+        self.assertAlmostEqual(values[-1], expected_r_squared, places=14)
+
+    def test_r_square_handles_flat_scale_and_future_rows(self) -> None:
+        flat = calculate_r_square(simple_rows([50.03] * 6), 5)
+        smooth_prices = [100 * (1.01 ** index) for index in range(8)]
+        smooth = calculate_r_square(simple_rows(smooth_prices), 5)
+        scaled = calculate_r_square(
+            simple_rows(smooth_prices, scale=37), 5
+        )
+        extended = calculate_r_square(
+            simple_rows([*smooth_prices, 1_000_000]), 5
+        )
+
+        self.assertEqual(flat[-1], 0.0)
+        self.assertAlmostEqual(smooth[-1], 1.0, places=12)
+        for actual, expected in zip(scaled, smooth):
+            if expected is not None:
+                self.assertAlmostEqual(actual, expected, places=12)
+        self.assertEqual(extended[:len(smooth)], smooth)
+
     def test_visual_expression_context_reuses_indicator_system_values(self) -> None:
         rows = sample_rows()
         trading_date = rows[-1]["date"]
@@ -199,6 +233,7 @@ class IndicatorCalculationTests(unittest.TestCase):
             ("ema", (3,), "EMA", {"period": 3}),
             ("atr", (3,), "ATR", {"period": 3}),
             ("ratr", (3,), "RATR", {"period": 3}),
+            ("r_square", (3,), "LINEAR_FIT", {"period": 3}),
             ("rsi", (3,), "RSI", {"period": 3}),
             (
                 "wtme",
@@ -314,7 +349,8 @@ class IndicatorCalculationTests(unittest.TestCase):
             {"id": 2, "indicator_type": "EMA", "params": {"period": 3}},
             {"id": 3, "indicator_type": "ATR", "params": {"period": 3}},
             {"id": 4, "indicator_type": "RATR", "params": {"period": 3}},
-            {"id": 5, "indicator_type": "WTME", "params": {"period": 3, "half_life": 2, "epsilon": 1e-8}},
+            {"id": 5, "indicator_type": "LINEAR_FIT", "params": {"period": 3}},
+            {"id": 6, "indicator_type": "WTME", "params": {"period": 3, "half_life": 2, "epsilon": 1e-8}},
         ]
         overview = attach_overview_indicator_values(
             {"items": [{"symbol": "SPY"}]},
@@ -376,6 +412,27 @@ class IndicatorSeedTests(unittest.TestCase):
             indicator["params"],
             {"period": 5, "threshold_percent": 5.0},
         )
+
+    def test_default_r_square_indicator_uses_25_intervals(self) -> None:
+        indicator = next(
+            item for item in repository.list_indicators()
+            if item["code"] == "LINEAR_FIT25"
+        )
+
+        self.assertTrue(indicator["is_favorite"])
+        self.assertEqual(indicator["name"], "R²")
+        self.assertEqual(indicator["params"], {"period": 25})
+
+    def test_reseeding_renames_existing_r_square_default(self) -> None:
+        indicator = next(
+            item for item in repository.list_indicators()
+            if item["code"] == "LINEAR_FIT25"
+        )
+        repository.update_indicator(indicator["id"], {"name": "直线拟合度25"})
+
+        repository.seed_default_indicators()
+
+        self.assertEqual(repository.get_indicator(indicator["id"])["name"], "R²")
 
 
 class MarketOverviewIndicatorRouteTests(unittest.TestCase):
@@ -502,6 +559,7 @@ class MarketOverviewIndicatorRouteTests(unittest.TestCase):
         self.assertNotIn('id="overview-indicator-controls"', html)
         self.assertIn('<option value="ATR">', html)
         self.assertIn('<option value="RATR">', html)
+        self.assertIn('<option value="LINEAR_FIT">', html)
         self.assertIn('<option value="WTME">', html)
         self.assertIn('<option value="RAPID_DROP">', html)
         self.assertIn('<option value="RSI">', html)

@@ -70,6 +70,13 @@ from services.backtest.service import (
 )
 from services.backtest.presets import ensure_shipped_strategy_presets
 from services.backtest.export import build_run_xls
+from services.backtest.analysis import (
+    build_analysis,
+    build_analysis_meta,
+    build_candles as build_backtest_analysis_candles,
+    build_decision as build_backtest_analysis_decision,
+    purge_analysis_cache,
+)
 from services.backtest.validation import validate_strategy_payload
 from database import realtime_repository
 from services.realtime_mail import bootstrap_env_qq_channel
@@ -1441,6 +1448,61 @@ def get_backtest_run_detail(run_id: int):
         return backtest_error_response(exc)
 
 
+@app.route("/api/backtest/runs/<int:run_id>/analysis/meta")
+def get_backtest_analysis_meta(run_id: int):
+    try:
+        snapshot = backtest_run_manager.analysis_snapshot(run_id)
+        return jsonify({"ok": True, **build_analysis_meta(snapshot)})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/runs/<int:run_id>/analysis")
+def get_backtest_analysis(run_id: int):
+    try:
+        snapshot = backtest_run_manager.analysis_snapshot(run_id)
+        return jsonify({
+            "ok": True,
+            **build_analysis(
+                snapshot,
+                request.args.get("start_date", ""),
+                request.args.get("end_date", ""),
+            ),
+        })
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/runs/<int:run_id>/analysis/decision")
+def get_backtest_analysis_decision(run_id: int):
+    try:
+        trading_date = request.args.get("date", "")
+        snapshot = backtest_run_manager.analysis_snapshot(
+            run_id,
+            trading_date=trading_date,
+        )
+        return jsonify({"ok": True, **build_backtest_analysis_decision(snapshot, trading_date)})
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
+@app.route("/api/backtest/runs/<int:run_id>/analysis/candles")
+def get_backtest_analysis_candles(run_id: int):
+    try:
+        snapshot = backtest_run_manager.analysis_snapshot(run_id)
+        return jsonify({
+            "ok": True,
+            **build_backtest_analysis_candles(
+                snapshot,
+                request.args.get("symbol", ""),
+                request.args.get("start_date", ""),
+                request.args.get("end_date", ""),
+            ),
+        })
+    except Exception as exc:
+        return backtest_error_response(exc)
+
+
 @app.route("/api/backtest/runs/deletions", methods=["POST"])
 def delete_backtest_runs():
     payload = request.get_json(silent=True) or {}
@@ -1449,6 +1511,7 @@ def delete_backtest_runs():
             raise ValueError("必须明确确认不可逆删除。")
         result = backtest_repository.delete_runs(payload.get("run_ids") or [])
         backtest_run_manager.purge_deleted_runs(result["run_ids"])
+        purge_analysis_cache(result["run_ids"])
         return jsonify({"ok": True, **result})
     except Exception as exc:
         return backtest_error_response(exc)

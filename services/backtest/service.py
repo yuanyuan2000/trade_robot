@@ -363,6 +363,10 @@ class BacktestRunManager:
             "logs": [],
             "metrics": None,
             "last_db_update": 0.0,
+            "last_metrics_update": 0.0,
+            "captured_equity_count": 0,
+            "captured_trade_count": 0,
+            "captured_log_count": 0,
             "dataset": preflight.dataset,
         }
         with self._lock:
@@ -389,34 +393,48 @@ class BacktestRunManager:
 
             def progress(payload: dict) -> None:
                 now_monotonic = time.monotonic()
-                equity_points = list(engine.equity_points)
-                trades = list(engine.trades)
-                portfolio = getattr(engine, "portfolio", None)
-                live_metrics = calculate_metrics(
-                    equity_points,
-                    trades,
-                    initial_capital=settings["initial_capital"],
-                    risk_free_rate=settings["risk_free_rate"],
-                    total_commission=float(
-                        getattr(portfolio, "total_commission", 0)
-                    ),
-                    total_slippage=float(
-                        getattr(portfolio, "total_slippage", 0)
-                    ),
-                    termination_reason=getattr(
-                        engine, "termination_reason", None
-                    ),
-                    liquidation=getattr(engine, "liquidation", None),
-                    leverage_multiplier=settings["leverage_multiplier"],
-                    max_observed_gross_leverage=getattr(
-                        engine, "max_observed_gross_leverage", 0
-                    ),
-                )
+                new_equity_points = engine.equity_points[
+                    state["captured_equity_count"]:
+                ]
+                new_trades = engine.trades[state["captured_trade_count"]:]
+                new_logs = engine.logs[state["captured_log_count"]:]
+                state["captured_equity_count"] = len(engine.equity_points)
+                state["captured_trade_count"] = len(engine.trades)
+                state["captured_log_count"] = len(engine.logs)
+                live_metrics = None
+                if (
+                    state["metrics"] is None
+                    or now_monotonic - state["last_metrics_update"] >= 0.25
+                    or float(payload.get("progress") or 0) >= 1
+                ):
+                    portfolio = getattr(engine, "portfolio", None)
+                    live_metrics = calculate_metrics(
+                        engine.equity_points,
+                        engine.trades,
+                        initial_capital=settings["initial_capital"],
+                        risk_free_rate=settings["risk_free_rate"],
+                        total_commission=float(
+                            getattr(portfolio, "total_commission", 0)
+                        ),
+                        total_slippage=float(
+                            getattr(portfolio, "total_slippage", 0)
+                        ),
+                        termination_reason=getattr(
+                            engine, "termination_reason", None
+                        ),
+                        liquidation=getattr(engine, "liquidation", None),
+                        leverage_multiplier=settings["leverage_multiplier"],
+                        max_observed_gross_leverage=getattr(
+                            engine, "max_observed_gross_leverage", 0
+                        ),
+                    )
+                    state["last_metrics_update"] = now_monotonic
                 with self._lock:
-                    state["equity_points"] = equity_points
-                    state["trades"] = trades
-                    state["logs"] = list(engine.logs)
-                    state["metrics"] = live_metrics
+                    state["equity_points"].extend(new_equity_points)
+                    state["trades"].extend(new_trades)
+                    state["logs"].extend(new_logs)
+                    if live_metrics is not None:
+                        state["metrics"] = live_metrics
                     state["version"] += 1
                 if now_monotonic - state["last_db_update"] >= 0.5:
                     backtest_repository.update_run(
@@ -426,6 +444,9 @@ class BacktestRunManager:
                         current_time=payload["current_time"],
                     )
                     state["last_db_update"] = now_monotonic
+                # The engine is CPU-bound and shares this process with Flask.
+                # Yield at progress boundaries so request/SSE threads can run.
+                time.sleep(0)
 
             engine = BacktestEngine(
                 strategy,
@@ -619,6 +640,58 @@ class BacktestRunManager:
                 "equity_points": list(state["equity_points"]),
                 "trades": list(state["trades"]),
             }
+
+    def analysis_snapshot(self, run_id: int, *, trading_date: str | None = None) -> dict:
+        """Return one internally consistent, read-only view of a run's output."""
+        run = backtest_repository.get_run(run_id, include_snapshot=True)
+        with self._lock:
+            state = self._states.get(run_id)
+            if state is not None:
+                equity_points = deepcopy(state["equity_points"])
+                if trading_date:
+                    day = str(trading_date)[:10]
+                    trades = deepcopy([
+                        trade for trade in state["trades"]
+                        if str(trade.get("event_time") or "")[:10] == day
+                    ])
+                    logs = deepcopy([
+                        log for log in state["logs"]
+                        if str(log.get("event_time") or "")[:10] == day
+                    ])
+                else:
+                    trades = deepcopy(state["trades"])
+                    # Meta/range/candle endpoints do not consume decision logs.
+                    logs = []
+                if not run.get("metrics") and state.get("metrics") is not None:
+                    run["metrics"] = deepcopy(state["metrics"])
+                run["live"] = {
+                    "equity_point_count": len(equity_points),
+                    "trade_count": len(trades),
+                    "log_count": len(logs),
+                    "latest_equity_point": equity_points[-1] if equity_points else None,
+                    "version": state["version"],
+                }
+            else:
+                equity_points = backtest_repository.get_equity_points(run_id)
+                trades = backtest_repository.get_trades(run_id)
+                logs = (
+                    backtest_repository.get_logs_for_date(run_id, trading_date)
+                    if trading_date
+                    else []
+                )
+        if trading_date:
+            day = str(trading_date)[:10]
+            logs = [log for log in logs if str(log.get("event_time") or "")[:10] == day]
+            trades = [
+                trade for trade in trades
+                if str(trade.get("event_time") or "")[:10] == day
+            ]
+        return {
+            "run": run,
+            "equity_points": equity_points,
+            "trades": trades,
+            "logs": logs,
+        }
 
     def events_since(
         self,

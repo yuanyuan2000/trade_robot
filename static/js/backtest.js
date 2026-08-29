@@ -4,6 +4,7 @@ const bt = {
   current: null,
   runs: [],
   currentRunId: null,
+  currentRunStatus: null,
   eventSource: null,
   equityPoints: [],
   trades: [],
@@ -42,6 +43,7 @@ const btLogCount = document.getElementById("backtest-log-count");
 const btRunHistory = document.getElementById("backtest-run-history");
 const btResultsStatus = document.getElementById("backtest-results-status");
 const btResultsTable = document.getElementById("backtest-results-table");
+const btAnalysisOpen = document.getElementById("backtest-analysis-open");
 
 function btEscape(value) {
   return String(value ?? "")
@@ -83,6 +85,32 @@ function btDataIssueText(issue) {
     : issue.missing_date || issue.at || issue.start_date || "";
   const type = issue.type === "minute" ? "分钟线" : "日线";
   return `${issue.symbol || "未知标的"} ${dates} ${type}`.trim();
+}
+
+function btAnalysisHasThreeMonths(points) {
+  if (!points?.length) return false;
+  const first = new Date(`${points[0].trading_date}T00:00:00Z`);
+  const latest = new Date(`${points[points.length - 1].trading_date}T00:00:00Z`);
+  if (Number.isNaN(first.getTime()) || Number.isNaN(latest.getTime())) return false;
+  const targetFirst = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 3, 1));
+  const targetLast = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 4, 0));
+  const threshold = new Date(targetFirst);
+  threshold.setUTCDate(Math.min(first.getUTCDate(), targetLast.getUTCDate()));
+  threshold.setUTCDate(threshold.getUTCDate() - 1);
+  return latest >= threshold;
+}
+
+function updateBacktestAnalysisButton(run = {}) {
+  bt.currentRunStatus = run.status || bt.currentRunStatus;
+  const terminal = ["completed", "failed", "cancelled"].includes(bt.currentRunStatus);
+  const available = Boolean(bt.currentRunId && bt.equityPoints.length)
+    && (terminal || btAnalysisHasThreeMonths(bt.equityPoints));
+  btAnalysisOpen.disabled = !available;
+  btAnalysisOpen.title = available
+    ? "查看已完成区间的收益、决策与买卖点"
+    : bt.currentRunId && bt.equityPoints.length
+      ? "运行中累计完成三个月后即可打开"
+      : "请先运行或选择一条有结果的回测";
 }
 
 async function validateAndRepairBacktest() {
@@ -275,6 +303,7 @@ async function openBacktestRunDetail(runId) {
     bt.current = structuredClone(run.strategy_snapshot || {});
     bt.current.default_settings = structuredClone(run.settings || {});
     bt.currentRunId = run.id;
+    bt.currentRunStatus = run.status;
     bt.runs = [];
     bt.equityPoints = payload.equity_points || [];
     bt.trades = payload.trades || [];
@@ -291,6 +320,7 @@ async function openBacktestRunDetail(runId) {
     renderBacktestChart();
     renderBacktestLogs();
     renderBacktestTradeSummary(run);
+    updateBacktestAnalysisButton(run);
     btSetStatus(
       run.logs_deleted_at ? `历史回测 #${run.id}；详细日志已清理。` : `历史回测 #${run.id}（只读）。`,
       run.logs_deleted_at ? "warning" : "neutral",
@@ -543,6 +573,7 @@ async function saveBacktestStrategy({ announce = true } = {}) {
 
 function resetBacktestResult() {
   bt.currentRunId = null;
+  bt.currentRunStatus = null;
   bt.equityPoints = [];
   bt.trades = [];
   bt.logs = [];
@@ -553,6 +584,7 @@ function resetBacktestResult() {
   document.getElementById("backtest-trade-summary").textContent = "";
   renderBacktestChart();
   renderBacktestLogs();
+  updateBacktestAnalysisButton();
 }
 
 function settingsToForm() {
@@ -598,7 +630,9 @@ async function runBacktest() {
       body: JSON.stringify({ settings: bt.current.default_settings }),
     }));
     bt.currentRunId = payload.run.id;
+    bt.currentRunStatus = payload.run.status;
     renderBacktestMetrics(payload.run.metrics, payload.run);
+    updateBacktestAnalysisButton(payload.run);
     connectBacktestEvents(payload.run.id);
   } catch (error) {
     btSetRunning(false);
@@ -676,12 +710,17 @@ function consumeBacktestUpdate(payload) {
   renderBacktestChart();
   renderBacktestLogs();
   renderBacktestTradeSummary();
+  updateBacktestAnalysisButton(payload.run || {});
+  document.dispatchEvent(new CustomEvent("backtest-analysis-progress", {
+    detail: { runId: bt.currentRunId, payload },
+  }));
 }
 
 async function loadBacktestRunResult(runId, knownStatus = "") {
   try {
     const payload = await btJson(await fetch(`/api/backtest/runs/${runId}/results`));
     bt.currentRunId = runId;
+    bt.currentRunStatus = payload.run.status || knownStatus;
     bt.displayInitialCapital = Number(
       payload.run.settings?.initial_capital
       || bt.current?.default_settings?.initial_capital
@@ -696,6 +735,7 @@ async function loadBacktestRunResult(runId, knownStatus = "") {
     renderBacktestChart();
     renderBacktestLogs();
     renderBacktestTradeSummary(payload.run);
+    updateBacktestAnalysisButton(payload.run);
     if (!["completed", "failed", "cancelled"].includes(payload.run.status || knownStatus)) {
       btSetRunning(true);
       connectBacktestEvents(runId);
@@ -1054,6 +1094,11 @@ function initBacktest() {
     btWorkspace.hidden = true;
     btResultsPage.hidden = false;
     loadBacktestResultsOverview(1);
+  });
+  btAnalysisOpen.addEventListener("click", () => {
+    if (!btAnalysisOpen.disabled && typeof openBacktestAnalysis === "function") {
+      openBacktestAnalysis();
+    }
   });
   document.getElementById("backtest-results-back").addEventListener("click", () => {
     btResultsPage.hidden = true;

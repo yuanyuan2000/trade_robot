@@ -12,7 +12,7 @@ from services.backtest.errors import BacktestValidationError
 ALLOWED_NAMES = {"price", "position", "true", "false"}
 HISTORY_FUNCTIONS = {"open", "high", "low", "close", "volume"}
 INDICATOR_FUNCTIONS = {
-    "ma", "ema", "atr", "ratr", "wtme", "rapid_drop", "rsi",
+    "ma", "ema", "atr", "ratr", "r_square", "wtme", "rapid_drop", "rsi",
     "macd_line", "macd_signal", "macd_hist",
 }
 ALLOWED_FUNCTIONS = HISTORY_FUNCTIONS | INDICATOR_FUNCTIONS
@@ -101,6 +101,8 @@ def _validate_function_call(node: ast.Call) -> None:
         threshold = _numeric_constant(node.args[1])
         if threshold is None or not 0.1 <= float(threshold) <= 50:
             raise _node_error(node, "急跌阈值必须在 0.1% 至 50% 之间。")
+    elif name == "r_square" and period < 2:
+        raise _node_error(node, "R² 窗口必须是 2 至 500 的整数。")
 
 
 def _call_arguments(node: ast.Call) -> tuple[float | int, ...]:

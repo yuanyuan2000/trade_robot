@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import math
 from typing import Iterable
+
+import numpy as np
 
 
 WTME_DEFAULT_HALF_LIFE = 15.0
 WTME_DEFAULT_EPSILON = 1e-8
 INDICATOR_CONTRACT_VERSION = 1
+R_SQUARE_TOLERANCE = 1e-12
 
 
 def calculate_wilder_atr(
@@ -41,6 +45,83 @@ def calculate_wilder_atr(
     return values
 
 
+def calculate_r_square(
+    rows: list[dict],
+    period: int = 25,
+) -> list[float | None]:
+    """Return the SevenStar-style weighted log-price R-squared series.
+
+    ``period`` is the number of completed intervals before the current point,
+    so every observation uses ``period + 1`` closes.  The final row is treated
+    exactly like any other row; when it is an unfinished K-line its current
+    ``close`` therefore becomes the point-in-time final price.
+    """
+    values: list[float | None] = [None] * len(rows)
+    if period < 2 or len(rows) < period + 1:
+        return values
+
+    point_count = period + 1
+    x = np.arange(point_count, dtype=float)
+    fit_weights = np.linspace(1.0, 2.0, point_count)
+    importance = fit_weights ** 2
+    importance_total = float(np.sum(importance))
+    weighted_x_mean = float(np.average(x, weights=importance))
+    centered_x = x - weighted_x_mean
+    weighted_x_variance = float(np.sum(importance * centered_x ** 2))
+
+    closes = np.full(len(rows), np.nan, dtype=float)
+    for index, row in enumerate(rows):
+        try:
+            close = float(row["close"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(close) and close > 0:
+            closes[index] = close
+
+    log_prices = np.full(len(rows), np.nan, dtype=float)
+    valid_prices = np.isfinite(closes)
+    log_prices[valid_prices] = np.log(closes[valid_prices])
+    windows = np.lib.stride_tricks.sliding_window_view(log_prices, point_count)
+    valid_windows = np.all(np.isfinite(windows), axis=1)
+    if not np.any(valid_windows):
+        return values
+
+    output_indexes = np.flatnonzero(valid_windows) + period
+    y = windows[valid_windows]
+    weighted_means = np.sum(y * importance, axis=1) / importance_total
+    centered_y = y - weighted_means[:, None]
+    ss_tot = np.sum(importance * centered_y ** 2, axis=1)
+    weighted_variances = ss_tot / importance_total
+    finite_variances = np.isfinite(weighted_variances)
+
+    flat = finite_variances & (weighted_variances <= np.finfo(float).eps)
+    for output_index in output_indexes[flat]:
+        values[int(output_index)] = 0.0
+
+    fitted = finite_variances & ~flat
+    if not np.any(fitted):
+        return values
+    fitted_indexes = output_indexes[fitted]
+    fitted_y = centered_y[fitted]
+    slopes = (
+        np.sum(importance * centered_x * fitted_y, axis=1)
+        / weighted_x_variance
+    )
+    fitted_centered = slopes[:, None] * centered_x
+    ss_res = np.sum(importance * (fitted_y - fitted_centered) ** 2, axis=1)
+    raw_r_squared = 1 - ss_res / ss_tot[fitted]
+    acceptable = (
+        np.isfinite(raw_r_squared)
+        & (raw_r_squared >= -R_SQUARE_TOLERANCE)
+        & (raw_r_squared <= 1 + R_SQUARE_TOLERANCE)
+    )
+    result = np.zeros(len(raw_r_squared), dtype=float)
+    result[acceptable] = np.clip(raw_r_squared[acceptable], 0.0, 1.0)
+    for output_index, value in zip(fitted_indexes, result):
+        values[int(output_index)] = float(value)
+    return values
+
+
 def calculate_indicator_values(
     rows: list[dict],
     indicator_type: str,
@@ -63,7 +144,7 @@ def calculate_indicator_values(
         )["histogram"]
     if period is None:
         return [None] * len(rows)
-    minimum_period = 2 if normalized_type == "WTME" else 1
+    minimum_period = 2 if normalized_type in {"WTME", "LINEAR_FIT"} else 1
     if period < minimum_period:
         return [None] * len(rows)
     if normalized_type == "MA":
@@ -76,6 +157,8 @@ def calculate_indicator_values(
         return calculate_wilder_atr(rows, period)
     if normalized_type == "RATR":
         return _calculate_relative_atr_score(rows, period)
+    if normalized_type == "LINEAR_FIT":
+        return calculate_r_square(rows, period)
     if normalized_type == "WTME":
         return calculate_wtme(
             rows,

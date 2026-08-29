@@ -888,6 +888,30 @@ def get_logs(
     return result
 
 
+def get_logs_for_date(run_id: int, trading_date: str) -> list[dict]:
+    day = str(trading_date or "")[:10]
+    if len(day) != 10:
+        raise ValueError("决策日期格式必须为 YYYY-MM-DD。")
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM backtest_logs
+            WHERE run_id = ?
+              AND event_time >= ?
+              AND event_time < ?
+            ORDER BY sequence
+            """,
+            (int(run_id), f"{day} ", f"{day}~"),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["context"] = _decode(item.pop("context_json"), None)
+        result.append(item)
+    return result
+
+
 def upsert_corporate_actions(
     actions: list[dict],
     *,

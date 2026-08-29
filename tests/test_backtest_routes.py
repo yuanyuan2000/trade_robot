@@ -40,9 +40,68 @@ class BacktestRouteTests(unittest.TestCase):
     def test_backtest_page_uses_click_help_dialog_and_larger_selection_hitbox(self) -> None:
         html = self.client.get("/").get_data(as_text=True)
         script = (Path(app_module.app.static_folder) / "js" / "backtest.js").read_text(encoding="utf-8")
+        styles = (Path(app_module.app.static_folder) / "css" / "app.css").read_text(encoding="utf-8")
         self.assertIn('id="backtest-syntax-help-dialog"', html)
         self.assertIn('id="backtest-syntax-help-open"', html)
+        self.assertIn("r_square(25)", html)
         self.assertIn("bt-result-select-hitbox", script)
+        self.assertIn(".backtest-syntax-help-dialog { width: min(760px, calc(100vw - 32px)); overflow: hidden; }", styles)
+        self.assertIn(".backtest-syntax-help-content { min-height: 0; overflow: auto; }", styles)
+
+    def test_backtest_page_exposes_detailed_analysis_workspace(self) -> None:
+        html = self.client.get("/").get_data(as_text=True)
+        analysis_script = (
+            Path(app_module.app.static_folder) / "js" / "backtest_analysis.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('id="backtest-analysis-open"', html)
+        self.assertIn('id="backtest-analysis-page"', html)
+        self.assertIn('id="backtest-analysis-candles"', html)
+        self.assertIn('data-months="12"', html)
+        self.assertIn("backtest-analysis-progress", analysis_script)
+        self.assertIn("/analysis/decision", analysis_script)
+        self.assertIn("backtest-analysis-pnl-positive", analysis_script)
+        self.assertIn("backtest-analysis-pnl-negative", analysis_script)
+        self.assertIn('item.type === "strategy" ? 3.0', analysis_script)
+        self.assertIn('data-series-type="${btEscape(item.type)}"', analysis_script)
+
+    def test_backtest_analysis_routes_forward_range_and_date_parameters(self) -> None:
+        snapshot = {"run": {"id": 19}}
+        with (
+            patch.object(
+                app_module.backtest_run_manager,
+                "analysis_snapshot",
+                return_value=snapshot,
+            ) as snapshot_reader,
+            patch.object(app_module, "build_analysis", return_value={"series": []}) as builder,
+        ):
+            response = self.client.get(
+                "/api/backtest/runs/19/analysis?start_date=2024-01-01&end_date=2024-03-31"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["series"], [])
+        snapshot_reader.assert_called_once_with(19)
+        builder.assert_called_once_with(snapshot, "2024-01-01", "2024-03-31")
+
+        with (
+            patch.object(
+                app_module.backtest_run_manager,
+                "analysis_snapshot",
+                return_value=snapshot,
+            ) as snapshot_reader,
+            patch.object(
+                app_module,
+                "build_backtest_analysis_decision",
+                return_value={"mode": "competition", "rows": []},
+            ),
+        ):
+            response = self.client.get(
+                "/api/backtest/runs/19/analysis/decision?date=2024-03-29"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        snapshot_reader.assert_called_once_with(19, trading_date="2024-03-29")
 
     def test_backtest_metric_panel_uses_live_retained_fields_only(self) -> None:
         script = (Path(app_module.app.static_folder) / "js" / "backtest.js").read_text(encoding="utf-8")

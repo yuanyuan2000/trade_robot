@@ -2,7 +2,7 @@
 
 本文说明历史回测模块的界面、策略模型、成交时点、账户计算、数据约束、API、测试方法和
 已知边界。实现以 `services/backtest/`、`database/backtest_repository.py` 和
-`static/js/backtest.js` 为准。
+`static/js/backtest.js`、`static/js/backtest_analysis.js` 为准。
 
 ## 1. 模块结构
 
@@ -27,11 +27,35 @@
   功能上线前没有摘要的旧运行保持空白，不根据后来修改过的策略反推。
 - 回测在单 worker 后台队列执行，页面通过 SSE 接收每日权益、成交和日志增量。运行中可
   取消；应用不会因浏览器心跳消失而自动关闭正在执行的回测。
+- 后台 worker 使用专用 `backtest` 线程，但与 Flask 请求线程共享同一 Python 进程。运行进度
+  采用增量同步，实时指标最多每 250ms 全量刷新一次，并在每日进度边界主动让出执行权；分析
+  区间请求不复制决策日志，只有指定日期的决策接口读取当天日志，以降低长回测对其他页面的
+  GIL 和内存锁竞争。单 worker 也保证多个回测不会同时争抢本地行情与 SQLite。
 - 每个策略保存 `market` 契约。当前仅支持 `US_EQUITY`，其日历固定为 `XNYS`、时区固定为
   `America/New_York`，不能把市场类型、日历和时区拼成不一致的组合。界面已经保留市场选择
   入口，以后增加加密或 A 股时扩展同一契约。
 
-### 1.1 市场日历与日线序列
+### 1.1 精细化分析
+
+收益曲线下方的“精细化分析”进入同一次运行的独立分析工作区：
+
+- 可选择 1、3、6、12 个月周期，或在已完成交易日范围内指定起止日期，并用上一/下一周期
+  快速平移。运行中从首个权益点起完成三个自然月后开放，SSE 推进时动态扩展可选终点；终态
+  运行即使不足所选周期，也按实际首尾日期展示。
+- 区间曲线都以各自首个可用收盘点为 0%，包括策略权益、资产池每个标的单独买入持有、资产
+  池等权，以及不在资产池内的显式基准。`auto` 就是等权线；显式基准已在资产池时只标注对应
+  资产线，不重复生成。每条线使用不同颜色，图例支持逐条开关和批量显隐。
+- 鼠标日期联动决策面板。代码竞争策略和可视化竞争策略按评分降序显示标的、过滤状态、评分、
+  代入值后的最后一步公式，数值最多四位有效数字；七星策略公式帮助为“评分 = 长期年化趋势 ×
+  R²”。可视化非竞争策略显示规则内容、代入后的条件和执行结果。
+- 原始价格日 K 仅用于展示，可在资产池标的间切换；买点使用 K 线下方蓝色 B 箭头徽标，卖点
+  使用 K 线上方橙色 S 箭头徽标，避免与红绿 K 线混淆。区间成交汇总买入数、卖出数、盈利
+  卖单数、卖出实现盈亏、手续费和区间标的收益率；收益率口径为“（卖出实现盈亏－区间手续费
+  －区间滑点）÷ 区间起始日总权益”。逐笔成交的已实现盈亏金额按正数绿色、负数红色显示。
+- 曲线由运行快照、现有日线和公司行动清单按请求实时计算，只使用小型进程内 LRU 缓存；没有
+  `backtest_comparison_points` 或其他新增持久化表。删除历史运行时同步清除该运行的分析缓存。
+
+### 1.2 市场日历与日线序列
 
 - 美股策略只在 XNYS 实际交易日运行；周末和元旦、圣诞节等休市日不进入任何日线指标窗口。
 - `OPEN`、`CLOSE` 和具体时间均使用美东时间，夏令时及提前收市使用保存的交易日历分钟。
@@ -94,7 +118,7 @@ WHEN [OPEN | CLOSE | HH:MM]
 - 算术：`+`、`-`、`*`、`/`
 - 当前量：`price`、`position`
 - 已完成日线：`open(n)`、`high(n)`、`low(n)`、`close(n)`、`volume(n)`
-- 指标：`ma(n)`、`ema(n)`、`atr(n)`、`ratr(n)`、`rsi(n)`
+- 指标：`ma(n)`、`ema(n)`、`atr(n)`、`ratr(n)`、`r_square(n)`、`rsi(n)`
 - MACD：`macd_line(fast, slow)` 返回 DIF，`macd_signal(fast, slow, signal)` 返回 DEA，
   `macd_hist(fast, slow, signal)` 返回未加倍的 `DIF - DEA`
 - WTME：`wtme(n, h)` 或 `wtme(n, h, epsilon)`
@@ -102,9 +126,10 @@ WHEN [OPEN | CLOSE | HH:MM]
   时返回 `1`，否则返回 `0`
 
 `ratr(n)` 等于当前决策价相对 n 个交易日前收盘价的位移除以前一完整交易日可知的 Wilder
-ATR(n)。WTME 的 `h` 范围为 0.1～500，epsilon 默认 `1e-8`；急跌阈值范围为
-0.1%～50%。`position` 是 0～1 的策略仓位占比。`n` 必须为 1～500 的整数（WTME 至少为
-2）；`n=0` 被禁止。公式由
+ATR(n)。`r_square(n)` 复用七星一致加权 R²，取前 n 根完整 K 线和当前决策价共 n+1
+个价格点，对对数价格做近期权重更高的直线拟合并返回 `[0,1]`。WTME 的 `h` 范围为
+0.1～500，epsilon 默认 `1e-8`；急跌阈值范围为 0.1%～50%。`position` 是 0～1 的策略
+仓位占比。`n` 必须为 1～500 的整数（WTME 和 R² 至少为 2）；`n=0` 被禁止。公式由
 AST 白名单解释器执行，不使用 Python `eval`，属性访问、导入、任意函数调用、NaN 和
 Infinity 都会被拒绝。
 
@@ -121,9 +146,10 @@ close(1) >= ema(20) OR atr(14) < 3
 rsi(14) < 30 AND price > ma(20)
 macd_hist(12, 26, 9) > 0
 wtme(40, 15) >= 0 AND rapid_drop(5, 5) = 0
+r_square(25) >= 0.8 AND price > ma(20)
 ```
 
-盘中计算 `ratr`、WTME 和急跌过滤时，当前观测只使用“前收盘价 → 决策价”这段已知路径，
+盘中计算 `ratr`、R²、WTME 和急跌过滤时，当前观测只使用“前收盘价 → 决策价”这段已知路径，
 不会读取当日尚未完成的最高价、最低价或收盘价；CLOSE 时才可使用完整当日日线。指标的
 数学定义是固定的，但策略有权决定向指标公式提供哪些点时可知 K 线或自行构造观测，因此
 盘中策略值不等同于行情页把当前暂定 OHLC 当作最后一根标准 K 线计算出的指标值。
@@ -290,10 +316,7 @@ equity = cash + dividend_receivables + Σ(quantity * close_price)
 
 - `none`：不绘制基准。
 - `SPY` / `GLD`：期初按同样的手续费和滑点买入并持有。
-- `auto`：
-  - single：100% 持有该标的；
-  - distribution：按各标的最大仓位比例持有；
-  - competition：平均持有所有候选标的。
+- `auto`：资产池等权；单标的池等同于 100% 持有该标的。
 
 晚成立候选在自身预热完成前对应的固定等权槽位保持现金，首次具备资格的交易日开盘买入；
 防御标的不进入 `auto`。
@@ -381,6 +404,9 @@ Sharpe、Sortino、Calmar、成交数、卖单胜率、平均已实现 PnL、Pro
 快照和结果。种子状态表只用于保证内置示例首次写入且删除后不复活。SQLite 启用外键、
 WAL 和 busy timeout。
 
+精细化分析不新增数据库表。单标的比较曲线、等权曲线和日 K 响应均在请求时由现有数据构造，
+只在当前进程短暂缓存。
+
 ## 9. API
 
 | 方法与路径 | 用途 |
@@ -395,6 +421,10 @@ WAL 和 busy timeout。
 | `GET /api/backtest/runs/{id}` | 运行状态 |
 | `GET /api/backtest/runs` | 跨策略运行结果分页总览 |
 | `GET /api/backtest/runs/{id}/detail` | 单次运行的只读快照与完整结果 |
+| `GET /api/backtest/runs/{id}/analysis/meta` | 分析可用性、已完成日期边界和资产池标的 |
+| `GET /api/backtest/runs/{id}/analysis?start_date=&end_date=` | 区间指标和对比收益曲线 |
+| `GET /api/backtest/runs/{id}/analysis/decision?date=` | 指定已完成日期的紧凑决策过程 |
+| `GET /api/backtest/runs/{id}/analysis/candles?symbol=&start_date=&end_date=` | 原始日 K、成交标记和区间盈亏 |
 | `POST /api/backtest/runs/deletions` | 确认后隐藏终态运行并删除日志、每日权益/持仓节点 |
 | `POST /api/backtest/runs/{id}/cancel` | 取消 |
 | `GET /api/backtest/runs/{id}/results` | 权益点与成交 |
@@ -418,6 +448,9 @@ WAL 和 busy timeout。
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+测试覆盖运行中三个月开放门槛、终态短区间收缩、资产池基准去重、`auto` 等权、代码策略评分
+公式、资产池 K 线限制，以及分析工作区的前端入口。
 
 使用本地真实日线和原始分钟数据进行多策略审计：
 

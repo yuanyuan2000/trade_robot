@@ -598,6 +598,10 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
                         f"[P({self.params['selection_time']}) - Close({base_date})] / "
                         f"ATR({atr_period}, {self.params['atr_weighting']})"
                     ),
+                    "score_formula_display": (
+                        f"({current_price:.4g} - {base:.4g}) ÷ {atr:.4g}"
+                    ),
+                    "score_formula_help": "评分 =（当前价格 - 基准价格）÷ ATR",
                     "current_price": current_price,
                     "base_price": base,
                     "base_date": base_date,
@@ -970,6 +974,12 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
                     f"100 × Rw / (Aw + {epsilon:g}); WTME(N={period}, "
                     f"h={half_life:g}) at {self.params['selection_time']}"
                 ),
+                "score_formula_display": (
+                    f"100 × {float(components['weighted_return']):.4g} ÷ "
+                    f"{float(components['weighted_true_range']):.4g}"
+                    if components is not None else "—"
+                ),
+                "score_formula_help": "评分 = 100 × 加权收益 ÷ 加权真实波幅",
                 "current_price": current_price,
                 "previous_close": previous_close,
                 "current_observation_true_range": abs(current_price - previous_close),

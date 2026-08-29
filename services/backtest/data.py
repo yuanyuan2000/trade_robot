@@ -130,11 +130,11 @@ class ExpressionContext:
                 include_current=self.event == "CLOSE",
             )
             values = calculate_indicator_values(rows, name, period)
-        elif name in {"ratr", "wtme", "rapid_drop"}:
+        elif name in {"ratr", "r_square", "wtme", "rapid_drop"}:
             rows = self._point_in_time_rows()
             values = calculate_indicator_values(
                 rows,
-                name,
+                "LINEAR_FIT" if name == "r_square" else name,
                 period,
                 half_life=(float(arguments[1]) if name == "wtme" else None),
                 epsilon=(

@@ -1027,6 +1027,7 @@ def seed_default_indicators() -> None:
         {"code": "MA20", "name": "MA20", "indicator_type": "MA", "params": {"period": 20}, "description": "简单移动平均"},
         {"code": "ATR14", "name": "ATR14", "indicator_type": "ATR", "params": {"period": 14}, "description": "Wilder 绝对 ATR"},
         {"code": "RATR14", "name": "相对ATR14", "indicator_type": "RATR", "params": {"period": 14}, "description": "(当前收盘价 - 14 个交易日前收盘价) / 前一日 Wilder ATR(14)"},
+        {"code": "LINEAR_FIT25", "name": "R²", "indicator_type": "LINEAR_FIT", "params": {"period": 25}, "description": "前 N 根完整 K 线与当前价格的加权对数价格趋势 R²"},
         {"code": "WTME40H15E1e-08", "name": "WTME40(h=15)", "indicator_type": "WTME", "params": {"period": 40, "half_life": 15.0, "epsilon": 1e-8}, "description": "加权真实波幅动量效率"},
         {"code": "RAPID_DROP5P5", "name": "急跌过滤5日5%", "indicator_type": "RAPID_DROP", "params": {"period": 5, "threshold_percent": 5.0}, "description": "近5个连续变化段任一跌幅不小于5%时输出1，否则输出0"},
     ]
@@ -1050,12 +1051,26 @@ def seed_default_indicators() -> None:
                     now,
                 ),
             )
+        conn.execute(
+            """
+            UPDATE indicators
+            SET name = CASE
+                    WHEN code = 'LINEAR_FIT25' THEN 'R²'
+                    ELSE REPLACE(name, '直线拟合度', 'R²')
+                END,
+                description = '前 N 根完整 K 线与当前价格的加权对数价格趋势 R²',
+                updated_at = ?
+            WHERE indicator_type = 'LINEAR_FIT'
+              AND name LIKE '直线拟合度%'
+            """,
+            (now,),
+        )
 
 
 def validate_indicator(indicator_type: str, params: dict) -> tuple[str, dict]:
     normalized_type = str(indicator_type or "").strip().upper()
-    if normalized_type not in {"MA", "EMA", "ATR", "RATR", "WTME", "RAPID_DROP", "RSI", "MACD"}:
-        raise ValueError("仅支持 MA、EMA、ATR、相对 ATR、WTME、急跌过滤、RSI 和 MACD 指标。")
+    if normalized_type not in {"MA", "EMA", "ATR", "RATR", "LINEAR_FIT", "WTME", "RAPID_DROP", "RSI", "MACD"}:
+        raise ValueError("仅支持 MA、EMA、ATR、相对 ATR、R²、WTME、急跌过滤、RSI 和 MACD 指标。")
 
     if normalized_type == "MACD":
         try:
@@ -1165,6 +1180,8 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
     params_json = normalize_params(normalized_params)
     if normalized_type == "RATR":
         default_name = f"相对ATR{normalized_params['period']}"
+    elif normalized_type == "LINEAR_FIT":
+        default_name = f"R²{normalized_params['period']}"
     elif normalized_type == "MACD":
         default_name = (
             f"MACD({normalized_params['fast_period']},"
@@ -1228,6 +1245,8 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
                     if normalized_type == "ATR"
                     else "相对 ATR 动量评分（当前价差 / 前一日 Wilder ATR）"
                     if normalized_type == "RATR"
+                    else "前 N 根完整 K 线与当前价格的加权对数价格趋势 R²"
+                    if normalized_type == "LINEAR_FIT"
                     else "加权方向收益 / 加权标准化真实波幅 × 100"
                     if normalized_type == "WTME"
                     else "近 N 个连续变化段任一跌幅达到阈值时输出 1，否则输出 0"
