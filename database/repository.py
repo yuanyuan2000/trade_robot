@@ -909,6 +909,46 @@ def get_latest_key_zone_analysis_snapshot(
     }
 
 
+def list_latest_key_zone_analysis_snapshots(
+        algorithm_version: str,
+        period: str = "1D",
+        window_size: int = 150,
+        adjustment: str = "all",
+) -> dict[str, dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT symbol, show_weekend_data, adjustment, latest_data_date,
+                   payload_json, computed_at
+            FROM key_zone_analysis_snapshots
+            WHERE algorithm_version = ? AND period = ? AND window_size = ?
+              AND adjustment = ?
+            ORDER BY computed_at DESC, id DESC
+            """,
+            (
+                algorithm_version,
+                str(period or "1D").upper(),
+                int(window_size),
+                str(adjustment or "all"),
+            ),
+        ).fetchall()
+
+    latest: dict[str, dict] = {}
+    for row in rows:
+        symbol = row["symbol"]
+        if symbol in latest:
+            continue
+        latest[symbol] = {
+            "symbol": symbol,
+            "show_weekend_data": bool(row["show_weekend_data"]),
+            "adjustment": row["adjustment"],
+            "latest_data_date": row["latest_data_date"],
+            "payload": json.loads(row["payload_json"]),
+            "computed_at": row["computed_at"],
+        }
+    return latest
+
+
 def update_symbol_display_order(symbols: list[str]) -> dict:
     normalized_symbols = [symbol.strip().upper() for symbol in symbols if symbol.strip()]
     if not normalized_symbols:

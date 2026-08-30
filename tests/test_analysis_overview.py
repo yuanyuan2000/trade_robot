@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from services.analysis_overview_service import (
+    build_key_zone_overview_summary,
     build_trendline_overview_summary,
     merge_analysis_overview,
     snapshot_matches_signature,
@@ -47,7 +48,132 @@ def payload(*trends: dict, data_count: int = 31) -> dict:
     }
 
 
+def zone(**overrides) -> dict:
+    value = {
+        "id": "resistance-100",
+        "active": True,
+        "current_role": "resistance",
+        "status": "challenging",
+        "center": 100.0,
+        "zone_low": 99.0,
+        "zone_high": 101.0,
+        "score": 80.0,
+        "distance_from_current_atr": 0.4,
+        "break_date": None,
+        "latest_test_date": "2026-01-30",
+        "latest_validation_date": "2026-01-30",
+    }
+    value.update(overrides)
+    return value
+
+
+def key_zone_payload(*zones: dict) -> dict:
+    return {
+        "period": "1D",
+        "requested_window_size": 150,
+        "latest_data_date": "2026-01-30",
+        "algorithm_version": "key-zone-test",
+        "zones": list(zones),
+    }
+
+
 class AnalysisOverviewTests(unittest.TestCase):
+    def test_key_zone_summary_only_keeps_critical_active_states(self) -> None:
+        summary = build_key_zone_overview_summary(key_zone_payload(
+            zone(id="testing"),
+            zone(id="valid", status="valid"),
+            zone(id="inactive", active=False),
+            zone(id="broken", status="broken"),
+        ))
+
+        self.assertEqual(summary["critical_count"], 1)
+        self.assertEqual(
+            [item["id"] for item in summary["headline_zones"]],
+            ["testing"],
+        )
+
+    def test_key_zone_summary_only_displays_zones_within_one_point_five_atr(
+            self,
+    ) -> None:
+        summary = build_key_zone_overview_summary(key_zone_payload(
+            zone(id="boundary", distance_from_current_atr=1.5),
+            zone(
+                id="outside",
+                current_role="support",
+                status="retesting",
+                distance_from_current_atr=1.5001,
+            ),
+        ))
+
+        self.assertEqual(summary["critical_count"], 1)
+        self.assertEqual(
+            [item["id"] for item in summary["headline_zones"]],
+            ["boundary"],
+        )
+
+    def test_key_zone_summary_picks_nearest_zone_for_each_role(self) -> None:
+        summary = build_key_zone_overview_summary(key_zone_payload(
+            zone(id="far-resistance", distance_from_current_atr=1.2),
+            zone(id="near-resistance", distance_from_current_atr=0.3),
+            zone(
+                id="near-support",
+                current_role="support",
+                status="retesting",
+                distance_from_current_atr=0.2,
+            ),
+            zone(
+                id="far-support",
+                current_role="support",
+                status="retesting",
+                distance_from_current_atr=0.8,
+            ),
+        ))
+
+        self.assertEqual(summary["critical_count"], 4)
+        self.assertEqual(
+            {item["id"] for item in summary["headline_zones"]},
+            {"near-resistance", "near-support"},
+        )
+
+    def test_key_zone_summary_prioritizes_testing_in_display_order(self) -> None:
+        summary = build_key_zone_overview_summary(key_zone_payload(
+            zone(
+                id="support-retest",
+                current_role="support",
+                status="retesting",
+                distance_from_current_atr=0.1,
+            ),
+            zone(id="resistance-testing", distance_from_current_atr=0.6),
+        ))
+
+        self.assertEqual(
+            [item["id"] for item in summary["headline_zones"]],
+            ["resistance-testing", "support-retest"],
+        )
+
+    def test_merge_adds_key_zone_summary_and_stale_state(self) -> None:
+        market = {
+            "items": [{
+                "symbol": "SKYY",
+                "analysis_latest_date": "2026-01-31",
+                "show_weekend_data": False,
+            }],
+        }
+        key_snapshots = {
+            "SKYY": {
+                "payload": key_zone_payload(zone()),
+                "computed_at": "2026-01-30T12:00:00+00:00",
+                "latest_data_date": "2026-01-30",
+                "show_weekend_data": False,
+            },
+        }
+
+        merged = merge_analysis_overview(market, {}, key_snapshots)
+
+        key_zones = merged["items"][0]["key_zones"]
+        self.assertTrue(key_zones["stale"])
+        self.assertEqual(key_zones["headline_zones"][0]["id"], "resistance-100")
+
     def test_no_active_trend_has_zero_sort_score(self) -> None:
         summary = build_trendline_overview_summary(payload(
             trend(active=False, status="broken"),

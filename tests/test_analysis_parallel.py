@@ -34,6 +34,28 @@ class ImmediateExecutor:
 
 
 class AnalysisParallelTests(unittest.TestCase):
+    @patch.object(app_module, "analyze_symbol_key_zones")
+    @patch.object(app_module, "analyze_symbol_trendlines")
+    def test_overview_analysis_dispatches_only_selected_algorithm(
+            self,
+            trendline,
+            key_zones,
+    ) -> None:
+        trendline.return_value = {"algorithm": "trendline"}
+        key_zones.return_value = {"algorithm": "key_zone"}
+
+        trend_result = app_module.analyze_symbol_overview_item(
+            "GDX", "trendline",
+        )
+        key_zone_result = app_module.analyze_symbol_overview_item(
+            "GDX", "key_zone",
+        )
+
+        self.assertEqual(trend_result["algorithm"], "trendline")
+        self.assertEqual(key_zone_result["algorithm"], "key_zone")
+        trendline.assert_called_once_with("GDX", "1D", 150)
+        key_zones.assert_called_once_with("GDX", "1D", 150)
+
     def test_heartbeat_access_log_is_suppressed(self) -> None:
         log_filter = HeartbeatAccessLogFilter()
         heartbeat = logging.LogRecord(
@@ -107,8 +129,8 @@ class AnalysisParallelTests(unittest.TestCase):
     @patch.object(app_module, "snapshot_matches_signature", return_value=False)
     @patch.object(app_module.repository, "get_latest_trendline_analysis_snapshot")
     @patch.object(app_module, "get_trendline_analysis_signature")
-    @patch.object(app_module, "save_analysis_overview_snapshot")
-    @patch.object(app_module, "analyze_symbol_trendlines")
+    @patch.object(app_module, "save_analysis_overview_item")
+    @patch.object(app_module, "analyze_symbol_overview_item")
     @patch.object(app_module.repository, "list_overview_symbols")
     def test_parallel_failures_are_isolated_and_results_keep_symbol_order(
             self,
@@ -138,7 +160,7 @@ class AnalysisParallelTests(unittest.TestCase):
             return {"symbol": symbol}
 
         analyze.side_effect = analyze_symbol
-        save_snapshot.side_effect = lambda symbol, payload: {
+        save_snapshot.side_effect = lambda symbol, analysis_type, payload: {
             "active_count": 1,
         }
 

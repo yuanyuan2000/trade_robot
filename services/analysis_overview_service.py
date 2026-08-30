@@ -20,6 +20,7 @@ EVENT_PRIORITIES = {
     "challenge_resolved": 70,
     "new_touch": 60,
 }
+KEY_ZONE_OVERVIEW_MAX_DISTANCE_ATR = 1.5
 
 
 def snapshot_matches_signature(
@@ -81,6 +82,62 @@ def build_trendline_overview_summary(payload: dict) -> dict:
         ),
         "headline_trends": headline_trends,
         "events": events,
+    }
+
+
+def build_key_zone_overview_summary(payload: dict) -> dict:
+    zones = payload.get("zones") or []
+    critical = [
+        zone for zone in zones
+        if zone.get("active")
+        and zone.get("status") in {"challenging", "retesting"}
+        and zone.get("current_role") in {"support", "resistance"}
+        and zone.get("distance_from_current_atr") is not None
+        and float(zone["distance_from_current_atr"])
+        <= KEY_ZONE_OVERVIEW_MAX_DISTANCE_ATR
+    ]
+    nearest_by_role = []
+    for role in ("support", "resistance"):
+        candidates = [zone for zone in critical if zone.get("current_role") == role]
+        if not candidates:
+            continue
+        nearest_by_role.append(min(
+            candidates,
+            key=lambda zone: (
+                float(zone.get("distance_from_current_atr") or 0),
+                -float(zone.get("score") or 0),
+            ),
+        ))
+    headline = sorted(
+        nearest_by_role,
+        key=lambda zone: (
+            zone.get("status") != "challenging",
+            float(zone.get("distance_from_current_atr") or 0),
+        ),
+    )
+    return {
+        "period": payload.get("period") or "1D",
+        "window_size": int(payload.get("requested_window_size") or 150),
+        "data_date": payload.get("latest_data_date"),
+        "critical_count": len(critical),
+        "headline_zones": [_compact_key_zone(zone) for zone in headline],
+    }
+
+
+def _compact_key_zone(zone: dict) -> dict:
+    return {
+        "id": zone.get("id"),
+        "role": zone.get("current_role"),
+        "status": zone.get("status"),
+        "center": zone.get("center"),
+        "zone_low": zone.get("zone_low"),
+        "zone_high": zone.get("zone_high"),
+        "score": float(zone.get("score") or 0),
+        "distance_atr": float(zone.get("distance_from_current_atr") or 0),
+        "break_date": zone.get("break_date"),
+        "latest_test_date": zone.get("latest_test_date"),
+        "latest_validation_date": zone.get("latest_validation_date"),
+        "provisional": bool(zone.get("provisional_edge_confirmation")),
     }
 
 
@@ -213,7 +270,9 @@ def _latest_trend_event(trend: dict, latest_index: int) -> dict | None:
 def merge_analysis_overview(
         market_overview: dict,
         snapshots: dict[str, dict],
+        key_zone_snapshots: dict[str, dict] | None = None,
 ) -> dict:
+    key_zone_snapshots = key_zone_snapshots or {}
     items = []
     for market_item in market_overview.get("items") or []:
         snapshot = snapshots.get(market_item["symbol"])
@@ -234,5 +293,29 @@ def merge_analysis_overview(
                     != market_item.get("analysis_latest_date")
                 ),
             }
-        items.append({**market_item, "analysis": analysis})
+        key_zone_snapshot = key_zone_snapshots.get(market_item["symbol"])
+        if (
+            key_zone_snapshot
+            and bool(key_zone_snapshot.get("show_weekend_data"))
+            != bool(market_item.get("show_weekend_data"))
+        ):
+            key_zone_snapshot = None
+        key_zones = None
+        if key_zone_snapshot:
+            key_zones = {
+                **build_key_zone_overview_summary(key_zone_snapshot["payload"]),
+                "computed_at": key_zone_snapshot["computed_at"],
+                "algorithm_version": key_zone_snapshot["payload"].get(
+                    "algorithm_version"
+                ),
+                "stale": (
+                    key_zone_snapshot.get("latest_data_date")
+                    != market_item.get("analysis_latest_date")
+                ),
+            }
+        items.append({
+            **market_item,
+            "analysis": analysis,
+            "key_zones": key_zones,
+        })
     return {**market_overview, "items": items}

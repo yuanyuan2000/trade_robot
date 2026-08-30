@@ -18,6 +18,8 @@ const overviewLiveToggle = document.getElementById("overview-live-toggle");
 const overviewLiveLabel = document.getElementById("overview-live-label");
 const overviewLiveControl = document.getElementById("overview-live-control");
 const overviewRefreshAll = document.getElementById("overview-refresh-all");
+const analysisRefreshTrendlines = document.getElementById("analysis-refresh-trendlines");
+const analysisRefreshKeyZones = document.getElementById("analysis-refresh-key-zones");
 const overviewTitle = document.getElementById("overview-title");
 const analysisOverviewProgress = document.getElementById("analysis-overview-progress");
 const analysisTrendTooltip = document.getElementById("analysis-trend-tooltip");
@@ -145,14 +147,12 @@ function applyWorkspaceMode(mode) {
   overviewLiveLabel.textContent = "自动更新";
   overviewLiveToggle.checked = marketOverviewAutoUpdate;
   overviewLiveControl.hidden = isAnalysis;
-  const refreshTitle = isAnalysis
-    ? "更新全部趋势线分析"
-    : "刷新全部标的日线数据";
-  overviewRefreshAll.title = refreshTitle;
-  overviewRefreshAll.setAttribute("aria-label", refreshTitle);
-  overviewRefreshAll.disabled = isAnalysis
-    ? Boolean(lastAnalysisRefreshState.running)
-    : marketOverviewManualRefreshRunning;
+  overviewRefreshAll.hidden = isAnalysis;
+  overviewRefreshAll.disabled = marketOverviewManualRefreshRunning;
+  analysisRefreshTrendlines.hidden = !isAnalysis;
+  analysisRefreshKeyZones.hidden = !isAnalysis;
+  analysisRefreshTrendlines.disabled = Boolean(lastAnalysisRefreshState.running);
+  analysisRefreshKeyZones.disabled = Boolean(lastAnalysisRefreshState.running);
   overviewLiveControl.title = "每5分钟刷新总览最新价格";
   analysisOverviewProgress.hidden = !isAnalysis;
   if (isAnalysis) {
@@ -518,10 +518,12 @@ async function fetchAndRenderAnalysisOverview() {
   return payload;
 }
 
-async function startAnalysisOverviewRefresh(options = {}) {
+async function startAnalysisOverviewRefresh(analysisType, options = {}) {
   try {
     const response = await fetch("/api/analysis-overview/refresh", {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ analysis_type: analysisType }),
     });
     const payload = await parseJsonResponse(response);
     if (!payload.ok) {
@@ -583,14 +585,16 @@ function analysisProgressText(state) {
     ? `，${workers} 个进程并行计算，剩余 ${remaining} 个`
     : "";
   const current = state.current_symbol ? `，正在分析 ${state.current_symbol}` : "";
-  return `直线趋势线分析需要一些时间：已完成 ${completed}/${total}${parallel}${current}`;
+  const analysisName = state.analysis_type === "key_zone" ? "关键区域" : "直线趋势线";
+  return `${analysisName}分析需要一些时间：已完成 ${completed}/${total}${parallel}${current}`;
 }
 
 function analysisCompletionText(state) {
   const failed = Number(state.last_result?.failed || 0);
+  const analysisName = state.analysis_type === "key_zone" ? "关键区域" : "直线趋势线";
   return failed
-    ? `趋势线总览更新完成，${failed} 个标的分析失败。`
-    : "趋势线总览更新完成。";
+    ? `${analysisName}更新完成，${failed} 个标的分析失败。`
+    : `${analysisName}更新完成。`;
 }
 
 function renderAnalysisProgress(state) {
@@ -600,7 +604,8 @@ function renderAnalysisProgress(state) {
     return;
   }
   const running = Boolean(state.running);
-  overviewRefreshAll.disabled = running;
+  analysisRefreshTrendlines.disabled = running;
+  analysisRefreshKeyZones.disabled = running;
   const hasError = Boolean(state.last_error);
   analysisOverviewProgress.hidden = false;
   analysisOverviewProgress.className = `analysis-overview-progress${running ? " is-running" : ""}${hasError ? " is-error" : ""}`;
@@ -827,10 +832,11 @@ function renderAnalysisOverviewTable(items) {
     { label: "最新价格", key: "latest_price" },
     { label: "更新时间", key: "latest_price_updated_at" },
     { label: "直线趋势线", key: "analysis_score" },
+    { label: "关键区域", key: "key_zone_distance" },
   ];
   const thead = `<thead><tr>${headers.map(renderOverviewHeader).join("")}</tr></thead>`;
   if (!items.length) {
-    overviewTable.innerHTML = `${thead}<tbody><tr><td class="empty-cell" colspan="4">暂无分析标的。</td></tr></tbody>`;
+    overviewTable.innerHTML = `${thead}<tbody><tr><td class="empty-cell" colspan="5">暂无分析标的。</td></tr></tbody>`;
     return;
   }
   const rows = items.map((item) => {
@@ -838,6 +844,9 @@ function renderAnalysisOverviewTable(items) {
     const analysis = item.analysis;
     const trendContent = analysis
       ? renderAnalysisTrendSummary(analysis)
+      : '<span class="analysis-empty">等待后台分析</span>';
+    const keyZoneContent = item.key_zones
+      ? renderAnalysisKeyZoneSummary(item.key_zones)
       : '<span class="analysis-empty">等待后台分析</span>';
     return `
       <tr class="overview-row analysis-overview-row" data-symbol="${escapeHtml(item.symbol)}" tabindex="0" role="button" aria-label="打开 ${escapeHtml(item.symbol)} K线分析">
@@ -848,10 +857,56 @@ function renderAnalysisOverviewTable(items) {
         </td>
         <td class="number-neutral">${formatOverviewUpdatedAt(item.latest_price_updated_at)}</td>
         <td class="analysis-trend-cell">${trendContent}</td>
+        <td class="analysis-key-zone-cell">${keyZoneContent}</td>
       </tr>
     `;
   });
   overviewTable.innerHTML = `${thead}<tbody>${rows.join("")}</tbody>`;
+}
+
+function renderAnalysisKeyZoneSummary(summary) {
+  const zones = summary.headline_zones || [];
+  if (!zones.length) {
+    return '<span class="analysis-empty">暂无关键状态</span>';
+  }
+  const zoneRows = zones.map((zone) => {
+    const role = zone.role === "support" ? "支撑" : "压力";
+    const status = zone.status === "challenging" ? "测试中" : "待回测";
+    const distance = Number(zone.distance_atr);
+    const distanceText = Number.isFinite(distance) ? `${distance.toFixed(2)} ATR` : "-";
+    const rangeText = formatKeyZoneRange(zone);
+    const detail = [
+      `${role} · ${status}`,
+      `区域 ${rangeText}`,
+      `距现价 ${distanceText}`,
+      `评分 ${Number(zone.score || 0).toFixed(1)}`,
+      zone.break_date ? `破位 ${formatOverviewDate(zone.break_date)}` : "",
+      zone.latest_validation_date
+        ? `最近验证 ${formatOverviewDate(zone.latest_validation_date)}`
+        : "",
+    ].filter(Boolean).join("\n");
+    return `
+      <span class="analysis-key-zone analysis-key-zone-${escapeHtml(zone.status)}" title="${escapeHtml(detail)}">
+        <span class="analysis-zone-role analysis-zone-role-${escapeHtml(zone.role)}">${role}</span>
+        <span class="analysis-zone-status">${status}</span>
+        <strong class="analysis-zone-price">${rangeText}</strong>
+        <span class="analysis-zone-distance">${distanceText}</span>
+      </span>
+    `;
+  }).join("");
+  const stale = summary.stale
+    ? '<span class="analysis-stale" title="行情数据已更新，关键区域正在等待重新计算">待更新</span>'
+    : "";
+  return `<div class="analysis-key-zone-summary">${zoneRows}${stale}</div>`;
+}
+
+function formatKeyZoneRange(zone) {
+  const low = Number(zone.zone_low);
+  const high = Number(zone.zone_high);
+  if (Number.isFinite(low) && Number.isFinite(high)) {
+    return `${formatOverviewPrice(low)}–${formatOverviewPrice(high)}`;
+  }
+  return formatOverviewPrice(zone.center);
 }
 
 function renderAnalysisTrendSummary(analysis) {
@@ -1076,6 +1131,9 @@ function renderOverviewHeader(header) {
 function getSortedOverviewItems() {
   const direction = overviewSort.direction === "desc" ? -1 : 1;
   return [...overviewItems].sort((left, right) => {
+    if (overviewSort.key === "key_zone_distance") {
+      return compareKeyZoneOverviewDistance(left, right, direction);
+    }
     const result = compareOverviewValues(left, right, overviewSort.key);
     return result * direction;
   });
@@ -1125,6 +1183,27 @@ function analysisOverviewSortScore(analysis) {
   return Number.isFinite(fallback) ? fallback : 0;
 }
 
+function keyZoneOverviewSortDistance(summary) {
+  const zones = summary?.headline_zones || [];
+  const distances = zones
+    .filter((zone) => zone.distance_atr !== null && zone.distance_atr !== undefined)
+    .map((zone) => Number(zone.distance_atr))
+    .filter(Number.isFinite);
+  return distances.length ? Math.min(...distances) : null;
+}
+
+function compareKeyZoneOverviewDistance(left, right, direction) {
+  const leftDistance = keyZoneOverviewSortDistance(left.key_zones);
+  const rightDistance = keyZoneOverviewSortDistance(right.key_zones);
+  const leftMissing = leftDistance === null;
+  const rightMissing = rightDistance === null;
+  if (leftMissing && rightMissing) return compareStrings(left.symbol, right.symbol);
+  if (leftMissing) return 1;
+  if (rightMissing) return -1;
+  return (leftDistance - rightDistance) * direction
+    || compareStrings(left.symbol, right.symbol);
+}
+
 function compareNullableNumbers(left, right) {
   const leftNumber = Number(left);
   const rightNumber = Number(right);
@@ -1158,7 +1237,14 @@ function applyOverviewSort(key) {
   }
 
   if (overviewSort.key !== key) {
-    overviewSort = { key, direction: "desc" };
+    overviewSort = {
+      key,
+      direction: key === "key_zone_distance" ? "asc" : "desc",
+    };
+  } else if (key === "key_zone_distance") {
+    overviewSort = overviewSort.direction === "asc"
+      ? { key, direction: "desc" }
+      : { ...defaultOverviewSort };
   } else if (overviewSort.direction === "desc") {
     overviewSort = { key, direction: "asc" };
   } else {
@@ -1685,7 +1771,7 @@ function renderKeyZoneLegend(zones) {
     return;
   }
   const roleLabels = { support: "支撑区", resistance: "压力区" };
-  const statusLabels = { active: "有效", challenging: "测试中", retesting: "待回测", broken: "已破位" };
+  const statusLabels = { active: "有效", challenging: "测试中", retesting: "待回测" };
   trendlineLegend.innerHTML = sortedZones.map((zone) => {
     const visible = zone.visible !== false;
     const visibilityClass = visible ? "" : " is-hidden";
@@ -2430,11 +2516,13 @@ overviewLiveToggle.addEventListener("change", () => {
   setOverviewLiveRefresh(overviewLiveToggle.checked);
 });
 overviewRefreshAll.addEventListener("click", () => {
-  if (currentWorkspaceMode === "analysis") {
-    startAnalysisOverviewRefresh();
-  } else {
-    refreshAllMarketDailyData();
-  }
+  refreshAllMarketDailyData();
+});
+analysisRefreshTrendlines.addEventListener("click", () => {
+  startAnalysisOverviewRefresh("trendline");
+});
+analysisRefreshKeyZones.addEventListener("click", () => {
+  startAnalysisOverviewRefresh("key_zone");
 });
 themeToggle.addEventListener("click", () => {
   const nextTheme = document.body.classList.contains("theme-dark") ? "light" : "dark";

@@ -1061,7 +1061,7 @@ function drawKeyZones(ctx, plot, priceRange, theme) {
       ctx.fillRect(left, top, Math.max(1, right - left), Math.max(1, bottom - top));
       ctx.strokeStyle = colors.stroke;
       ctx.lineWidth = zone.id === chartState.hoverKeyZoneId ? 2.2 : 1.2;
-      ctx.setLineDash(zone.status === "broken" ? [6, 4] : []);
+      ctx.setLineDash([]);
       ctx.strokeRect(left, top, Math.max(1, right - left), Math.max(1, bottom - top));
       ctx.setLineDash([5, 4]);
       ctx.globalAlpha = 0.86;
@@ -1093,9 +1093,6 @@ function drawKeyZones(ctx, plot, priceRange, theme) {
 }
 
 function getKeyZoneColors(zone, theme) {
-  if (zone.status === "broken") {
-    return { fill: "rgba(107, 114, 128, 0.08)", stroke: "rgba(107, 114, 128, 0.58)" };
-  }
   if (zone.status === "challenging" || zone.status === "retesting") {
     return { fill: "rgba(245, 158, 11, 0.15)", stroke: "rgba(245, 158, 11, 0.82)" };
   }
@@ -1570,7 +1567,6 @@ function showKeyZoneTooltip(zone, offsetX, offsetY) {
     active: "有效",
     challenging: "测试中",
     retesting: "突破后待回测",
-    broken: "已破位",
   }[zone.status] || zone.status;
   const components = zone.score_components || {};
   const labels = {
@@ -1595,8 +1591,11 @@ function showKeyZoneTooltip(zone, offsetX, offsetY) {
     <div class="trendline-detail-meta">
       <span>评分 / 中心</span><b>${Number(zone.score || 0).toFixed(1)} / ${formatPrice(zone.center)}</b>
       <span>区域范围</span><b>${formatPrice(zone.zone_low)}–${formatPrice(zone.zone_high)}</b>
-      <span>独立测试 / 互换</span><b>${Number(zone.independent_tests || 0)} / ${zone.role_reversal_confirmed ? "已确认" : "无"}</b>
-      <span>形成 / 最近测试</span><b>${escapeHtml(zone.formation_date || "-")} / ${escapeHtml(zone.latest_test_date || "-")}</b>
+      <span>结构 / 肩部 / 临时边界</span><b>${Number(zone.independent_tests || 0)} / ${Number(zone.shoulder_tests || 0)} / ${Number(zone.provisional_edge_tests || 0)}</b>
+      <span>边界提前确认</span><b>${zone.provisional_edge_confirmation ? "临时，待第 3 根复核" : "无"}</b>
+      <span>近期验证 / 互换</span><b>${Number(zone.validation_tests || 0)} / ${zone.role_reversal_confirmed ? "已确认" : "无"}</b>
+      <span>形成 / 最近结构测试</span><b>${escapeHtml(zone.formation_date || "-")} / ${escapeHtml(zone.latest_test_date || "-")}</b>
+      <span>最近区域验证</span><b>${escapeHtml(zone.latest_validation_date || "-")}</b>
       <span>距现价</span><b>${Number(zone.distance_from_current_atr || 0).toFixed(2)} ATR</b>
     </div>
     <div class="trendline-score-grid">${scoreRows}${integrityMultiplierRow}</div>

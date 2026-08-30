@@ -48,6 +48,7 @@ from services.corporate_action_adjustment_service import (
     stored_adjusted_daily_payload,
 )
 from services.analysis_overview_service import (
+    build_key_zone_overview_summary,
     build_trendline_overview_summary,
     merge_analysis_overview,
     snapshot_matches_signature,
@@ -118,6 +119,7 @@ analysis_executor_lock = threading.Lock()
 analysis_process_executor: ProcessPoolExecutor | None = None
 analysis_overview_state = {
     "running": False,
+    "analysis_type": None,
     "total": 0,
     "completed": 0,
     "current_symbol": None,
@@ -126,7 +128,7 @@ analysis_overview_state = {
     "last_result": None,
     "last_error": None,
     "updated_at": None,
-    "rerun_requested": False,
+    "rerun_requested": None,
 }
 
 
@@ -802,9 +804,12 @@ def analysis_overview():
         snapshots = repository.list_latest_trendline_analysis_snapshots(
             ANALYSIS_CACHE_VERSION,
         )
+        key_zone_snapshots = repository.list_latest_key_zone_analysis_snapshots(
+            KEY_ZONE_ALGORITHM_VERSION,
+        )
         return jsonify({
             "ok": True,
-            **merge_analysis_overview(market, snapshots),
+            **merge_analysis_overview(market, snapshots, key_zone_snapshots),
             "refresh": analysis_overview_snapshot(),
         })
     except Exception as exc:
@@ -825,12 +830,22 @@ def analysis_overview():
 @app.route("/api/analysis-overview/refresh", methods=["POST"])
 def refresh_analysis_overview():
     try:
-        started = start_analysis_overview_refresh()
+        payload = request.get_json(silent=True) or {}
+        analysis_type = str(payload.get("analysis_type") or "trendline")
+        started = start_analysis_overview_refresh(analysis_type)
         return jsonify({
             "ok": True,
             "started": started,
             **analysis_overview_snapshot(),
         })
+    except ValueError as exc:
+        return jsonify({
+            "ok": False,
+            "error": {
+                "code": "INVALID_ANALYSIS_TYPE",
+                "message": str(exc),
+            },
+        }), 400
     except Exception as exc:
         app.logger.exception("Unable to start analysis overview refresh")
         return jsonify({
@@ -1031,15 +1046,55 @@ def save_analysis_overview_snapshot(symbol: str, payload: dict) -> dict:
     )
 
 
-def start_analysis_overview_refresh(queue_if_running: bool = False) -> bool:
+def analyze_symbol_overview_item(
+        symbol: str,
+        analysis_type: str,
+        period: str = "1D",
+        limit: int = 150,
+) -> dict:
+    if analysis_type == "trendline":
+        return analyze_symbol_trendlines(symbol, period, limit)
+    if analysis_type == "key_zone":
+        return analyze_symbol_key_zones(symbol, period, limit)
+    raise ValueError("Unsupported overview analysis type")
+
+
+def save_analysis_overview_item(
+        symbol: str,
+        analysis_type: str,
+        payload: dict,
+) -> dict:
+    if analysis_type == "trendline":
+        return save_analysis_overview_snapshot(symbol, payload)
+    canonical_symbol = (
+        payload.get("canonical_symbol")
+        or payload.get("symbol")
+        or symbol
+    )
+    repository.save_key_zone_analysis_snapshot(
+        canonical_symbol,
+        payload,
+        KEY_ZONE_ALGORITHM_VERSION,
+    )
+    summary = build_key_zone_overview_summary(payload)
+    return {**summary, "active_count": summary["critical_count"]}
+
+
+def start_analysis_overview_refresh(
+        analysis_type: str = "trendline",
+        queue_if_running: bool = False,
+) -> bool:
+    if analysis_type not in {"trendline", "key_zone"}:
+        raise ValueError("Unsupported overview analysis type")
     total = len(repository.list_overview_symbols())
     with analysis_overview_lock:
         if analysis_overview_state["running"]:
             if queue_if_running:
-                analysis_overview_state["rerun_requested"] = True
+                analysis_overview_state["rerun_requested"] = analysis_type
             return False
         analysis_overview_state.update({
             "running": True,
+            "analysis_type": analysis_type,
             "total": total,
             "completed": 0,
             "current_symbol": None,
@@ -1047,10 +1102,11 @@ def start_analysis_overview_refresh(queue_if_running: bool = False) -> bool:
             "remaining": total,
             "last_error": None,
             "updated_at": now_utc().isoformat(),
-            "rerun_requested": False,
+            "rerun_requested": None,
         })
     threading.Thread(
         target=run_analysis_overview_refresh,
+        args=(analysis_type,),
         daemon=True,
     ).start()
     return True
@@ -1093,7 +1149,7 @@ def _mark_analysis_item_completed(remaining: int) -> None:
         analysis_overview_state["updated_at"] = now_utc().isoformat()
 
 
-def run_analysis_overview_refresh() -> None:
+def run_analysis_overview_refresh(analysis_type: str = "trendline") -> None:
     ordered_symbols: list[str] = []
     results_by_symbol: dict[str, dict] = {}
     pending_symbols: list[str] = []
@@ -1115,23 +1171,40 @@ def run_analysis_overview_refresh() -> None:
                     period="1D",
                     limit=150,
                 )
-                snapshot = repository.get_latest_trendline_analysis_snapshot(
-                    signature["canonical_symbol"],
-                    ANALYSIS_CACHE_VERSION,
-                )
-                cache_hit = snapshot_matches_signature(
-                    snapshot,
-                    signature,
-                )
-                if cache_hit:
-                    saved = save_analysis_overview_snapshot(
-                        symbol,
-                        snapshot["payload"],
+                if analysis_type == "trendline":
+                    snapshot = (
+                        repository.get_latest_trendline_analysis_snapshot(
+                            signature["canonical_symbol"],
+                            ANALYSIS_CACHE_VERSION,
+                        )
+                    )
+                else:
+                    snapshot = repository.get_latest_key_zone_analysis_snapshot(
+                        signature["canonical_symbol"],
+                        KEY_ZONE_ALGORITHM_VERSION,
+                        period="1D",
+                        window_size=150,
+                        show_weekend_data=bool(
+                            signature.get("show_weekend_data")
+                        ),
+                        adjustment="all",
+                    )
+                if snapshot_matches_signature(snapshot, signature):
+                    summary = (
+                        snapshot["summary"]
+                        if analysis_type == "trendline"
+                        else build_key_zone_overview_summary(
+                            snapshot["payload"]
+                        )
                     )
                     results_by_symbol[symbol] = _analysis_result(
                         symbol,
                         "cached",
-                        saved["active_count"],
+                        int(
+                            summary.get("active_count")
+                            or summary.get("critical_count")
+                            or 0
+                        ),
                     )
                     _mark_analysis_item_completed(
                         len(symbols) - len(results_by_symbol)
@@ -1162,12 +1235,17 @@ def run_analysis_overview_refresh() -> None:
         if worker_count == 1:
             for symbol in pending_symbols:
                 try:
-                    payload = analyze_symbol_trendlines(
+                    payload = analyze_symbol_overview_item(
                         symbol,
+                        analysis_type,
                         period="1D",
                         limit=150,
                     )
-                    saved = save_analysis_overview_snapshot(symbol, payload)
+                    saved = save_analysis_overview_item(
+                        symbol,
+                        analysis_type,
+                        payload,
+                    )
                     results_by_symbol[symbol] = _analysis_result(
                         symbol,
                         "success",
@@ -1201,8 +1279,9 @@ def run_analysis_overview_refresh() -> None:
                 try:
                     futures = {
                         executor.submit(
-                            analyze_symbol_trendlines,
+                            analyze_symbol_overview_item,
                             symbol,
+                            analysis_type,
                             "1D",
                             150,
                         ): symbol
@@ -1212,8 +1291,9 @@ def run_analysis_overview_refresh() -> None:
                         symbol = futures[future]
                         try:
                             payload = future.result()
-                            saved = save_analysis_overview_snapshot(
+                            saved = save_analysis_overview_item(
                                 symbol,
+                                analysis_type,
                                 payload,
                             )
                             results_by_symbol[symbol] = _analysis_result(
@@ -1258,24 +1338,23 @@ def run_analysis_overview_refresh() -> None:
         with analysis_overview_lock:
             analysis_overview_state["last_error"] = str(exc)
     finally:
-        rerun_requested = False
+        rerun_requested = None
         with analysis_overview_lock:
-            rerun_requested = bool(
-                analysis_overview_state["rerun_requested"]
-            )
+            rerun_requested = analysis_overview_state["rerun_requested"]
             analysis_overview_state["running"] = False
             analysis_overview_state["current_symbol"] = None
             analysis_overview_state["parallel_workers"] = 0
             analysis_overview_state["remaining"] = 0
             analysis_overview_state["updated_at"] = now_utc().isoformat()
         if rerun_requested:
-            start_analysis_overview_refresh()
+            start_analysis_overview_refresh(rerun_requested)
 
 
 def analysis_overview_snapshot() -> dict:
     with analysis_overview_lock:
         return {
             "running": bool(analysis_overview_state["running"]),
+            "analysis_type": analysis_overview_state["analysis_type"],
             "total": int(analysis_overview_state["total"]),
             "completed": int(analysis_overview_state["completed"]),
             "current_symbol": analysis_overview_state["current_symbol"],
