@@ -50,6 +50,10 @@ def _restore_portfolio(portfolio: Portfolio, state: dict | None) -> None:
     if not state:
         return
     portfolio.cash = D(state.get("cash", float(portfolio.initial_cash)))
+    for symbol, multiplier in (
+        state.get("symbol_leverage_multipliers") or {}
+    ).items():
+        portfolio.set_symbol_leverage_multiplier(str(symbol), float(multiplier))
     for symbol, item in (state.get("positions") or {}).items():
         quantity = D(item.get("quantity", 0))
         if quantity <= 0:
@@ -66,6 +70,10 @@ def _portfolio_state(portfolio: Portfolio, marks: dict[str, float]) -> dict:
     return {
         "cash": float(portfolio.cash),
         "realized_pnl": float(portfolio.realized_pnl),
+        "symbol_leverage_multipliers": {
+            symbol: float(multiplier)
+            for symbol, multiplier in portfolio.symbol_leverage_multipliers.items()
+        },
         "positions": portfolio.snapshot(marks),
     }
 
@@ -322,13 +330,13 @@ class RealtimeDecisionEvaluator:
             trades = list(engine.trades)
         recommendations = []
         for intent in intents:
-            item = next((entry for entry in definition.get("symbols", []) if entry["symbol"] == intent.symbol), {})
-            symbol_leverage = float(item.get("leverage_multiplier", 1))
             recommendations.append({
                 "symbol": intent.symbol,
                 "action": intent.action,
                 "target_weight_percent": float(intent.value_percent),
-                "effective_leverage": float(settings.get("leverage_multiplier", 1)) * symbol_leverage,
+                "effective_leverage": float(
+                    engine.portfolio.effective_leverage(intent.symbol)
+                ),
                 "reason": intent.reason,
             })
         decision = {

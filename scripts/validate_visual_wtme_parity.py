@@ -35,6 +35,10 @@ def equivalent_visual_strategy(code_strategy: dict) -> dict:
     params = RapidDropWtmeRotationStrategy.validate_params(
         code_strategy["definition"].get("params", {})
     )
+    if params["buy_top_n"] != 1 or params["buy_score_threshold"] != 9999:
+        raise ValueError(
+            "非代码 competition 模式只能交叉验证默认的 WTME 买入条件：前 1 名或评分 > 9999。"
+        )
     risk_expression = (
         f"rapid_drop({params['drop_lookback_sessions']}, "
         f"{params['drop_threshold_percent']:g})"
@@ -70,7 +74,7 @@ def equivalent_visual_strategy(code_strategy: dict) -> dict:
                     f"{params['wtme_epsilon']:g})"
                 ),
                 "minimum_score": None,
-                "target_weight": params["target_weight"],
+                "target_weight": 100,
                 "cash_when_none": True,
                 "rebalance_existing": False,
                 "when": params["selection_time"],

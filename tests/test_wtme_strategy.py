@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from services.backtest.code_strategies import RapidDropWtmeRotationStrategy
 from services.backtest.data import HistoricalDataSet, _epoch_minute
 from services.backtest.engine import BacktestEngine
+from services.backtest.portfolio import Portfolio
 
 
 def business_dates(start: str, count: int) -> list[str]:
@@ -34,9 +37,92 @@ def daily_rows(dates: list[str], closes: list[float]) -> list[dict]:
 
 
 class WtmeStrategyTests(unittest.TestCase):
+    def _selection_context(
+        self,
+        scores: dict[str, float],
+        *,
+        portfolio: Portfolio | None = None,
+    ) -> tuple[SimpleNamespace, list[dict]]:
+        symbols = list(scores)
+        prices = {symbol: 101.0 + index for index, symbol in enumerate(symbols)}
+        price_scores = {prices[symbol]: score for symbol, score in scores.items()}
+
+        class Dataset:
+            @staticmethod
+            def daily_before(symbol, trading_date, limit):
+                return [
+                    {
+                        "date": f"2024-01-{index + 1:02d}",
+                        "open": 100.0,
+                        "high": 100.0,
+                        "low": 100.0,
+                        "close": 100.0,
+                    }
+                    for index in range(limit)
+                ]
+
+        logs: list[dict] = []
+
+        def log_custom(event_type, message, **kwargs):
+            logs.append({
+                "event_type": event_type,
+                "message": message,
+                "symbol": kwargs.get("symbol"),
+                "context": kwargs.get("context") or {},
+            })
+
+        context = SimpleNamespace(
+            dataset=Dataset(),
+            portfolio=portfolio or Portfolio(10_000, allow_fractional_shares=True),
+            universe=symbols,
+            trading_date="2024-01-31",
+            event="10:00",
+            event_prices={
+                symbol: SimpleNamespace(signal_price=price)
+                for symbol, price in prices.items()
+            },
+            marks=prices,
+            log_custom=log_custom,
+            price_scores=price_scores,
+        )
+        return context, logs
+
+    @staticmethod
+    def _mock_wtme(rows, period, half_life, epsilon):
+        score = WtmeStrategyTests._active_price_scores[float(rows[-1]["close"])]
+        return {
+            "value": score,
+            "weighted_return": score / 100,
+            "weighted_true_range": 1.0,
+        }
+
+    _active_price_scores: dict[float, float] = {}
+
+    def _select_with_scores(
+        self,
+        params: dict,
+        scores: dict[str, float],
+        *,
+        portfolio: Portfolio | None = None,
+    ):
+        strategy = RapidDropWtmeRotationStrategy(params)
+        context, logs = self._selection_context(scores, portfolio=portfolio)
+        type(self)._active_price_scores = context.price_scores
+        with patch(
+            "services.backtest.code_strategies.calculate_wtme_components",
+            side_effect=self._mock_wtme,
+        ):
+            intents = strategy._select(context)
+        return strategy, context, logs, intents
+
     def test_strategy_parameters_cover_wtme_filters_and_times(self) -> None:
         params = RapidDropWtmeRotationStrategy.validate_params({})
 
+        self.assertEqual(params["allocation_mode"], "equal")
+        self.assertEqual(params["buy_top_n"], 1)
+        self.assertEqual(params["buy_score_threshold"], 9999)
+        for retired in RapidDropWtmeRotationStrategy.retired_parameters:
+            self.assertNotIn(retired, params)
         self.assertEqual(params["wtme_period"], 40)
         self.assertEqual(params["wtme_half_life"], 15.0)
         self.assertEqual(params["wtme_epsilon"], 1e-8)
@@ -51,6 +137,166 @@ class WtmeStrategyTests(unittest.TestCase):
             RapidDropWtmeRotationStrategy.required_events({}),
             ("09:40", "10:00"),
         )
+
+    def test_buy_conditions_use_or_and_equal_allocation_uses_actual_count(self) -> None:
+        _strategy, _context, logs, intents = self._select_with_scores(
+            {
+                "buy_top_n": 1,
+                "buy_score_threshold": 10,
+            },
+            {"AAA": 30, "BBB": 20, "CCC": 10},
+        )
+
+        buys = [intent for intent in intents if intent.action == "BUY"]
+        self.assertEqual([intent.symbol for intent in buys], ["AAA", "BBB"])
+        self.assertEqual([intent.value_percent for intent in buys], [50.0, 50.0])
+        by_symbol = {item["symbol"]: item["context"] for item in logs}
+        self.assertTrue(by_symbol["AAA"]["passes_rank_condition"])
+        self.assertTrue(by_symbol["BBB"]["passes_score_condition"])
+        self.assertFalse(by_symbol["CCC"]["selected_for_target"])
+        self.assertIn("buy_conditions", by_symbol["CCC"]["filter_codes"])
+
+    def test_linear_rank_allocation_gives_first_place_the_largest_weight(self) -> None:
+        _strategy, _context, logs, intents = self._select_with_scores(
+            {"buy_top_n": 3, "allocation_mode": "linear_rank"},
+            {"AAA": 60, "BBB": 30, "CCC": -10},
+        )
+
+        buys = {intent.symbol: intent.value_percent for intent in intents}
+        self.assertAlmostEqual(buys["AAA"], 50)
+        self.assertAlmostEqual(buys["BBB"], 100 / 3)
+        self.assertAlmostEqual(buys["CCC"], 100 / 6)
+        by_symbol = {item["symbol"]: item["context"] for item in logs}
+        self.assertTrue(by_symbol["CCC"]["selected_for_target"])
+        self.assertAlmostEqual(by_symbol["CCC"]["target_weight"], 100 / 6)
+        self.assertEqual(by_symbol["CCC"]["filter_codes"], [])
+
+    def test_legacy_score_weighted_value_maps_to_linear_rank(self) -> None:
+        self.assertEqual(
+            RapidDropWtmeRotationStrategy.validate_params(
+                {"allocation_mode": "score_weighted"}
+            )["allocation_mode"],
+            "linear_rank",
+        )
+
+    def test_leveraged_equal_allocation_gives_each_target_full_gross_exposure(self) -> None:
+        _strategy, context, _logs, intents = self._select_with_scores(
+            {"buy_top_n": 3, "allocation_mode": "leveraged_equal"},
+            {"AAA": 30, "BBB": 20, "CCC": 10},
+        )
+
+        self.assertTrue(all(intent.value_percent == 100 / 3 for intent in intents))
+        self.assertTrue(
+            all(float(context.portfolio.effective_leverage(symbol)) == 3 for symbol in context.universe)
+        )
+        for intent in intents:
+            context.portfolio.execute(
+                intent,
+                reference_price=context.marks[intent.symbol],
+                marks=context.marks,
+                max_weight_percent=100,
+                event_time="2024-01-31 10:00",
+            )
+        self.assertAlmostEqual(float(context.portfolio.gross_leverage(context.marks)), 3.0, places=5)
+        snapshot = context.portfolio.snapshot(context.marks)
+        for symbol in context.universe:
+            self.assertAlmostEqual(snapshot[symbol]["weight"], 1.0, places=5)
+            self.assertAlmostEqual(snapshot[symbol]["strategy_weight"], 1 / 3, places=5)
+
+    def test_leveraged_linear_rank_combines_rank_weights_and_target_count_leverage(self) -> None:
+        _strategy, context, _logs, intents = self._select_with_scores(
+            {"buy_top_n": 3, "allocation_mode": "leveraged_linear_rank"},
+            {"AAA": 30, "BBB": 20, "CCC": 10},
+        )
+
+        target_weights = {intent.symbol: intent.value_percent for intent in intents}
+        self.assertAlmostEqual(target_weights["AAA"], 50)
+        self.assertAlmostEqual(target_weights["BBB"], 100 / 3)
+        self.assertAlmostEqual(target_weights["CCC"], 100 / 6)
+        self.assertTrue(
+            all(
+                float(context.portfolio.effective_leverage(symbol)) == 3
+                for symbol in context.universe
+            )
+        )
+        for intent in intents:
+            context.portfolio.execute(
+                intent,
+                reference_price=context.marks[intent.symbol],
+                marks=context.marks,
+                max_weight_percent=100,
+                event_time="2024-01-31 10:00",
+            )
+        snapshot = context.portfolio.snapshot(context.marks)
+        self.assertAlmostEqual(float(context.portfolio.gross_leverage(context.marks)), 3.0, places=5)
+        for symbol, gross_weight, strategy_weight in (
+            ("AAA", 1.5, 0.5),
+            ("BBB", 1.0, 1 / 3),
+            ("CCC", 0.5, 1 / 6),
+        ):
+            self.assertAlmostEqual(snapshot[symbol]["weight"], gross_weight, places=5)
+            self.assertAlmostEqual(
+                snapshot[symbol]["strategy_weight"], strategy_weight, places=5
+            )
+
+    def test_dynamic_leverage_multiplies_account_and_configured_symbol_leverage(self) -> None:
+        portfolio = Portfolio(
+            10_000,
+            leverage_multiplier=2,
+            allow_fractional_shares=True,
+            symbol_leverage_multipliers={"AAA": 1.5, "BBB": 2, "CCC": 1},
+        )
+        strategy, context, _logs, _intents = self._select_with_scores(
+            {"buy_top_n": 3, "allocation_mode": "leveraged_linear_rank"},
+            {"AAA": 30, "BBB": 20, "CCC": 10},
+            portfolio=portfolio,
+        )
+
+        self.assertEqual(
+            {
+                symbol: float(context.portfolio.effective_leverage(symbol))
+                for symbol in context.universe
+            },
+            {"AAA": 9.0, "BBB": 12.0, "CCC": 6.0},
+        )
+        type(self)._active_price_scores = context.price_scores
+        with patch(
+            "services.backtest.code_strategies.calculate_wtme_components",
+            side_effect=self._mock_wtme,
+        ):
+            strategy._select(context)
+        self.assertEqual(
+            {
+                symbol: float(context.portfolio.effective_leverage(symbol))
+                for symbol in context.universe
+            },
+            {"AAA": 9.0, "BBB": 12.0, "CCC": 6.0},
+        )
+
+        strategy.params["buy_top_n"] = 1
+        with patch(
+            "services.backtest.code_strategies.calculate_wtme_components",
+            side_effect=self._mock_wtme,
+        ):
+            strategy._select(context)
+        self.assertEqual(
+            {
+                symbol: float(context.portfolio.effective_leverage(symbol))
+                for symbol in context.universe
+            },
+            {"AAA": 3.0, "BBB": 4.0, "CCC": 2.0},
+        )
+
+    def test_score_condition_is_strictly_greater_than_x(self) -> None:
+        _strategy, _context, logs, intents = self._select_with_scores(
+            {"buy_top_n": 1, "buy_score_threshold": 10},
+            {"AAA": 20, "BBB": 10, "CCC": 9},
+        )
+
+        self.assertEqual([intent.symbol for intent in intents], ["AAA"])
+        by_symbol = {item["symbol"]: item["context"] for item in logs}
+        self.assertFalse(by_symbol["BBB"]["passes_score_condition"])
+        self.assertFalse(by_symbol["BBB"]["selected_for_target"])
 
     def test_backtest_filters_rapid_drop_and_buys_highest_remaining_wtme(self) -> None:
         dates = business_dates("2024-01-02", 7)
@@ -193,7 +439,6 @@ class WtmeStrategyTests(unittest.TestCase):
             "drop_lookback_sessions": 2,
             "risk_check_time": "09:40",
             "selection_time": "10:00",
-            "target_weight": 100,
         }
         code_strategy = {
             "name": "代码 WTME 策略",

@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import app as app_module
+from services.backtest.code_strategies import RapidDropWtmeRotationStrategy
 import database.db as main_db
 from database import backtest_repository
 import services.backtest.service as backtest_service
@@ -253,10 +254,30 @@ class BacktestRouteTests(unittest.TestCase):
             item for item in catalog.get_json()["strategies"]
             if item["key"] == "rapid_drop_wtme_rotation"
         )
-        self.assertEqual(wtme["version"], "1.1.0")
+        self.assertEqual(wtme["version"], "1.7.0")
+        self.assertEqual(wtme["parameter_schema"]["buy_top_n"]["default"], 1)
+        self.assertEqual(
+            wtme["parameter_schema"]["buy_score_threshold"]["default"],
+            9999.0,
+        )
+        self.assertEqual(wtme["parameter_schema"]["allocation_mode"]["default"], "equal")
+        self.assertEqual(
+            [
+                option["value"]
+                for option in wtme["parameter_schema"]["allocation_mode"]["options"]
+            ],
+            [
+                "equal",
+                "linear_rank",
+                "leveraged_equal",
+                "leveraged_linear_rank",
+            ],
+        )
         self.assertEqual(wtme["parameter_schema"]["wtme_period"]["default"], 40)
         self.assertEqual(wtme["parameter_schema"]["wtme_half_life"]["default"], 15.0)
         self.assertEqual(wtme["parameter_schema"]["wtme_epsilon"]["default"], 1e-8)
+        for retired in RapidDropWtmeRotationStrategy.retired_parameters:
+            self.assertNotIn(retired, wtme["parameter_schema"])
         self.assertNotIn("atr_period", wtme["parameter_schema"])
         self.assertNotIn("atr_weighting", wtme["parameter_schema"])
         self.assertNotIn("enable_atr_drop_filter", wtme["parameter_schema"])
@@ -307,7 +328,7 @@ class BacktestRouteTests(unittest.TestCase):
             for item in listed
             if item["code_key"] == "rapid_drop_wtme_rotation"
         )
-        self.assertEqual(wtme_strategy["code_version"], "1.1.0")
+        self.assertEqual(wtme_strategy["code_version"], "1.7.0")
         self.assertEqual(wtme_strategy["definition"]["params"]["wtme_period"], 40)
 
         created = self.client.post(

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import database.db as main_db
 from database import backtest_repository
+from services.backtest.code_strategies import RapidDropWtmeRotationStrategy
 from services.backtest.presets import shipped_strategy_presets
 from services.backtest.service import create_default_strategy
 
@@ -228,6 +229,77 @@ class BacktestRepositoryTests(unittest.TestCase):
             upgraded["definition"]["params"],
             shipped["definition"]["params"],
         )
+
+    def test_seeded_code_version_upgrade_can_replace_parameter_value(self) -> None:
+        _, shipped = next(
+            item
+            for item in shipped_strategy_presets()
+            if item[0] == "builtin-rapid-drop-wtme-rotation-v1"
+        )
+        legacy = deepcopy(shipped)
+        legacy["name"] = "WTME 仓位方式迁移测试"
+        legacy["code_version"] = "1.3.0"
+        legacy["definition"]["params"]["allocation_mode"] = "score_weighted"
+        seed_key = "test-wtme-linear-rank-allocation"
+        backtest_repository.seed_strategy_once(seed_key, legacy)
+
+        upgraded = backtest_repository.upgrade_seeded_strategy_code_version_once(
+            seed_key,
+            "test-wtme-linear-rank-allocation-v1.4.0",
+            code_key="rapid_drop_wtme_rotation",
+            from_versions=("1.3.0",),
+            to_version="1.4.0",
+            parameter_value_replacements={
+                "allocation_mode": {"score_weighted": "linear_rank"},
+            },
+        )
+
+        self.assertEqual(upgraded["code_version"], "1.4.0")
+        self.assertEqual(
+            upgraded["definition"]["params"]["allocation_mode"],
+            "linear_rank",
+        )
+
+    def test_seeded_wtme_upgrade_replaces_old_selection_parameters(self) -> None:
+        _, shipped = next(
+            item
+            for item in shipped_strategy_presets()
+            if item[0] == "builtin-rapid-drop-wtme-rotation-v1"
+        )
+        legacy = deepcopy(shipped)
+        legacy["name"] = "WTME OR 条件迁移测试"
+        legacy["code_version"] = "1.4.0"
+        legacy["definition"]["params"].update({
+            "holdings_num": 3,
+            "target_weight": 80,
+            "enable_new_position_min_score": True,
+            "new_position_min_score": 5,
+        })
+        legacy["definition"]["params"].pop("buy_top_n")
+        legacy["definition"]["params"].pop("buy_score_threshold")
+        seed_key = "test-wtme-or-buy-conditions"
+        backtest_repository.seed_strategy_once(seed_key, legacy)
+
+        upgraded = backtest_repository.upgrade_seeded_strategy_code_version_once(
+            seed_key,
+            "test-wtme-or-buy-conditions-v1.5.0",
+            code_key="rapid_drop_wtme_rotation",
+            from_versions=("1.4.0",),
+            to_version="1.5.0",
+            parameter_defaults={"buy_top_n": 1, "buy_score_threshold": 9999.0},
+            removed_parameters=tuple(
+                RapidDropWtmeRotationStrategy.retired_parameters
+            ),
+        )
+
+        self.assertEqual(upgraded["code_version"], "1.5.0")
+        self.assertEqual(upgraded["definition"]["params"]["buy_top_n"], 1)
+        self.assertEqual(
+            upgraded["definition"]["params"]["buy_score_threshold"],
+            9999.0,
+        )
+        for retired in RapidDropWtmeRotationStrategy.retired_parameters:
+            self.assertNotIn(retired, upgraded["definition"]["params"])
 
     def test_output_round_trip_preserves_equity_trade_and_log(self) -> None:
         strategy = create_default_strategy(

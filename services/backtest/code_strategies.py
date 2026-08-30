@@ -57,6 +57,10 @@ class CodeStrategy:
                     if not isinstance(value, str):
                         raise ValueError
                     value = value.strip().lower()
+                    value = {
+                        str(legacy).strip().lower(): str(current).strip().lower()
+                        for legacy, current in spec.get("value_aliases", {}).items()
+                    }.get(value, value)
                     allowed = {
                         str(option["value"]).strip().lower()
                         if isinstance(option, dict)
@@ -686,15 +690,70 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
 
 class RapidDropWtmeRotationStrategy(CodeStrategy):
     key = "rapid_drop_wtme_rotation"
-    version = "1.1.0"
+    version = "1.7.0"
     name = "急跌回避与 WTME 动量轮动"
     description = (
         "先按百分比单日急跌规则过滤标的，再以指定时点价格构造"
-        "不含未来数据的当前观测，买入 WTME 评分最高的未过滤标的。"
+        "不含未来数据的当前观测；评分排名前 n 或评分严格大于 x 即可入选，"
+        "并支持等权、线性排名及二者各自的动态杠杆配置。"
     )
     selection_modes = ("competition",)
     default_symbols = [dict(item) for item in RapidDropAtrRotationStrategy.default_symbols]
+    retired_parameters = {
+        "holdings_num",
+        "target_weight",
+        "enable_new_position_min_score",
+        "new_position_min_score",
+        "enable_new_position_max_rank",
+        "new_position_max_rank",
+        "enable_held_position_min_score",
+        "held_position_min_score",
+        "enable_held_position_max_rank",
+        "held_position_max_rank",
+    }
+    linear_allocation_modes = {"linear_rank", "leveraged_linear_rank"}
+    leveraged_allocation_modes = {"leveraged_equal", "leveraged_linear_rank"}
     parameter_schema = {
+        "allocation_mode": {
+            "label": "入选标的仓位分配",
+            "type": "choice",
+            "default": "equal",
+            "options": [
+                {"value": "equal", "label": "平均买入"},
+                {"value": "linear_rank", "label": "按线性排名权重买入"},
+                {"value": "leveraged_equal", "label": "平均仓位并动态加杠杆"},
+                {
+                    "value": "leveraged_linear_rank",
+                    "label": "按线性排名权重买入并动态加杠杆",
+                },
+            ],
+            "value_aliases": {"score_weighted": "linear_rank"},
+            "help": (
+                "平均买入按实际入选数等分 100% 组合仓位；线性排名模式按实际入选数 k，"
+                "从第一名到第 k 名使用 k:(k-1):…:1 分配；"
+                "两种动态杠杆模式都会在完成平均或线性仓位分配后额外乘以 k；"
+                "最终杠杆 = k × 整体杠杆 × 单标的设定杠杆。"
+            ),
+        },
+        "buy_top_n": {
+            "label": "买入条件 1：评分位于前 n 名",
+            "type": "integer",
+            "default": 1,
+            "minimum": 1,
+            "maximum": 100,
+            "step": 1,
+            "unit": "只",
+            "help": "急跌过滤后排名不超过 n 即通过条件 1；默认 1 表示评分第 1 名通过。",
+        },
+        "buy_score_threshold": {
+            "label": "买入条件 2：评分大于 x",
+            "type": "number",
+            "default": 9999.0,
+            "minimum": -100000.0,
+            "maximum": 100000.0,
+            "step": 0.1,
+            "help": "评分严格大于 x 即通过条件 2；默认 9999，使正常 WTME 评分无法仅靠条件 2 入选。",
+        },
         "wtme_period": {
             "label": "WTME 窗口 N",
             "type": "integer",
@@ -739,7 +798,6 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
         "selection_time": RapidDropAtrRotationStrategy.parameter_schema[
             "selection_time"
         ],
-        "target_weight": RapidDropAtrRotationStrategy.parameter_schema["target_weight"],
     }
 
     @classmethod
@@ -750,10 +808,16 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
         super().__init__(params)
         self.risk_off: dict[str, set[str]] = {}
         self.risk_evaluations: dict[str, dict[str, dict]] = {}
+        self.linear_rank_targets: tuple[str, ...] | list[str] | None = None
 
     @classmethod
     def validate_params(cls, params: dict) -> dict:
-        values = super().validate_params(params)
+        normalized = {
+            name: value
+            for name, value in dict(params).items()
+            if name not in cls.retired_parameters
+        }
+        values = super().validate_params(normalized)
         if values["risk_check_time"] >= values["selection_time"]:
             raise BacktestValidationError("风险检查时间必须早于轮动选标时间。")
         return values
@@ -766,12 +830,15 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
     @classmethod
     def validate_definition(cls, definition: dict) -> None:
         values = cls.validate_params(definition.get("params", {}))
+        candidates = [item["symbol"] for item in definition.get("symbols", [])]
+        if values["buy_top_n"] > len(candidates):
+            raise BacktestValidationError("买入条件 1 的前 n 名不能超过候选池标的数量。")
         if any(
-            float(item.get("max_weight", 100)) + 1e-9 < values["target_weight"]
+            float(item.get("max_weight", 100)) + 1e-9 < 100
             for item in definition.get("symbols", [])
         ):
             raise BacktestValidationError(
-                "候选标的最大仓位不能低于 WTME 策略总目标仓位。"
+                "候选标的最大仓位不能低于 WTME 策略固定的 100% 组合仓位。"
             )
 
     @classmethod
@@ -796,9 +863,18 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             f"{self.params['drop_lookback_sessions']}日{'/'.join(filters) or '无急跌过滤'}，"
             f"{self.params['selection_time']}按 WTME("
             f"N={self.params['wtme_period']}, h={self.params['wtme_half_life']:g}, "
-            f"epsilon={self.params['wtme_epsilon']:g}) 选择最高分标的，"
-            f"目标仓位{self.params['target_weight']:g}%（目标不变时不重复再平衡）"
+            f"epsilon={self.params['wtme_epsilon']:g})；排名前"
+            f"{self.params['buy_top_n']}名或评分>{self.params['buy_score_threshold']:g}即入选，"
+            f"{self._allocation_mode_label()}，组合总目标仓位固定为100%"
         )
+
+    def _allocation_mode_label(self) -> str:
+        return {
+            "equal": "平均买入",
+            "linear_rank": "按线性排名权重买入",
+            "leveraged_equal": "平均仓位并按实际入选数动态加杠杆",
+            "leveraged_linear_rank": "按线性排名权重买入并按实际入选数动态加杠杆",
+        }[self.params["allocation_mode"]]
 
     def observation_columns(self) -> list[dict]:
         period = int(self.params["wtme_period"])
@@ -829,10 +905,44 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
                 "key": "score", "label": "策略 WTME 评分", "format": "number",
                 "help": (
                     f"本策略 WTME = 100 × Rw ÷ (Aw + {epsilon:g})；{filter_text}，"
-                    "过滤后选择评分最高的标的。策略对当前观测的构造可能与行情页标准指标不同。"
+                    f"急跌过滤后排名前 {int(self.params['buy_top_n'])} 名或评分严格大于 "
+                    f"{float(self.params['buy_score_threshold']):g} 即入选，"
+                    f"采用{self._allocation_mode_label()}。策略对当前观测的构造可能与行情页标准指标不同。"
                 ),
             },
         ]
+
+    def buy_condition_filters(
+        self,
+        *,
+        score: float,
+        rank: int,
+    ) -> tuple[list[str], list[str]]:
+        passes_rank = rank <= int(self.params["buy_top_n"])
+        passes_score = score > float(self.params["buy_score_threshold"])
+        if passes_rank or passes_score:
+            return [], []
+        return ["buy_conditions"], [
+            f"排名未进入前 {self.params['buy_top_n']} 名，且评分未严格大于 "
+            f"{self.params['buy_score_threshold']:g}"
+        ]
+
+    def _target_weights(
+        self,
+        selected: list[tuple[float, str]],
+    ) -> dict[str, float]:
+        if not selected:
+            return {}
+        target_weight = 100.0
+        if self.params["allocation_mode"] in self.linear_allocation_modes:
+            count = len(selected)
+            denominator = count * (count + 1) / 2
+            return {
+                symbol: target_weight * (count - index) / denominator
+                for index, (_score, symbol) in enumerate(selected)
+            }
+        per_symbol = target_weight / len(selected)
+        return {symbol: per_symbol for _score, symbol in selected}
 
     def observe_latest(
         self,
@@ -976,6 +1086,8 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             if score is not None and symbol not in flagged:
                 scores.append((score, symbol))
             risk = self.risk_evaluations.get(context.trading_date, {}).get(symbol, {})
+            hard_filter_codes = list(risk.get("filter_codes", []))
+            hard_filter_reasons = list(risk.get("filter_reasons", []))
             evaluations.append({
                 "symbol": symbol,
                 "score": score,
@@ -999,27 +1111,71 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
                 "previous_close": previous_close,
                 "current_observation_true_range": abs(current_price - previous_close),
                 "current_observation_is_partial": True,
-                "filter_codes": list(risk.get("filter_codes", [])),
-                "filter_reasons": list(risk.get("filter_reasons", [])),
+                "hard_filter_codes": hard_filter_codes,
+                "hard_filter_reasons": hard_filter_reasons,
+                "filter_codes": list(hard_filter_codes),
+                "filter_reasons": list(hard_filter_reasons),
                 "percent_changes": list(risk.get("percent_changes", [])),
                 "risk_event_price": risk.get("risk_event_price"),
             })
 
         ranked_scores = sorted(scores, key=lambda item: (-item[0], item[1]))
-        target = ranked_scores[0][1] if ranked_scores else None
         rank_by_symbol = {
             symbol: index + 1
             for index, (_score, symbol) in enumerate(ranked_scores)
         }
+        evaluation_by_symbol = {item["symbol"]: item for item in evaluations}
+        eligible_scores: list[tuple[float, str]] = []
+        for score, symbol in ranked_scores:
+            condition_codes, condition_reasons = self.buy_condition_filters(
+                score=score,
+                rank=rank_by_symbol[symbol],
+            )
+            item = evaluation_by_symbol[symbol]
+            item["passes_rank_condition"] = (
+                rank_by_symbol[symbol] <= int(self.params["buy_top_n"])
+            )
+            item["passes_score_condition"] = (
+                score > float(self.params["buy_score_threshold"])
+            )
+            item["selection_filter_codes"] = condition_codes
+            item["selection_filter_reasons"] = condition_reasons
+            item["filter_codes"].extend(condition_codes)
+            item["filter_reasons"].extend(condition_reasons)
+            item["eligible"] = not condition_codes
+            if not condition_codes:
+                eligible_scores.append((score, symbol))
+        selected = eligible_scores
+        targets = [symbol for _score, symbol in selected]
+        target_set = set(targets)
+        target_weights = self._target_weights(selected)
+        if self.params["allocation_mode"] in self.leveraged_allocation_modes:
+            if len(targets) > 10:
+                raise BacktestValidationError(
+                    "动态杠杆模式当次入选标的不能超过 10 只。"
+                )
+            leverage = max(1, len(targets))
+            for symbol in context.universe:
+                context.portfolio.apply_strategy_leverage_multiplier(
+                    symbol,
+                    leverage if symbol in target_set else 1,
+                )
         for item in evaluations:
             item["rank"] = rank_by_symbol.get(item["symbol"])
-            item["selected_for_target"] = item["symbol"] == target
+            item["held_at_selection"] = context.portfolio.quantity(item["symbol"]) > 0
+            item.setdefault("passes_rank_condition", False)
+            item.setdefault("passes_score_condition", False)
+            item.setdefault("selection_filter_codes", [])
+            item.setdefault("selection_filter_reasons", [])
+            item.setdefault("eligible", not item["filter_codes"])
+            item["selected_for_target"] = item["symbol"] in target_set
+            item["target_weight"] = target_weights.get(item["symbol"])
             filter_text = (
-                f"，硬性过滤：{'；'.join(item['filter_reasons'])}"
+                f"，过滤：{'；'.join(item['filter_reasons'])}"
                 if item["filter_reasons"]
-                else "，通过硬性过滤"
+                else "，通过全部门槛"
             )
-            rank_text = f"，合格排名第 {item['rank']}" if item["rank"] else ""
+            rank_text = f"，急跌过滤后排名第 {item['rank']}" if item["rank"] else ""
             score_text = (
                 f"{item['score']:.8f}" if item["score"] is not None else "不可计算"
             )
@@ -1030,7 +1186,11 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
                 context=item,
             )
 
-        target_label = target or "无"
+        target_label = "、".join(targets) or "无"
+        held_set = {
+            symbol for symbol in context.universe
+            if context.portfolio.quantity(symbol) > 0
+        }
         intents = [
             OrderIntent(
                 symbol=symbol,
@@ -1040,21 +1200,36 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
                 reason=f"{self.params['selection_time']} WTME 轮动换仓，目标标的为 {target_label}",
             )
             for symbol in context.universe
-            if symbol != target and context.portfolio.quantity(symbol) > 0
+            if symbol not in target_set and context.portfolio.quantity(symbol) > 0
         ]
-        if target is not None and context.portfolio.quantity(target) <= 0:
-            intents.append(
-                OrderIntent(
-                    symbol=target,
-                    action="BUY",
-                    sizing_mode="TARGET",
-                    value_percent=self.params["target_weight"],
-                    reason=(
-                        f"{self.params['selection_time']} 未过滤标的 WTME 最高："
-                        f"{target}"
-                    ),
+        linear_rank_changed = (
+            self.params["allocation_mode"] in self.linear_allocation_modes
+            and tuple(targets) != tuple(self.linear_rank_targets or ())
+        )
+        should_rebalance = linear_rank_changed or target_set != held_set
+        if should_rebalance:
+            for symbol in targets:
+                desired_weight = target_weights[symbol]
+                current_weight = float(
+                    context.portfolio.weight(symbol, context.marks) * 100
                 )
-            )
+                if abs(current_weight - desired_weight) <= 1e-7:
+                    continue
+                intents.append(
+                    OrderIntent(
+                        symbol=symbol,
+                        action="BUY" if current_weight < desired_weight else "SELL",
+                        sizing_mode="TARGET",
+                        value_percent=desired_weight,
+                        reason=(
+                            f"{self.params['selection_time']} WTME 入选：{symbol}；"
+                            f"{self._allocation_mode_label()}，目标策略仓位 "
+                            f"{desired_weight:.6g}%"
+                        ),
+                    )
+                )
+        if self.params["allocation_mode"] in self.linear_allocation_modes:
+            self.linear_rank_targets = tuple(targets)
         return intents
 
 

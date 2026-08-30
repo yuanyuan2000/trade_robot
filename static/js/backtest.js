@@ -440,8 +440,9 @@ function renderBacktestCodeParameters() {
   }
   const params = bt.current.definition.params || {};
   btCodeParams.innerHTML = Object.entries(spec.parameter_schema).map(([name, field]) => {
-    const value = params[name] ?? field.default;
-    const maximum = name === "holdings_num"
+    const rawValue = params[name] ?? field.default;
+    const value = field.value_aliases?.[rawValue] ?? rawValue;
+    const maximum = ["holdings_num", "buy_top_n"].includes(name)
       ? Math.min(field.maximum ?? Infinity, bt.current.definition.symbols?.length || 0)
       : field.maximum;
     const range = field.minimum != null || maximum != null
@@ -552,11 +553,10 @@ function collectBacktestStrategy() {
               ? input.value.trim().toUpperCase()
               : Number(input.value);
     });
-    if (
-      Number(strategy.definition.params.holdings_num) >
-      strategy.definition.symbols.length
-    ) {
-      throw new Error("目标持仓数量不能超过候选池标的数量。");
+    const boundedCount = strategy.definition.params.holdings_num
+      ?? strategy.definition.params.buy_top_n;
+    if (Number(boundedCount) > strategy.definition.symbols.length) {
+      throw new Error("持仓数量或买入条件的前 n 名不能超过候选池标的数量。");
     }
   }
   return strategy;

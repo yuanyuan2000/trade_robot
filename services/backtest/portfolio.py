@@ -73,12 +73,14 @@ class Portfolio:
         self.leverage_multiplier = D(leverage_multiplier)
         if self.leverage_multiplier < ONE:
             raise BacktestOrderError("杠杆倍率不能小于 1。")
-        self.symbol_leverage_multipliers = {
+        configured_symbol_leverages = {
             symbol: D(multiplier)
             for symbol, multiplier in (symbol_leverage_multipliers or {}).items()
         }
-        if any(multiplier < ONE for multiplier in self.symbol_leverage_multipliers.values()):
+        if any(multiplier < ONE for multiplier in configured_symbol_leverages.values()):
             raise BacktestOrderError("单标的杠杆倍率不能小于 1。")
+        self.configured_symbol_leverage_multipliers = dict(configured_symbol_leverages)
+        self.symbol_leverage_multipliers = dict(configured_symbol_leverages)
         self.commission_per_share = D(commission_per_share)
         self.minimum_commission = D(minimum_commission)
         self.slippage_bps = D(slippage_bps)
@@ -146,6 +148,22 @@ class Portfolio:
     def effective_leverage(self, symbol: str) -> Decimal:
         """Return account leverage multiplied by the symbol-specific leverage."""
         return self.leverage_multiplier * self.symbol_leverage_multipliers.get(symbol, ONE)
+
+    def set_symbol_leverage_multiplier(self, symbol: str, multiplier: float) -> None:
+        """Update a strategy-owned symbol leverage before target orders are built."""
+        normalized = D(multiplier)
+        if normalized < ONE or normalized > Decimal("100"):
+            raise BacktestOrderError("运行中的单标的杠杆倍率必须在 1 至 100 之间。")
+        self.symbol_leverage_multipliers[symbol] = normalized
+
+    def apply_strategy_leverage_multiplier(
+        self,
+        symbol: str,
+        strategy_multiplier: float,
+    ) -> None:
+        """Apply an extra strategy multiplier on top of the configured symbol leverage."""
+        base = self.configured_symbol_leverage_multipliers.get(symbol, ONE)
+        self.set_symbol_leverage_multiplier(symbol, base * D(strategy_multiplier))
 
     @property
     def max_leverage_multiplier(self) -> Decimal:

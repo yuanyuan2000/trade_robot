@@ -414,22 +414,56 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
             row["details"] = {"error": str(exc)}
         rows.append(row)
 
+    is_wtme_code = (
+        code_observer is not None
+        and strategy.get("code_key") == "rapid_drop_wtme_rotation"
+    )
     ranked = sorted(
         (
             row for row in rows
-            if row["is_candidate"] and row["eligible"] and row.get("score") is not None
+            if row["is_candidate"]
+            and row.get("score") is not None
+            and (
+                not (row.get("details") or {}).get("hard_filter_codes")
+                if is_wtme_code
+                else row["eligible"]
+            )
         ),
         key=lambda row: (-float(row["score"]), row["symbol"]),
     )
     for index, row in enumerate(ranked, start=1):
         row["rank"] = index
-    target_count = 0
-    if strategy["selection_mode"] == "competition":
-        if code_observer is not None:
-            target_count = max(0, int(code_observer.observation_target_count()))
-        else:
-            target_count = 1
-    for row in ranked[:target_count]:
+    if is_wtme_code:
+        for row in rows:
+            details = row.get("details") or {}
+            hard_reasons = list(details.get("hard_filter_reasons") or [])
+            if row.get("rank") is None or row.get("score") is None:
+                row["eligible"] = False
+                row["status"] = "已过滤" if hard_reasons else row["status"]
+                row["reason"] = "、".join(hard_reasons) if hard_reasons else row["reason"]
+                continue
+            condition_codes, condition_reasons = code_observer.buy_condition_filters(
+                score=float(row["score"]),
+                rank=int(row["rank"]),
+            )
+            row["eligible"] = not condition_codes
+            row["status"] = "通过" if row["eligible"] else "已过滤"
+            row["reason"] = "、".join(condition_reasons) if condition_reasons else "—"
+            details["selection_filter_codes"] = condition_codes
+            details["selection_filter_reasons"] = condition_reasons
+    target_candidates = [row for row in ranked if row["eligible"]]
+    target_rows = (
+        target_candidates
+        if is_wtme_code
+        else target_candidates[:1]
+        if strategy["selection_mode"] == "competition"
+        else []
+    )
+    if code_observer is not None and not is_wtme_code:
+        target_rows = target_candidates[
+            :max(0, int(code_observer.observation_target_count()))
+        ]
+    for row in target_rows:
         row["selected_for_target"] = True
 
     payload = {

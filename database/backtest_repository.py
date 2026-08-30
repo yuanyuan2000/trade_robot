@@ -243,6 +243,7 @@ def upgrade_seeded_strategy_code_version_once(
     from_versions: tuple[str, ...],
     to_version: str,
     parameter_defaults: dict | None = None,
+    parameter_value_replacements: dict[str, dict] | None = None,
     removed_parameters: tuple[str, ...] = (),
 ) -> dict | None:
     """Upgrade seeded code metadata and apply explicit parameter migrations."""
@@ -298,6 +299,15 @@ def upgrade_seeded_strategy_code_version_once(
                         for name, value in current_params.items()
                         if name not in set(removed_parameters)
                     }
+                if parameter_value_replacements:
+                    current_params = definition.get("params")
+                    if not isinstance(current_params, dict):
+                        current_params = {}
+                    for name, replacements in parameter_value_replacements.items():
+                        current_value = current_params.get(name)
+                        if current_value in replacements:
+                            current_params[name] = replacements[current_value]
+                    definition["params"] = current_params
                 conn.execute(
                     """
                     UPDATE backtest_strategies
