@@ -120,7 +120,11 @@ analysis_process_executor: ProcessPoolExecutor | None = None
 analysis_overview_state = {
     "running": False,
     "analysis_type": None,
+    "phase": "idle",
     "total": 0,
+    "checked": 0,
+    "cache_hits": 0,
+    "pending": 0,
     "completed": 0,
     "current_symbol": None,
     "parallel_workers": 0,
@@ -1095,7 +1099,11 @@ def start_analysis_overview_refresh(
         analysis_overview_state.update({
             "running": True,
             "analysis_type": analysis_type,
+            "phase": "checking_cache",
             "total": total,
+            "checked": 0,
+            "cache_hits": 0,
+            "pending": 0,
             "completed": 0,
             "current_symbol": None,
             "parallel_workers": 0,
@@ -1149,6 +1157,13 @@ def _mark_analysis_item_completed(remaining: int) -> None:
         analysis_overview_state["updated_at"] = now_utc().isoformat()
 
 
+def _mark_analysis_item_checked(pending: int) -> None:
+    with analysis_overview_lock:
+        analysis_overview_state["checked"] += 1
+        analysis_overview_state["pending"] = max(0, pending)
+        analysis_overview_state["updated_at"] = now_utc().isoformat()
+
+
 def run_analysis_overview_refresh(analysis_type: str = "trendline") -> None:
     ordered_symbols: list[str] = []
     results_by_symbol: dict[str, dict] = {}
@@ -1157,6 +1172,7 @@ def run_analysis_overview_refresh(analysis_type: str = "trendline") -> None:
         symbols = repository.list_overview_symbols()
         ordered_symbols = [item["common_symbol"] for item in symbols]
         with analysis_overview_lock:
+            analysis_overview_state["phase"] = "checking_cache"
             analysis_overview_state["total"] = len(symbols)
             analysis_overview_state["remaining"] = len(symbols)
 
@@ -1206,6 +1222,8 @@ def run_analysis_overview_refresh(analysis_type: str = "trendline") -> None:
                             or 0
                         ),
                     )
+                    with analysis_overview_lock:
+                        analysis_overview_state["cache_hits"] += 1
                     _mark_analysis_item_completed(
                         len(symbols) - len(results_by_symbol)
                     )
@@ -1224,9 +1242,12 @@ def run_analysis_overview_refresh(analysis_type: str = "trendline") -> None:
                 _mark_analysis_item_completed(
                     len(symbols) - len(results_by_symbol)
                 )
+            finally:
+                _mark_analysis_item_checked(len(pending_symbols))
 
         worker_count = analysis_worker_count(len(pending_symbols))
         with analysis_overview_lock:
+            analysis_overview_state["phase"] = "calculating"
             analysis_overview_state["current_symbol"] = None
             analysis_overview_state["parallel_workers"] = worker_count
             analysis_overview_state["remaining"] = len(pending_symbols)
@@ -1331,6 +1352,12 @@ def run_analysis_overview_refresh(analysis_type: str = "trendline") -> None:
                 "items": results,
                 "total": len(results),
                 "failed": failed,
+                "cache_hits": sum(
+                    1 for item in results if item["status"] == "cached"
+                ),
+                "calculated": sum(
+                    1 for item in results if item["status"] == "success"
+                ),
             }
             analysis_overview_state["last_error"] = None
     except Exception as exc:
@@ -1342,6 +1369,11 @@ def run_analysis_overview_refresh(analysis_type: str = "trendline") -> None:
         with analysis_overview_lock:
             rerun_requested = analysis_overview_state["rerun_requested"]
             analysis_overview_state["running"] = False
+            analysis_overview_state["phase"] = (
+                "error"
+                if analysis_overview_state["last_error"]
+                else "complete"
+            )
             analysis_overview_state["current_symbol"] = None
             analysis_overview_state["parallel_workers"] = 0
             analysis_overview_state["remaining"] = 0
@@ -1355,7 +1387,11 @@ def analysis_overview_snapshot() -> dict:
         return {
             "running": bool(analysis_overview_state["running"]),
             "analysis_type": analysis_overview_state["analysis_type"],
+            "phase": analysis_overview_state["phase"],
             "total": int(analysis_overview_state["total"]),
+            "checked": int(analysis_overview_state["checked"]),
+            "cache_hits": int(analysis_overview_state["cache_hits"]),
+            "pending": int(analysis_overview_state["pending"]),
             "completed": int(analysis_overview_state["completed"]),
             "current_symbol": analysis_overview_state["current_symbol"],
             "parallel_workers": int(

@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import database.db as main_db
 from database import realtime_repository
 import services.realtime_scheduler as scheduler_module
+from services.backtest.errors import BacktestValidationError
 from services.backtest.service import create_default_strategy
 from services.realtime_mail import render_message, validate_message_template
 from services.realtime_scheduler import RealtimeTaskManager
@@ -397,6 +398,52 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
         self.assertIn("SPY 风险检查通过", body)
         self.assertNotIn("百分比/ATR", body)
 
+        selection_result = {
+            "decision": {
+                "trading_date": "2026-08-03",
+                "event": "10:00",
+                "recommendations": [{
+                    "action": "BUY",
+                    "symbol": "GLD",
+                    "target_weight_percent": 100,
+                    "effective_leverage": 2,
+                    "reason": "WTME 买入条件通过",
+                }],
+            },
+            "data_manifest": {},
+            "calculation": {"engine_logs": [
+                {
+                    "event_type": "RAPID_DROP_WTME_DAILY_SCORE",
+                    "message": "GLD WTME 评分完整计算说明",
+                    "symbol": "GLD",
+                    "context": {
+                        "score": 12.34567,
+                        "rank": 1,
+                        "score_formula": "100 × Rw ÷ Aw",
+                    },
+                },
+                {
+                    "event_type": "RAPID_DROP_WTME_DAILY_SCORE",
+                    "message": "SPY WTME 评分完整计算说明",
+                    "symbol": "SPY",
+                    "context": {
+                        "score": 8.2,
+                        "rank": 2,
+                        "score_formula": "100 × Rw ÷ Aw",
+                    },
+                },
+            ]},
+        }
+
+        _subject, selection_body = render_message(task, selection_result)
+
+        self.assertIn("| 标的 | WTME评分 | 急跌过滤后排名 |", selection_body)
+        self.assertIn("| GLD | 12.346 | 1 |", selection_body)
+        self.assertIn("| SPY | 8.2 | 2 |", selection_body)
+        self.assertNotIn("100 × Rw", selection_body)
+        self.assertNotIn("轮动与调仓建议", selection_body)
+        self.assertNotIn("BUY GLD", selection_body)
+
     def test_event_calculation_aliases_are_persisted_for_audit(self) -> None:
         strategy = create_default_strategy(name="事件审计策略", design_mode="visual", selection_mode="single")
         task = realtime_repository.create_task(
@@ -583,6 +630,38 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
         finally:
             for task in tasks:
                 manager.stop(task["id"])
+            manager._executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_start_rejects_stale_code_version_before_history_or_run_creation(self) -> None:
+        strategy = create_default_strategy(
+            name="旧代码版本策略",
+            design_mode="code",
+            selection_mode="competition",
+            code_key="rapid_drop_wtme_rotation",
+        )
+        stale_snapshot = {**strategy, "code_version": "0.9.0"}
+        task = realtime_repository.create_task(
+            name="旧代码版本任务",
+            strategy=stale_snapshot,
+            follow_strategy=False,
+            settings={},
+            notification_settings={},
+            portfolio_state={},
+        )
+        manager = RealtimeTaskManager(max_workers=1)
+        try:
+            with patch.object(
+                scheduler_module, "_validate_local_history"
+            ) as validate_history:
+                with self.assertRaisesRegex(
+                    BacktestValidationError,
+                    "不能按原版本运行.*重新保存该策略参数",
+                ):
+                    manager.start(task["id"])
+            validate_history.assert_not_called()
+            self.assertEqual(realtime_repository.list_runs(task["id"]), [])
+            self.assertNotIn(task["id"], manager._states)
+        finally:
             manager._executor.shutdown(wait=False, cancel_futures=True)
 
 

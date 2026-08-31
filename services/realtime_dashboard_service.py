@@ -418,6 +418,22 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
         code_observer is not None
         and strategy.get("code_key") == "rapid_drop_wtme_rotation"
     )
+    candidate_order = {
+        str(item["symbol"]).upper(): index
+        for index, item in enumerate(strategy["definition"].get("symbols", []))
+    }
+
+    def ranking_key(row: dict) -> tuple:
+        # ATR, WTME and visual competition use symbol as their deterministic
+        # tie-breaker. Sevenstar's production ranking is stable in configured
+        # universe order, so its observation target must preserve that order.
+        tie_breaker = (
+            candidate_order.get(row["symbol"], len(candidate_order))
+            if strategy.get("code_key") == "sevenstar_etf_rotation"
+            else row["symbol"]
+        )
+        return (-float(row["score"]), tie_breaker)
+
     ranked = sorted(
         (
             row for row in rows
@@ -429,31 +445,68 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
                 else row["eligible"]
             )
         ),
-        key=lambda row: (-float(row["score"]), row["symbol"]),
+        key=ranking_key,
     )
     for index, row in enumerate(ranked, start=1):
         row["rank"] = index
     if is_wtme_code:
         for row in rows:
             details = row.get("details") or {}
+            hard_codes = list(details.get("hard_filter_codes") or [])
             hard_reasons = list(details.get("hard_filter_reasons") or [])
-            if row.get("rank") is None or row.get("score") is None:
+            details["buy_condition_passed"] = False
+            details["buy_condition_codes"] = []
+            details["buy_condition_reasons"] = []
+            if row.get("score") is None:
                 row["eligible"] = False
-                row["status"] = "已过滤" if hard_reasons else row["status"]
-                row["reason"] = "、".join(hard_reasons) if hard_reasons else row["reason"]
+                row["status"] = "已过滤" if hard_codes else "不可计算"
+                row["reason"] = (
+                    "、".join(hard_reasons) if hard_reasons else "WTME 评分不可计算"
+                )
+                continue
+            if hard_codes:
+                row["eligible"] = False
+                row["status"] = "已过滤"
+                row["reason"] = "、".join(hard_reasons)
+                continue
+            # A hard-filter pass is a candidate pass even when this overview
+            # row is outside the task pool or fails both OR buy conditions.
+            row["eligible"] = True
+            row["status"] = "通过"
+            if row.get("rank") is None:
+                row["reason"] = "通过硬性过滤；不在任务候选池排名中"
                 continue
             condition_codes, condition_reasons = code_observer.buy_condition_filters(
                 score=float(row["score"]),
                 rank=int(row["rank"]),
             )
-            row["eligible"] = not condition_codes
-            row["status"] = "通过" if row["eligible"] else "已过滤"
-            row["reason"] = "、".join(condition_reasons) if condition_reasons else "—"
-            details["selection_filter_codes"] = condition_codes
-            details["selection_filter_reasons"] = condition_reasons
+            passes_rank = int(row["rank"]) <= int(code_observer.params["buy_top_n"])
+            passes_score = float(row["score"]) > float(
+                code_observer.params["buy_score_threshold"]
+            )
+            details["passes_rank_condition"] = passes_rank
+            details["passes_score_condition"] = passes_score
+            details["buy_condition_passed"] = not condition_codes
+            details["buy_condition_codes"] = condition_codes
+            details["buy_condition_reasons"] = condition_reasons
+            row["buy_condition_passed"] = not condition_codes
+            if condition_reasons:
+                row["reason"] = (
+                    "已进入候选名单；未进入买入名单："
+                    + "、".join(condition_reasons)
+                )
+            else:
+                passed_labels = []
+                if passes_rank:
+                    passed_labels.append("排名条件")
+                if passes_score:
+                    passed_labels.append("评分条件")
+                row["reason"] = (
+                    f"已进入买入名单（{'、'.join(passed_labels)}通过）"
+                )
     target_candidates = [row for row in ranked if row["eligible"]]
     target_rows = (
-        target_candidates
+        [row for row in target_candidates if row.get("buy_condition_passed")]
         if is_wtme_code
         else target_candidates[:1]
         if strategy["selection_mode"] == "competition"

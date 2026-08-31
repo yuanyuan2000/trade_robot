@@ -181,6 +181,10 @@ class AnalysisParallelTests(unittest.TestCase):
             ["success", "error", "success"],
         )
         self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["calculated"], 2)
+        self.assertEqual(result["cache_hits"], 0)
+        self.assertEqual(app_module.analysis_overview_state["phase"], "complete")
+        self.assertEqual(app_module.analysis_overview_state["checked"], 3)
         self.assertEqual(
             [call.args[0] for call in save_snapshot.call_args_list],
             ["THIRD", "FIRST"],

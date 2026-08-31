@@ -203,6 +203,23 @@ def _limit_decimal_places(value: str) -> str:
     )
 
 
+def _wtme_score_table(score_logs: list[dict]) -> list[str]:
+    lines = [
+        "| 标的 | WTME评分 | 急跌过滤后排名 |",
+        "| --- | ---: | ---: |",
+    ]
+    for log in score_logs[:12]:
+        context = log.get("context") or {}
+        score = context.get("score")
+        rank = context.get("rank")
+        lines.append(
+            f"| {log.get('symbol') or context.get('symbol') or '—'} "
+            f"| {_format_number(score) if score is not None else '—'} "
+            f"| {int(rank) if rank is not None else '—'} |"
+        )
+    return lines
+
+
 def validate_message_template(value: str) -> None:
     template = str(value or "")
     tokens = set(_TEMPLATE_TOKEN_PATTERN.findall(template))
@@ -274,11 +291,15 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
         "rapid_drop_atr_rotation",
         "rapid_drop_wtme_rotation",
     }
+    compact_wtme_selection = (
+        code_key == "rapid_drop_wtme_rotation"
+        and event == params.get("selection_time")
+    )
     lines = [
         f"{task['name']} · {decision['trading_date']} {event}",
         "",
     ]
-    if strategy_snapshot.get("design_mode") == "code":
+    if strategy_snapshot.get("design_mode") == "code" and not compact_wtme_selection:
         strategy_type = get_code_strategy(code_key or "")
         if rapid_drop_code and event == params.get("risk_check_time"):
             risk_rule_label = (
@@ -290,7 +311,22 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
         else:
             lines.append(strategy_type.realtime_notification_intro())
 
-    if rapid_drop_code and event == params.get("risk_check_time"):
+    if compact_wtme_selection:
+        score_logs = [
+            log for log in engine_logs
+            if log.get("event_type") == "RAPID_DROP_WTME_DAILY_SCORE"
+        ]
+        score_logs.sort(key=lambda log: (
+            (log.get("context") or {}).get("rank") is None,
+            (log.get("context") or {}).get("rank") or 9999,
+            str(log.get("symbol") or ""),
+        ))
+        lines.extend(["WTME评分与急跌过滤后排名：", ""])
+        if score_logs:
+            lines.extend(_wtme_score_table(score_logs))
+        else:
+            lines.append("本次事件没有生成有效 WTME 评分。")
+    elif rapid_drop_code and event == params.get("risk_check_time"):
         risk_event_type = (
             "RAPID_DROP_WTME_RISK_CHECK"
             if code_key == "rapid_drop_wtme_rotation"

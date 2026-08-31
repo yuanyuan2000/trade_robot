@@ -58,7 +58,7 @@ function rtStateLabel(state) {
 function rtCodeBodyPreview(strategy) {
   const labels = {
     rapid_drop_atr_rotation: "风险节点列出急跌过滤；选标节点列出价格位移、ATR、评分、排名与调仓建议。",
-    rapid_drop_wtme_rotation: "风险节点列出急跌过滤；选标节点列出 Rw、Aw、WTME 评分、排名与调仓建议。",
+    rapid_drop_wtme_rotation: "风险节点列出急跌过滤；选标节点使用简洁表格列出标的、WTME 评分和急跌过滤后排名。",
     sevenstar_etf_rotation: "列出长期趋势、R²、短动量、过滤原因、七星评分、排名与目标。",
   };
   return `代码策略默认邮件正文：\n${labels[strategy?.code_key] || "显示策略评分、过滤原因、排名和调仓建议。"}\n\n正式邮件只使用任务候选池，并在事件时点独立获取行情。`;
@@ -290,7 +290,7 @@ function renderRealtimeDashboardTable() {
     <thead><tr>${headers.map(([key, label, help]) => `<th>${rtSortHeader(key, label, help)}</th>`).join("")}<th>明细</th></tr></thead>
     <tbody>${rows.length ? rows.map((row) => `<tr>
       <td><span class="realtime-symbol-cell">${row.is_candidate ? '<i class="realtime-candidate-dot" title="属于当前任务候选池" aria-label="属于当前任务候选池"></i>' : '<i class="realtime-candidate-dot is-empty" aria-hidden="true"></i>'}<button class="realtime-symbol-link" type="button" data-rt-open-symbol="${rtEscape(row.symbol)}" title="查看 ${rtEscape(row.display_symbol || row.symbol)} K线详情"><strong>${rtEscape(row.display_symbol || row.symbol)}</strong>${row.name && row.name !== row.display_symbol ? `<small>${rtEscape(row.name)}</small>` : ""}</button></span></td>
-      <td><span class="realtime-status-pill realtime-status-${row.status === "通过" ? "ok" : row.status === "不可计算" ? "na" : row.status === "观察" ? "watch" : "filter"}">${rtEscape(row.status)}</span>${row.reason && row.reason !== "—" ? `<small class="realtime-reason">${rtEscape(row.reason)}</small>` : ""}</td>
+      <td><span class="realtime-status-pill realtime-status-${row.status === "通过" ? "ok" : row.status === "不可计算" ? "na" : row.status === "观察" ? "watch" : "filter"}" title="${rtEscape(row.reason && row.reason !== "—" ? row.reason : row.status)}" aria-label="${rtEscape(row.reason && row.reason !== "—" ? `${row.status}：${row.reason}` : row.status)}">${rtEscape(row.status)}</span></td>
       <td>${rtFormatMetric(row.latest_price, "price")}</td>
       ${columns.map((column) => `<td>${rtFormatMetric(row.metrics?.[column.key], column.format)}</td>`).join("")}
       <td>${row.rank ? `<strong>#${row.rank}</strong>${row.selected_for_target ? '<span class="realtime-target-badge">面板目标</span>' : ""}` : "—"}</td>

@@ -1125,7 +1125,7 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             for index, (_score, symbol) in enumerate(ranked_scores)
         }
         evaluation_by_symbol = {item["symbol"]: item for item in evaluations}
-        eligible_scores: list[tuple[float, str]] = []
+        selected_scores: list[tuple[float, str]] = []
         for score, symbol in ranked_scores:
             condition_codes, condition_reasons = self.buy_condition_filters(
                 score=score,
@@ -1138,14 +1138,16 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             item["passes_score_condition"] = (
                 score > float(self.params["buy_score_threshold"])
             )
-            item["selection_filter_codes"] = condition_codes
-            item["selection_filter_reasons"] = condition_reasons
-            item["filter_codes"].extend(condition_codes)
-            item["filter_reasons"].extend(condition_reasons)
-            item["eligible"] = not condition_codes
+            item["buy_condition_passed"] = not condition_codes
+            item["buy_condition_codes"] = condition_codes
+            item["buy_condition_reasons"] = condition_reasons
+            # Candidate eligibility and target selection are intentionally
+            # separate.  Failing both OR buy conditions does not filter a
+            # symbol out of the candidate list.
+            item["eligible"] = not item["filter_codes"]
             if not condition_codes:
-                eligible_scores.append((score, symbol))
-        selected = eligible_scores
+                selected_scores.append((score, symbol))
+        selected = selected_scores
         targets = [symbol for _score, symbol in selected]
         target_set = set(targets)
         target_weights = self._target_weights(selected)
@@ -1165,23 +1167,39 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             item["held_at_selection"] = context.portfolio.quantity(item["symbol"]) > 0
             item.setdefault("passes_rank_condition", False)
             item.setdefault("passes_score_condition", False)
-            item.setdefault("selection_filter_codes", [])
-            item.setdefault("selection_filter_reasons", [])
+            item.setdefault("buy_condition_passed", False)
+            item.setdefault("buy_condition_codes", [])
+            item.setdefault("buy_condition_reasons", [])
             item.setdefault("eligible", not item["filter_codes"])
             item["selected_for_target"] = item["symbol"] in target_set
             item["target_weight"] = target_weights.get(item["symbol"])
             filter_text = (
-                f"，过滤：{'；'.join(item['filter_reasons'])}"
+                f"，硬性过滤：{'；'.join(item['filter_reasons'])}"
                 if item["filter_reasons"]
-                else "，通过全部门槛"
+                else "，进入候选名单"
             )
+            if item["selected_for_target"]:
+                passed_conditions = []
+                if item["passes_rank_condition"]:
+                    passed_conditions.append("排名条件")
+                if item["passes_score_condition"]:
+                    passed_conditions.append("评分条件")
+                selection_text = (
+                    f"，进入买入名单（{'、'.join(passed_conditions)}通过）"
+                )
+            elif item["eligible"] and item["rank"] is not None:
+                selection_text = (
+                    f"，未进入买入名单：{'；'.join(item['buy_condition_reasons'])}"
+                )
+            else:
+                selection_text = ""
             rank_text = f"，急跌过滤后排名第 {item['rank']}" if item["rank"] else ""
             score_text = (
                 f"{item['score']:.8f}" if item["score"] is not None else "不可计算"
             )
             context.log_custom(
                 "RAPID_DROP_WTME_DAILY_SCORE",
-                f"{item['symbol']} WTME 评分 {score_text}{rank_text}{filter_text}。",
+                f"{item['symbol']} WTME 评分 {score_text}{rank_text}{filter_text}{selection_text}。",
                 symbol=item["symbol"],
                 context=item,
             )

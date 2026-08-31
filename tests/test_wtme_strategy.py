@@ -154,7 +154,16 @@ class WtmeStrategyTests(unittest.TestCase):
         self.assertTrue(by_symbol["AAA"]["passes_rank_condition"])
         self.assertTrue(by_symbol["BBB"]["passes_score_condition"])
         self.assertFalse(by_symbol["CCC"]["selected_for_target"])
-        self.assertIn("buy_conditions", by_symbol["CCC"]["filter_codes"])
+        self.assertTrue(by_symbol["CCC"]["eligible"])
+        self.assertEqual(by_symbol["CCC"]["filter_codes"], [])
+        self.assertFalse(by_symbol["CCC"]["buy_condition_passed"])
+        self.assertIn("buy_conditions", by_symbol["CCC"]["buy_condition_codes"])
+        self.assertIn("进入候选名单", next(
+            item["message"] for item in logs if item["symbol"] == "CCC"
+        ))
+        self.assertIn("未进入买入名单", next(
+            item["message"] for item in logs if item["symbol"] == "CCC"
+        ))
 
     def test_linear_rank_allocation_gives_first_place_the_largest_weight(self) -> None:
         _strategy, _context, logs, intents = self._select_with_scores(

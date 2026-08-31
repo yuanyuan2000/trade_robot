@@ -12,6 +12,7 @@ from config import (
 )
 from database import backtest_repository, realtime_repository
 from services.backtest.code_strategies import get_code_strategy
+from services.backtest.errors import BacktestValidationError
 from services.backtest.market_calendar import ensure_market_sessions
 from services.backtest.validation import validate_strategy_payload
 from services.realtime_decision_service import RealtimeDecisionEvaluator
@@ -51,6 +52,22 @@ def _events_for_strategy(strategy: dict) -> list[str]:
         strategy_type = get_code_strategy(strategy["code_key"])
         events.update(strategy_type.required_events(definition.get("params", {})))
     return sorted(events, key=_event_order)
+
+
+def validate_realtime_code_version(strategy: dict) -> None:
+    """Fail at task launch when its saved code implementation is unavailable."""
+    if strategy.get("design_mode") != "code":
+        return
+    strategy_type = get_code_strategy(strategy["code_key"])
+    saved_version = strategy.get("code_version")
+    if saved_version in {None, strategy_type.version}:
+        return
+    raise BacktestValidationError(
+        f"实时任务保存的策略版本为 {saved_version}，当前可运行版本为 "
+        f"{strategy_type.version}，系统未保留原版本实现，不能按原版本运行。"
+        "请先在历史回测模块重新保存该策略参数；若本任务未自动跟随源策略，"
+        "请再启用“自动跟随源策略”并保存任务，然后重新点击运行。"
+    )
 
 
 def _validate_local_history(strategy: dict) -> None:
@@ -178,6 +195,9 @@ class RealtimeTaskManager:
     def start(self, task_id: int, *, recovering: bool = False) -> dict:
         task = self._sync_followed_strategy(realtime_repository.get_task(task_id))
         strategy = validate_strategy_payload(task["strategy_snapshot"])
+        # This must run before history repair, run creation or event scheduling
+        # so clicking Run reports an unavailable saved implementation at once.
+        validate_realtime_code_version(strategy)
         _validate_local_history(strategy)
         events = _events_for_strategy(strategy)
         if not events:

@@ -92,6 +92,7 @@ let marketDetailReturnContext = null;
 let visibleMarketRefreshInFlight = false;
 let marketOverviewManualRefreshRunning = false;
 const overviewIndicatorStorageKey = "trade-overview-indicator-columns";
+const analysisOverviewLastTypeStorageKey = "trade-analysis-overview-last-refresh-type";
 const visibleMarketDatabaseRefreshMs = 60_000;
 
 function applyOverviewAutoRefreshState(enabled) {
@@ -579,26 +580,42 @@ function monitorAnalysisOverviewRefresh() {
 function analysisProgressText(state) {
   const total = Number(state.total || 0);
   const completed = Number(state.completed || 0);
+  const checked = Number(state.checked || 0);
   const workers = Number(state.parallel_workers || 0);
   const remaining = Number(state.remaining || 0);
-  const parallel = workers > 1
-    ? `，${workers} 个进程并行计算，剩余 ${remaining} 个`
-    : "";
-  const current = state.current_symbol ? `，正在分析 ${state.current_symbol}` : "";
+  const currentSymbol = state.current_symbol ? String(state.current_symbol) : "";
   const analysisName = state.analysis_type === "key_zone" ? "关键区域" : "直线趋势线";
-  return `${analysisName}分析需要一些时间：已完成 ${completed}/${total}${parallel}${current}`;
+  if (state.phase === "checking_cache") {
+    const current = currentSymbol ? `，正在检查 ${currentSymbol}` : "";
+    return `${analysisName}：正在逐个检查数据指纹与缓存 ${checked}/${total}${current}`;
+  }
+  if (workers > 1) {
+    return `${analysisName}：${workers} 个进程并行计算，已完成 ${completed}/${total}，剩余 ${remaining} 个`;
+  }
+  if (workers === 1) {
+    return `${analysisName}：单任务串行计算，已完成 ${completed}/${total}，剩余 ${remaining} 个`;
+  }
+  return `${analysisName}：缓存检查完成，无需重新计算。`;
 }
 
 function analysisCompletionText(state) {
   const failed = Number(state.last_result?.failed || 0);
+  const calculated = Number(state.last_result?.calculated || 0);
+  const cacheHits = Number(state.last_result?.cache_hits || 0);
   const analysisName = state.analysis_type === "key_zone" ? "关键区域" : "直线趋势线";
   return failed
     ? `${analysisName}更新完成，${failed} 个标的分析失败。`
-    : `${analysisName}更新完成。`;
+    : `${analysisName}更新完成：重新计算 ${calculated} 个，复用缓存 ${cacheHits} 个。`;
 }
 
 function renderAnalysisProgress(state) {
   lastAnalysisRefreshState = state || {};
+  if (["trendline", "key_zone"].includes(state.analysis_type)) {
+    window.localStorage.setItem(
+      analysisOverviewLastTypeStorageKey,
+      state.analysis_type,
+    );
+  }
   if (currentWorkspaceMode !== "analysis") {
     analysisOverviewProgress.hidden = true;
     return;
@@ -612,6 +629,19 @@ function renderAnalysisProgress(state) {
   analysisOverviewProgress.innerHTML = running
     ? `<span class="analysis-progress-spinner" aria-hidden="true"></span><span>${escapeHtml(analysisProgressText(state))}</span>`
     : `<span>${escapeHtml(hasError ? state.last_error : analysisCompletionText(state))}</span>`;
+}
+
+function preferLastBatchAnalysisForDetail() {
+  const lastType = ["trendline", "key_zone"].includes(
+    lastAnalysisRefreshState.analysis_type,
+  )
+    ? lastAnalysisRefreshState.analysis_type
+    : window.localStorage.getItem(analysisOverviewLastTypeStorageKey);
+  if (lastType === "key_zone") {
+    analysisAlgorithm.value = "key_zones";
+  } else if (lastType === "trendline") {
+    analysisAlgorithm.value = "trendlines";
+  }
 }
 
 async function syncMarketOverviewDaily() {
@@ -2425,6 +2455,9 @@ overviewTable.addEventListener("click", (event) => {
   const row = event.target.closest("tr[data-symbol]");
   if (!row) {
     return;
+  }
+  if (currentWorkspaceMode === "analysis") {
+    preferLastBatchAnalysisForDetail();
   }
   loadMarketData(row.dataset.symbol);
 });

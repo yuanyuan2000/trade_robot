@@ -151,6 +151,48 @@ class RealtimeDashboardTests(unittest.TestCase):
         ranked = [row for row in available if row["rank"] is not None]
         self.assertEqual([row["rank"] for row in sorted(ranked, key=lambda row: row["rank"])], list(range(1, len(ranked) + 1)))
 
+    def test_sevenstar_dashboard_uses_production_universe_order_for_score_ties(self) -> None:
+        strategy = next(
+            item for item in backtest_repository.list_strategies()
+            if item.get("code_key") == "sevenstar_etf_rotation"
+        )
+        strategy["definition"] = {
+            **strategy["definition"],
+            "symbols": [
+                {"symbol": "GLD", "max_weight": 100, "leverage_multiplier": 1},
+                {"symbol": "SPY", "max_weight": 100, "leverage_multiplier": 1},
+            ],
+        }
+        task = realtime_repository.create_task(
+            name="Sevenstar tie order",
+            strategy=strategy,
+            follow_strategy=False,
+            settings=strategy["default_settings"],
+            notification_settings={"enabled": False},
+            portfolio_state={"cash": 100000, "positions": {}},
+            panel_settings=generate_panel_settings(strategy),
+        )
+        observed = {
+            "eligible": True,
+            "reasons": [],
+            "score": 1.0,
+            "metrics": {"score": 1.0},
+            "details": {},
+        }
+
+        with patch(
+            "services.realtime_dashboard_service._code_row",
+            return_value=observed,
+        ):
+            payload = build_realtime_dashboard(task["id"], force=True)
+
+        ranked = sorted(
+            (row for row in payload["rows"] if row["rank"] is not None),
+            key=lambda row: row["rank"],
+        )
+        self.assertEqual([row["symbol"] for row in ranked], ["GLD", "SPY"])
+        self.assertTrue(ranked[0]["selected_for_target"])
+
     def test_atr_and_wtme_dashboard_components_match_score_formulas(self) -> None:
         strategies = {
             item.get("code_key"): item for item in backtest_repository.list_strategies()
@@ -191,6 +233,54 @@ class RealtimeDashboardTests(unittest.TestCase):
                     / (row["metrics"]["weighted_true_range"] + epsilon),
                     places=10,
                 )
+
+    def test_wtme_dashboard_keeps_buy_condition_failures_in_candidate_list(self) -> None:
+        strategy = next(
+            item for item in backtest_repository.list_strategies()
+            if item.get("code_key") == "rapid_drop_wtme_rotation"
+        )
+        strategy["definition"] = {
+            **strategy["definition"],
+            "symbols": [
+                {"symbol": "SPY", "max_weight": 100, "leverage_multiplier": 1},
+                {"symbol": "GLD", "max_weight": 100, "leverage_multiplier": 1},
+            ],
+            "params": {
+                **strategy["definition"]["params"],
+                "buy_top_n": 1,
+                "buy_score_threshold": 9999,
+            },
+        }
+        task = realtime_repository.create_task(
+            name="WTME candidate versus buy list",
+            strategy=strategy,
+            follow_strategy=False,
+            settings=strategy["default_settings"],
+            notification_settings={"enabled": False},
+            portfolio_state={"cash": 100000, "positions": {}},
+            panel_settings=generate_panel_settings(strategy),
+        )
+
+        payload = build_realtime_dashboard(task["id"], force=True)
+        ranked = sorted(
+            (
+                row for row in payload["rows"]
+                if row["is_candidate"] and row["rank"] is not None
+            ),
+            key=lambda row: row["rank"],
+        )
+
+        self.assertEqual(len(ranked), 2)
+        self.assertTrue(ranked[0]["eligible"])
+        self.assertTrue(ranked[0]["selected_for_target"])
+        self.assertTrue(ranked[0]["details"]["buy_condition_passed"])
+        self.assertTrue(ranked[1]["eligible"])
+        self.assertEqual(ranked[1]["status"], "通过")
+        self.assertFalse(ranked[1]["selected_for_target"])
+        self.assertFalse(ranked[1]["details"]["buy_condition_passed"])
+        self.assertEqual(ranked[1]["details"]["filter_codes"], [])
+        self.assertIn("未进入买入名单", ranked[1]["reason"])
+        self.assertNotIn("已过滤", ranked[1]["reason"])
 
     def test_visual_panel_script_is_generated_for_all_selection_modes(self) -> None:
         strategies = backtest_repository.list_strategies()
@@ -389,6 +479,8 @@ class RealtimeDashboardTests(unittest.TestCase):
         script = (Path(__file__).parents[1] / "static" / "js" / "realtime.js").read_text(encoding="utf-8")
         self.assertNotIn("任务快照候选池 · 每 60 秒轮询内部数据", script)
         self.assertIn('`已过滤 ${summary.filtered ?? 0}`', script)
+        self.assertNotIn('<small class="realtime-reason">', script)
+        self.assertIn('title="${rtEscape(row.reason', script)
         self.assertIn('market-overview-auto-refresh-changed', script)
         self.assertIn('data-rt-open-symbol', script)
         self.assertIn('returnContext: "realtime-dashboard"', script)
