@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260829-04') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260901-01') }}">
   </head>
   <body class="theme-dark">
     <aside class="sidebar">
@@ -420,7 +420,7 @@
           <header class="page-header">
             <div>
               <h2>回测结果</h2>
-              <p>查看所有策略的历次运行并清理详细日志</p>
+              <p>查看所有策略的历次运行，或彻底删除不再需要的回测数据</p>
             </div>
             <button id="backtest-results-back" type="button">返回策略</button>
           </header>
@@ -429,6 +429,12 @@
             <div class="panel-title">
               <h3>历次回测</h3>
               <div class="backtest-header-actions">
+                <select id="backtest-results-page-size" aria-label="每页显示数量">
+                  <option value="20">20条</option>
+                  <option value="50">50条</option>
+                  <option value="100">100条</option>
+                  <option value="200">200条</option>
+                </select>
                 <span id="backtest-results-count">0 条</span>
                 <button id="backtest-delete-runs" class="danger-action" type="button" disabled>删除</button>
               </div>
@@ -633,6 +639,7 @@
                   <button type="button" data-legend-mode="all">全部显示</button>
                   <button type="button" data-legend-mode="strategy">仅策略</button>
                   <button type="button" data-legend-mode="core">策略 + 等权</button>
+                  <button id="backtest-analysis-leverage" type="button" aria-pressed="false" title="以整体杠杆 × 单标的杠杆 × 特殊杠杆计算各基准的期初买入持有曲线">杠杆</button>
                 </div>
               </div>
               <div id="backtest-analysis-legend" class="backtest-analysis-legend"></div>
@@ -868,8 +875,8 @@ price &lt; close(1) - 2 * atr(14)</pre></section>
 
     <script src="{{ url_for('static', filename='js/chart.js', v='20260829-02') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260730-02') }}"></script>
-    <script src="{{ url_for('static', filename='js/backtest.js', v='20260829-01') }}"></script>
-    <script src="{{ url_for('static', filename='js/backtest_analysis.js', v='20260829-05') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest.js', v='20260901-02') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest_analysis.js', v='20260902-01') }}"></script>
     <script src="{{ url_for('static', filename='js/realtime.js', v='20260831-01') }}"></script>
     <script src="{{ url_for('static', filename='js/app.js', v='20260829-02') }}"></script>
   </body>

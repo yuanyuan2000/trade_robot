@@ -20,6 +20,7 @@ from services.market_context import (
     calendar_contract,
     normalize_market_config,
     strategy_daily_series,
+    uses_previous_close_for_historical_intraday,
 )
 from services.indicator_service import (
     WTME_DEFAULT_EPSILON,
@@ -1087,6 +1088,13 @@ def load_historical_dataset(
     intraday_join_dates: dict[str, str] = {}
     if exact_events:
         for symbol in universe:
+            if uses_previous_close_for_historical_intraday(symbol, market_config):
+                minute_history_metadata[symbol] = {
+                    "minute_history_start_date": None,
+                    "minute_history_start_source": "previous_session_close_fallback",
+                    "minute_history_start_verified": True,
+                }
+                continue
             sync_state = intraday_repository.get_sync_state(symbol)
             minute_history_metadata[symbol] = {
                 "minute_history_start_date": sync_state.get(
@@ -1163,6 +1171,7 @@ def load_historical_dataset(
     intraday_event_minutes: dict[str, dict[str, dict]] = {}
     cumulative_volumes: dict[str, dict[str, float]] = {}
     delayed_intraday_events: dict[str, list[dict]] = {}
+    intraday_price_fallbacks: dict[str, dict] = {}
     minute_missing: list[dict] = []
     if exact_events:
         for symbol in universe:
@@ -1171,6 +1180,57 @@ def load_historical_dataset(
                 if availability_start.get(symbol)
                 and trading_date >= availability_start[symbol]
             ]
+            if uses_previous_close_for_historical_intraday(symbol, market_config):
+                bars: dict[int, dict] = {}
+                resolutions: dict[str, dict] = {}
+                rows = daily[symbol]
+                for trading_date in eligible_sessions:
+                    previous = next(
+                        (
+                            row for row in reversed(rows)
+                            if str(row["date"]) < trading_date
+                            and bool(row.get("is_complete", True))
+                        ),
+                        None,
+                    )
+                    if previous is None:
+                        minute_missing.append({
+                            "symbol": symbol,
+                            "type": "minute_previous_close_fallback",
+                            "missing_date": trading_date,
+                        })
+                        continue
+                    previous_close = float(previous["close"])
+                    session = session_by_date[trading_date]
+                    for event in exact_events:
+                        target = effective_event_minute(session, event)
+                        for minute_value in (target - 1, target):
+                            bars[minute_value] = {
+                                "minute_utc": minute_value,
+                                "open": previous_close,
+                                "high": previous_close,
+                                "low": previous_close,
+                                "close": previous_close,
+                                "volume": 0.0,
+                                "trade_count": 0,
+                                "vwap": previous_close,
+                            }
+                        resolutions[f"{trading_date}|{event}"] = {
+                            "signal_minute": target - 1,
+                            "fill_minute": target,
+                        }
+                        if event in cumulative_volume_events:
+                            cumulative_volumes.setdefault(symbol, {})[
+                                f"{trading_date}|{event}"
+                            ] = 0.0
+                minute[symbol] = bars
+                intraday_event_minutes[symbol] = resolutions
+                intraday_price_fallbacks[symbol] = {
+                    "mode": "previous_session_close",
+                    "reason": "US10Y has no Alpaca minute history",
+                    "events": list(exact_events),
+                }
+                continue
             required_minutes = sorted(
                 {
                     minute_value
@@ -1355,6 +1415,7 @@ def load_historical_dataset(
             "daily_eligible_start_date": daily_availability_start.get(symbol),
             **minute_history_metadata.get(symbol, {}),
             "intraday_join_date": intraday_join_dates.get(symbol),
+            "intraday_price_fallback": intraday_price_fallbacks.get(symbol),
             # Compatibility alias for older exported manifests.
             "history_start_date": (
                 relevant_daily[0]["date"] if relevant_daily else None
@@ -1402,6 +1463,7 @@ def load_historical_dataset(
         "cumulative_volume_events": sorted(cumulative_volume_events),
         "early_close_event_offsets": early_close_offsets,
         "delayed_intraday_events": delayed_intraday_events,
+        "intraday_price_fallbacks": intraday_price_fallbacks,
         "minimum_lookback": minimum_lookback,
         "timezone": market_config["timezone"],
         "early_close_sessions": [

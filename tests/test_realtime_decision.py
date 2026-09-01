@@ -75,6 +75,39 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
         self.assertEqual(row["fill_price"], 103.5)
         self.assertEqual(row["daily"]["close"], 103)
 
+    def test_us10y_uses_yahoo_current_price_without_alpaca_minutes(self) -> None:
+        hub = IEXMarketDataHub()
+        with (
+            patch(
+                "services.realtime_market_data.repository.resolve_symbol_alias",
+                return_value={"yahoo_symbol": "^TNX"},
+            ),
+            patch(
+                "services.realtime_market_data.fetch_latest_chart_prices_batch",
+                return_value={
+                    "^TNX": {
+                        "price": 4.321,
+                        "market_time": 1788271200,
+                    }
+                },
+            ),
+            patch(
+                "services.realtime_market_data.fetch_stock_bars",
+                side_effect=AssertionError("US10Y must not be sent to Alpaca"),
+            ),
+        ):
+            snapshot = hub.event_snapshot(
+                ["US10Y"],
+                trading_date="2026-09-01",
+                event="10:00",
+            )
+
+        row = snapshot["symbols"]["US10Y"]
+        self.assertEqual(row["signal_price"], 4.321)
+        self.assertEqual(row["fill_price"], 4.321)
+        self.assertEqual(row["source"], "yahoo_current_price")
+        self.assertEqual(row["price_fallback"], "current_price_without_alpaca_minutes")
+
     def test_close_does_not_substitute_last_minute_for_daily_close(self) -> None:
         hub = IEXMarketDataHub()
 

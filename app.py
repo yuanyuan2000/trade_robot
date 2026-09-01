@@ -68,6 +68,7 @@ from services.backtest.service import (
     create_default_strategy,
     create_strategy as create_backtest_strategy_service,
     duplicate_strategy,
+    list_run_overviews,
     repair_saved_strategy_data,
     run_manager as backtest_run_manager,
     update_strategy as update_backtest_strategy_service,
@@ -1633,7 +1634,7 @@ def list_all_backtest_runs():
         strategy_id = request.args.get("strategy_id")
         return jsonify({
             "ok": True,
-            **backtest_repository.list_runs_overview(
+            **list_run_overviews(
                 page=int(request.args.get("page", "1")),
                 page_size=int(request.args.get("page_size", "25")),
                 strategy_id=int(strategy_id) if strategy_id else None,

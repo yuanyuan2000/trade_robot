@@ -5,6 +5,7 @@ import threading
 from zoneinfo import ZoneInfo
 
 from config import ALPACA_API_KEY, ALPACA_SECRET
+from database import repository
 from services.alpaca_data_client import (
     fetch_crypto_bars_page,
     fetch_latest_stock_bars,
@@ -14,6 +15,8 @@ from services.market_data_request_coordinator import (
     PRIORITY_FORMAL_DECISION,
     market_data_request_coordinator,
 )
+from services.market_context import uses_previous_close_for_historical_intraday
+from services.yahoo_finance_client import fetch_latest_chart_prices_batch
 
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -136,6 +139,46 @@ class IEXMarketDataHub:
         missing: list[str] = []
         for symbol in sorted({str(item).strip().upper() for item in symbols}):
             is_crypto = "/" in symbol
+            if uses_previous_close_for_historical_intraday(symbol, "US_EQUITY"):
+                try:
+                    alias = repository.resolve_symbol_alias(symbol)
+                    provider_symbol = alias.get("yahoo_symbol")
+                    quotes = fetch_latest_chart_prices_batch([provider_symbol])
+                    quote = quotes.get(provider_symbol)
+                    if not quote:
+                        raise RuntimeError("Yahoo Finance did not return a current price")
+                    current_price = float(quote["price"])
+                    market_time = quote.get("market_time")
+                    signal_time = (
+                        datetime.fromtimestamp(float(market_time), tz=UTC)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                        if isinstance(market_time, (int, float))
+                        else str(market_time or now.isoformat().replace("+00:00", "Z"))
+                    )
+                    result[symbol] = {
+                        "signal_price": current_price,
+                        "fill_price": None if event == "CLOSE" else current_price,
+                        "signal_time": signal_time,
+                        "fill_time": None if event == "CLOSE" else signal_time,
+                        "latest_minute": None,
+                        "daily": {
+                            "open": current_price,
+                            "high": current_price,
+                            "low": current_price,
+                            "close": current_price,
+                            "volume": 0.0,
+                        },
+                        "daily_is_complete": False,
+                        "cumulative_volume": 0.0 if include_cumulative_volume else None,
+                        "source": "yahoo_current_price",
+                        "feed": "yahoo",
+                        "requested_at": now.isoformat().replace("+00:00", "Z"),
+                        "price_fallback": "current_price_without_alpaca_minutes",
+                    }
+                except Exception as exc:
+                    missing.append(f"{symbol}: current-price fallback failed: {exc}")
+                continue
             try:
                 def fetch_event_pages() -> dict:
                     if is_crypto:

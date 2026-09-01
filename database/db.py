@@ -55,6 +55,18 @@ def migrate_database(conn: sqlite3.Connection) -> None:
         ON backtest_runs(deleted_at, created_at DESC)
         """
     )
+    # Older versions only hid deleted runs and retained their compact summary
+    # and trades. Finish those already-requested deletions during migration.
+    for table in ("backtest_logs", "backtest_equity_points", "backtest_trades"):
+        conn.execute(
+            f"""
+            DELETE FROM {table}
+            WHERE run_id IN (
+                SELECT id FROM backtest_runs WHERE deleted_at IS NOT NULL
+            )
+            """
+        )
+    conn.execute("DELETE FROM backtest_runs WHERE deleted_at IS NOT NULL")
     conn.execute(
         """
         UPDATE backtest_runs

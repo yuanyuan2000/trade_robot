@@ -313,7 +313,23 @@ def ensure_shipped_strategy_presets() -> None:
                 "rapid-drop-wtme-multiply-configured-leverage-v1.7.0",
                 code_key="rapid_drop_wtme_rotation",
                 from_versions=("1.6.0",),
+                to_version="1.7.0",
+            )
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "rapid-drop-wtme-upside-sell-protection-v1.8.0",
+                code_key="rapid_drop_wtme_rotation",
+                from_versions=("1.7.0",),
+                to_version="1.8.0",
+                parameter_defaults={"enable_upside_sell_protection": False},
+            )
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "rapid-drop-wtme-max-simultaneous-holdings-v1.9.0",
+                code_key="rapid_drop_wtme_rotation",
+                from_versions=("1.8.0",),
                 to_version=payload["code_version"],
+                parameter_defaults={"max_simultaneous_holdings": 1},
             )
         backtest_repository.upgrade_seeded_strategy_settings_once(
             seed_key,

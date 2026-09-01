@@ -6,7 +6,9 @@ from unittest.mock import patch
 from services.market_context import (
     annotate_us_market_sessions,
     filter_rows_for_market,
+    is_cash_placeholder_symbol,
     normalize_market_config,
+    uses_previous_close_for_historical_intraday,
 )
 
 
@@ -51,6 +53,17 @@ class MarketContextTests(unittest.TestCase):
 
         self.assertEqual(market["calendar"], "XNYS")
         self.assertEqual(market["timezone"], "America/New_York")
+
+    def test_usdindex_and_us10y_are_us_cash_placeholders(self) -> None:
+        self.assertTrue(is_cash_placeholder_symbol("USDIndex", "US_EQUITY"))
+        self.assertTrue(is_cash_placeholder_symbol("us10y", {"type": "US_EQUITY"}))
+        self.assertFalse(is_cash_placeholder_symbol("SPY", "US_EQUITY"))
+        self.assertTrue(
+            uses_previous_close_for_historical_intraday("US10Y", "US_EQUITY")
+        )
+        self.assertFalse(
+            uses_previous_close_for_historical_intraday("USDINDEX", "US_EQUITY")
+        )
 
 
 if __name__ == "__main__":

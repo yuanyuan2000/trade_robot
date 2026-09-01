@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
+import math
 import threading
 import time
 
@@ -30,6 +31,107 @@ from services.backtest.validation import (
 
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def _overview_number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _overview_max_buy_count(strategy_snapshot: dict) -> int | None:
+    mode = strategy_snapshot.get("selection_mode")
+    definition = strategy_snapshot.get("definition") or {}
+    if not isinstance(definition, dict):
+        return None
+    symbols = definition.get("symbols") or []
+    if not isinstance(symbols, list):
+        return None
+    symbol_count = sum(
+        1
+        for item in symbols
+        if isinstance(item, dict) and item.get("symbol")
+    )
+    if strategy_snapshot.get("design_mode") == "visual":
+        if mode == "single":
+            return 1
+        if mode == "distribution":
+            return symbol_count or None
+        if mode == "competition":
+            return 1
+        return None
+    if strategy_snapshot.get("design_mode") != "code":
+        return None
+    try:
+        strategy_type = get_code_strategy(str(strategy_snapshot.get("code_key") or ""))
+    except BacktestError:
+        return None
+    return strategy_type.overview_max_buy_count(strategy_snapshot)
+
+
+def _overview_leverage_display(strategy_snapshot: dict, settings: dict) -> str:
+    if not isinstance(settings, dict):
+        return "-"
+    leverage = _overview_number(settings.get("leverage_multiplier"))
+    if leverage is None:
+        return "-"
+    suffix = ""
+    if strategy_snapshot.get("design_mode") == "code":
+        try:
+            strategy_type = get_code_strategy(
+                str(strategy_snapshot.get("code_key") or "")
+            )
+        except BacktestError:
+            strategy_type = None
+        if strategy_type is not None:
+            suffix = strategy_type.overview_leverage_suffix(strategy_snapshot)
+    return f"{leverage:g}x{suffix}"
+
+
+def list_run_overviews(
+    *,
+    page: int = 1,
+    page_size: int = 25,
+    strategy_id: int | None = None,
+    status: str | None = None,
+) -> dict:
+    """Build compact rows exclusively from each run's immutable snapshot."""
+    result = backtest_repository.list_runs_overview(
+        page=page,
+        page_size=page_size,
+        strategy_id=strategy_id,
+        status=status,
+        include_snapshot=True,
+    )
+    for item in result["items"]:
+        snapshot = item.pop("strategy_snapshot", None) or {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        definition = snapshot.get("definition") or {}
+        if not isinstance(definition, dict):
+            definition = {}
+        raw_symbols = definition.get("symbols") or []
+        if not isinstance(raw_symbols, list):
+            raw_symbols = []
+        item["symbol_leverages"] = [
+            {
+                "symbol": symbol["symbol"],
+                "leverage_multiplier": _overview_number(
+                    symbol.get("leverage_multiplier")
+                ),
+            }
+            for symbol in raw_symbols
+            if isinstance(symbol, dict) and symbol.get("symbol")
+        ]
+        item["max_buy_count"] = _overview_max_buy_count(snapshot)
+        item["leverage_display"] = _overview_leverage_display(
+            snapshot, item.get("settings") or {}
+        )
+    return result
 
 
 def _validate_code_configuration(strategy: dict) -> dict:

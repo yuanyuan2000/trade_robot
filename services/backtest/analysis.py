@@ -67,6 +67,58 @@ def _symbols(snapshot: dict) -> list[str]:
     ]
 
 
+def _positive_leverage(value: object, default: float = 1.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) and number > 0 else default
+
+
+def _benchmark_leverage_assumptions(snapshot: dict) -> dict:
+    run = snapshot.get("run", {})
+    strategy = run.get("strategy_snapshot", {})
+    definition = strategy.get("definition", {})
+    overall = _positive_leverage(run.get("settings", {}).get("leverage_multiplier"))
+    symbol_multipliers = {
+        str(item.get("symbol") or "").strip().upper(): _positive_leverage(
+            item.get("leverage_multiplier")
+        )
+        for item in definition.get("symbols", [])
+        if str(item.get("symbol") or "").strip()
+    }
+    params = definition.get("params") or {}
+    dynamic_special = (
+        strategy.get("design_mode") == "code"
+        and params.get("allocation_mode")
+        in {"leveraged_equal", "leveraged_linear_rank"}
+    )
+    # There is currently no fixed special multiplier in shipped strategies.
+    # Dynamic special leverage deliberately stays at one for this hypothetical
+    # buy-and-hold comparison, as it cannot be known at the interval start.
+    special = 1.0
+    return {
+        "overall_multiplier": overall,
+        "symbol_multipliers": symbol_multipliers,
+        "special_multiplier": special,
+        "dynamic_special_assumed_one": dynamic_special,
+        "final_multipliers": {
+            symbol: overall * multiplier * special
+            for symbol, multiplier in symbol_multipliers.items()
+        },
+    }
+
+
+def _leveraged_points(points: list[dict], multiplier: float) -> list[dict]:
+    return [
+        {
+            **point,
+            "return_rate": float(point["return_rate"]) * multiplier,
+        }
+        for point in points
+    ]
+
+
 def build_analysis_meta(snapshot: dict) -> dict:
     run = snapshot["run"]
     first_date, latest_date = _snapshot_bounds(snapshot)
@@ -248,12 +300,17 @@ def build_analysis(snapshot: dict, start_date: str, end_date: str) -> dict:
             return deepcopy(cached)
 
     symbols = _symbols(snapshot)
+    leverage = _benchmark_leverage_assumptions(snapshot)
     benchmark = str(run.get("settings", {}).get("benchmark") or "none")
     series = [{"key": "strategy", "label": "策略", "type": "strategy", "points": _strategy_curve(snapshot, range_value)}]
     asset_returns: dict[str, dict[str, float]] = {}
     warnings: list[str] = []
     for symbol in symbols:
         points, returns, warning = _asset_curve(run, symbol, range_value["trading_dates"])
+        final_leverage = leverage["final_multipliers"].get(
+            symbol,
+            leverage["overall_multiplier"],
+        )
         asset_returns[symbol] = returns
         series.append({
             "key": f"asset:{symbol}",
@@ -265,20 +322,35 @@ def build_analysis(snapshot: dict, start_date: str, end_date: str) -> dict:
                 or (benchmark.lower() == "auto" and len(symbols) == 1)
             ),
             "points": points,
+            "leveraged_points": _leveraged_points(points, final_leverage),
+            "leverage_multiplier": final_leverage,
         })
         if warning:
             warnings.append(warning)
 
     if len(symbols) > 1:
         equal_points = []
+        leveraged_equal_points = []
         last_values = {symbol: 0.0 for symbol in symbols}
+        leveraged_last_values = {symbol: 0.0 for symbol in symbols}
         for trading_date in range_value["trading_dates"]:
             for symbol in symbols:
                 if trading_date in asset_returns[symbol]:
                     last_values[symbol] = asset_returns[symbol][trading_date]
+                    leveraged_last_values[symbol] = (
+                        asset_returns[symbol][trading_date]
+                        * leverage["final_multipliers"].get(
+                            symbol,
+                            leverage["overall_multiplier"],
+                        )
+                    )
             equal_points.append({
                 "trading_date": trading_date,
                 "return_rate": sum(last_values.values()) / len(symbols),
+            })
+            leveraged_equal_points.append({
+                "trading_date": trading_date,
+                "return_rate": sum(leveraged_last_values.values()) / len(symbols),
             })
         series.append({
             "key": "pool:equal",
@@ -286,11 +358,14 @@ def build_analysis(snapshot: dict, start_date: str, end_date: str) -> dict:
             "type": "equal_weight",
             "configured_benchmark": benchmark.lower() == "auto",
             "points": equal_points,
+            "leveraged_points": leveraged_equal_points,
+            "leverage_mode": "per_asset",
         })
 
     normalized_benchmark = benchmark.upper()
     if benchmark.lower() not in {"none", "auto"} and normalized_benchmark not in symbols:
         points, _returns, warning = _asset_curve(run, normalized_benchmark, range_value["trading_dates"])
+        final_leverage = leverage["overall_multiplier"]
         series.append({
             "key": f"benchmark:{normalized_benchmark}",
             "label": f"{normalized_benchmark}（配置基准）",
@@ -298,6 +373,8 @@ def build_analysis(snapshot: dict, start_date: str, end_date: str) -> dict:
             "symbol": normalized_benchmark,
             "configured_benchmark": True,
             "points": points,
+            "leveraged_points": _leveraged_points(points, final_leverage),
+            "leverage_multiplier": final_leverage,
         })
         if warning:
             warnings.append(warning)
@@ -306,6 +383,7 @@ def build_analysis(snapshot: dict, start_date: str, end_date: str) -> dict:
         "range": range_value,
         "series": series,
         "metrics": _interval_metrics(snapshot, range_value),
+        "benchmark_leverage": leverage,
         "warnings": list(dict.fromkeys(warnings)),
     }
     with _cache_lock:

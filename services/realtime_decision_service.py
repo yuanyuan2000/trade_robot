@@ -92,8 +92,16 @@ def _current_daily_row(symbol: str, payload: dict) -> dict:
         "low": float(source.get("low", payload["signal_price"])),
         "close": float(source.get("close", payload["signal_price"])),
         "volume": float(source.get("volume") or 0),
-        "source_provider": "alpaca_crypto" if "/" in symbol else "alpaca",
-        "source_timeframe": "1Day" if daily_is_complete_bar else "1Min",
+        "source_provider": payload.get("source") or (
+            "alpaca_crypto" if "/" in symbol else "alpaca"
+        ),
+        "source_timeframe": (
+            "1Day"
+            if daily_is_complete_bar
+            else "CurrentPrice"
+            if payload.get("price_fallback") == "current_price_without_alpaca_minutes"
+            else "1Min"
+        ),
         "price_basis": "raw",
         "is_complete": 0 if payload.get("event") not in {"CLOSE"} else 1,
     }

@@ -148,6 +148,20 @@ class CodeStrategy:
     def observation_target_count(self) -> int:
         return 1
 
+    @classmethod
+    def overview_max_buy_count(cls, strategy_snapshot: dict) -> int | None:
+        """Return the historical run's maximum simultaneous target count.
+
+        Code strategies must opt in explicitly so adding a new strategy cannot
+        silently show a misleading generic value in the run overview.
+        """
+        return None
+
+    @classmethod
+    def overview_leverage_suffix(cls, strategy_snapshot: dict) -> str:
+        """Return text appended to the run's stored overall leverage."""
+        return ""
+
     def describe_run(self, definition: dict) -> str:
         """Return the immutable one-line strategy description stored with a run."""
         values = []
@@ -410,6 +424,21 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
 
     def observation_target_count(self) -> int:
         return int(self.params["holdings_num"])
+
+    @classmethod
+    def overview_max_buy_count(cls, strategy_snapshot: dict) -> int | None:
+        definition = strategy_snapshot.get("definition") or {}
+        if not isinstance(definition, dict):
+            return None
+        params = definition.get("params") or {}
+        if not isinstance(params, dict):
+            return None
+        value = params.get("holdings_num")
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return count if count > 0 else None
 
     def on_event(self, context) -> list[OrderIntent]:
         trading_date = context.trading_date
@@ -690,7 +719,7 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
 
 class RapidDropWtmeRotationStrategy(CodeStrategy):
     key = "rapid_drop_wtme_rotation"
-    version = "1.7.0"
+    version = "1.9.0"
     name = "急跌回避与 WTME 动量轮动"
     description = (
         "先按百分比单日急跌规则过滤标的，再以指定时点价格构造"
@@ -754,6 +783,19 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             "step": 0.1,
             "help": "评分严格大于 x 即通过条件 2；默认 9999，使正常 WTME 评分无法仅靠条件 2 入选。",
         },
+        "max_simultaneous_holdings": {
+            "label": "最多同时持仓个数",
+            "type": "integer",
+            "default": 1,
+            "minimum": 1,
+            "maximum": 100,
+            "step": 1,
+            "unit": "只",
+            "help": (
+                "在满足排名或评分买入条件的标的中按 WTME 排名取前若干只，"
+                "并将上涨保护保留的旧持仓计入上限。"
+            ),
+        },
         "wtme_period": {
             "label": "WTME 窗口 N",
             "type": "integer",
@@ -782,6 +824,15 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             "maximum": 0.01,
             "step": 1e-12,
             "help": "加入加权标准化真实波幅分母，防止零波动时除零。",
+        },
+        "enable_upside_sell_protection": {
+            "label": "启用上涨保护",
+            "type": "boolean",
+            "default": False,
+            "help": (
+                "WTME 轮动原计划卖出已有持仓时，若卖出时点价严格高于上一交易日收盘价，"
+                "则保留该标的；不影响更早执行的急跌风控卖出。"
+            ),
         },
         "enable_percent_drop_filter": RapidDropAtrRotationStrategy.parameter_schema[
             "enable_percent_drop_filter"
@@ -833,6 +884,8 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
         candidates = [item["symbol"] for item in definition.get("symbols", [])]
         if values["buy_top_n"] > len(candidates):
             raise BacktestValidationError("买入条件 1 的前 n 名不能超过候选池标的数量。")
+        if values["max_simultaneous_holdings"] > len(candidates):
+            raise BacktestValidationError("最多同时持仓个数不能超过候选池标的数量。")
         if any(
             float(item.get("max_weight", 100)) + 1e-9 < 100
             for item in definition.get("symbols", [])
@@ -865,7 +918,9 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             f"N={self.params['wtme_period']}, h={self.params['wtme_half_life']:g}, "
             f"epsilon={self.params['wtme_epsilon']:g})；排名前"
             f"{self.params['buy_top_n']}名或评分>{self.params['buy_score_threshold']:g}即入选，"
-            f"{self._allocation_mode_label()}，组合总目标仓位固定为100%"
+            f"最多同时持有{self.params['max_simultaneous_holdings']}只，"
+            f"{self._allocation_mode_label()}，组合总目标仓位固定为100%；"
+            f"上涨保护{'开启' if self.params['enable_upside_sell_protection'] else '关闭'}"
         )
 
     def _allocation_mode_label(self) -> str:
@@ -875,6 +930,53 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             "leveraged_equal": "平均仓位并按实际入选数动态加杠杆",
             "leveraged_linear_rank": "按线性排名权重买入并按实际入选数动态加杠杆",
         }[self.params["allocation_mode"]]
+
+    @classmethod
+    def overview_max_buy_count(cls, strategy_snapshot: dict) -> int | None:
+        definition = strategy_snapshot.get("definition") or {}
+        if not isinstance(definition, dict):
+            return None
+        params = definition.get("params") or {}
+        if not isinstance(params, dict):
+            return None
+        # The overview's “买入数” follows the run snapshot's configured rank
+        # count. Do not substitute the candidate-pool size merely because the
+        # independent score condition can also qualify a symbol.
+        if "max_simultaneous_holdings" in params:
+            try:
+                count = int(params["max_simultaneous_holdings"])
+            except (TypeError, ValueError):
+                return None
+            return count if count > 0 else None
+        if "buy_top_n" in params:
+            try:
+                count = int(params["buy_top_n"])
+            except (TypeError, ValueError):
+                return None
+            return count if count > 0 else None
+        if "holdings_num" in params:
+            try:
+                count = int(params["holdings_num"])
+            except (TypeError, ValueError):
+                return None
+            return count if count > 0 else None
+        if strategy_snapshot.get("code_version") in {"1.0.0", "1.1.0"}:
+            return 1
+        return None
+
+    @classmethod
+    def overview_leverage_suffix(cls, strategy_snapshot: dict) -> str:
+        definition = strategy_snapshot.get("definition") or {}
+        if not isinstance(definition, dict):
+            return ""
+        params = definition.get("params") or {}
+        if not isinstance(params, dict):
+            return ""
+        return (
+            "持仓数"
+            if params.get("allocation_mode") in cls.leveraged_allocation_modes
+            else ""
+        )
 
     def observation_columns(self) -> list[dict]:
         period = int(self.params["wtme_period"])
@@ -1147,7 +1249,11 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             item["eligible"] = not item["filter_codes"]
             if not condition_codes:
                 selected_scores.append((score, symbol))
-        selected = selected_scores
+        max_holdings = int(self.params["max_simultaneous_holdings"])
+        selected = selected_scores[:max_holdings]
+        holdings_cap_excluded = {
+            symbol for _score, symbol in selected_scores[max_holdings:]
+        }
         targets = [symbol for _score, symbol in selected]
         target_set = set(targets)
         target_weights = self._target_weights(selected)
@@ -1173,6 +1279,15 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             item.setdefault("eligible", not item["filter_codes"])
             item["selected_for_target"] = item["symbol"] in target_set
             item["target_weight"] = target_weights.get(item["symbol"])
+            item["max_simultaneous_holdings"] = max_holdings
+            item["excluded_by_max_simultaneous_holdings"] = (
+                item["symbol"] in holdings_cap_excluded
+            )
+            item["max_holdings_buy_blocked"] = False
+            item["upside_sell_protection_enabled"] = bool(
+                self.params["enable_upside_sell_protection"]
+            )
+            item["upside_sell_protection_applied"] = False
             filter_text = (
                 f"，硬性过滤：{'；'.join(item['filter_reasons'])}"
                 if item["filter_reasons"]
@@ -1186,6 +1301,10 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
                     passed_conditions.append("评分条件")
                 selection_text = (
                     f"，进入买入名单（{'、'.join(passed_conditions)}通过）"
+                )
+            elif item["excluded_by_max_simultaneous_holdings"]:
+                selection_text = (
+                    f"，买入条件通过，但受最多同时持仓 {max_holdings} 只限制未进入目标名单"
                 )
             elif item["eligible"] and item["rank"] is not None:
                 selection_text = (
@@ -1246,6 +1365,91 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
                         ),
                     )
                 )
+        protected_symbols: set[str] = set()
+        if self.params["enable_upside_sell_protection"]:
+            protected_intents: list[OrderIntent] = []
+            for intent in intents:
+                if (
+                    intent.action != "SELL"
+                    or intent.symbol in flagged
+                    or context.portfolio.quantity(intent.symbol) <= 0
+                ):
+                    protected_intents.append(intent)
+                    continue
+                evaluation = evaluation_by_symbol[intent.symbol]
+                current_price = float(evaluation["current_price"])
+                previous_close = float(evaluation["previous_close"])
+                if current_price <= previous_close:
+                    protected_intents.append(intent)
+                    continue
+                change = current_price / previous_close - 1
+                evaluation["upside_sell_protection_applied"] = True
+                evaluation["upside_sell_protection_change"] = change
+                protected_symbols.add(intent.symbol)
+                context.log_custom(
+                    "RAPID_DROP_WTME_UPSIDE_SELL_PROTECTION",
+                    (
+                        f"{intent.symbol} 原计划在 {self.params['selection_time']} 卖出，"
+                        f"但卖出时点价 {current_price:.6f} 高于上一交易日收盘价 "
+                        f"{previous_close:.6f}（{change:+.2%}），上涨保护生效，本次不卖出。"
+                    ),
+                    symbol=intent.symbol,
+                    context={
+                        "previous_close": previous_close,
+                        "planned_sell_price": current_price,
+                        "change": change,
+                        "planned_order": intent.__dict__,
+                        "risk_sell_excluded": True,
+                    },
+                    level="INFO",
+                )
+            intents = protected_intents
+        full_sell_symbols = {
+            intent.symbol
+            for intent in intents
+            if (
+                intent.action == "SELL"
+                and intent.sizing_mode == "TARGET"
+                and intent.value_percent <= 0
+            )
+        }
+        remaining_held = held_set - full_sell_symbols
+        available_slots = max(0, max_holdings - len(remaining_held))
+        capped_intents: list[OrderIntent] = []
+        admitted_new_symbols: set[str] = set()
+        for intent in intents:
+            is_new_buy = (
+                intent.action == "BUY"
+                and intent.symbol not in remaining_held
+                and intent.symbol not in admitted_new_symbols
+            )
+            if not is_new_buy:
+                capped_intents.append(intent)
+                continue
+            if available_slots > 0:
+                capped_intents.append(intent)
+                admitted_new_symbols.add(intent.symbol)
+                available_slots -= 1
+                continue
+            evaluation = evaluation_by_symbol[intent.symbol]
+            evaluation["max_holdings_buy_blocked"] = True
+            context.log_custom(
+                "RAPID_DROP_WTME_MAX_HOLDINGS_BLOCK",
+                (
+                    f"{intent.symbol} 已进入 WTME 目标名单，但当前预计保留 "
+                    f"{len(remaining_held)} 只持仓，最多同时持仓 {max_holdings} 只，"
+                    "本次不再新增持仓。"
+                ),
+                symbol=intent.symbol,
+                context={
+                    "max_simultaneous_holdings": max_holdings,
+                    "remaining_held_symbols": sorted(remaining_held),
+                    "upside_protected_symbols": sorted(protected_symbols),
+                    "blocked_order": intent.__dict__,
+                },
+                level="INFO",
+            )
+        intents = capped_intents
         if self.params["allocation_mode"] in self.linear_allocation_modes:
             self.linear_rank_targets = tuple(targets)
         return intents
@@ -1576,6 +1780,21 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
 
     def observation_target_count(self) -> int:
         return int(self.params["holdings_num"])
+
+    @classmethod
+    def overview_max_buy_count(cls, strategy_snapshot: dict) -> int | None:
+        definition = strategy_snapshot.get("definition") or {}
+        if not isinstance(definition, dict):
+            return None
+        params = definition.get("params") or {}
+        if not isinstance(params, dict):
+            return None
+        value = params.get("holdings_num")
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return count if count > 0 else None
 
     def on_event(self, context) -> list[OrderIntent]:
         if (

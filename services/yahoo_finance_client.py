@@ -112,6 +112,68 @@ def fetch_recent_daily_prices_fast(symbol: str, start_date: date) -> list[dict]:
     raise InvalidResponseError(detail="Yahoo Finance chart request failed.")
 
 
+def fetch_hourly_derived_daily_prices(
+    symbol: str,
+    trading_dates: list[str],
+) -> list[dict]:
+    """Rebuild sparse Yahoo daily gaps from its hourly chart series."""
+    rows: list[dict] = []
+    for date_text in sorted(set(trading_dates)):
+        trading_date = date.fromisoformat(date_text)
+        start_at = datetime.combine(trading_date, time.min, tzinfo=timezone.utc)
+        end_at = start_at + timedelta(days=1)
+        payload = _fetch_chart_payload(
+            symbol,
+            {
+                "interval": "60m",
+                "includePrePost": "true",
+                "period1": str(int(start_at.timestamp())),
+                "period2": str(int(end_at.timestamp())),
+            },
+        )
+        try:
+            result = payload["chart"]["result"][0]
+            timestamps = result.get("timestamp") or []
+            quote_values = (result.get("indicators", {}).get("quote") or [{}])[0]
+        except (KeyError, TypeError, IndexError, AttributeError) as exc:
+            raise InvalidResponseError(
+                detail="Yahoo Finance hourly chart payload has an unexpected shape."
+            ) from exc
+        hourly = []
+        for index, timestamp in enumerate(timestamps):
+            try:
+                values = {
+                    key: (quote_values.get(key) or [])[index]
+                    for key in ("open", "high", "low", "close")
+                }
+            except IndexError:
+                continue
+            if None in values.values():
+                continue
+            timestamp_date = datetime.fromtimestamp(
+                timestamp,
+                tz=timezone.utc,
+            ).date()
+            if timestamp_date != trading_date:
+                continue
+            hourly.append(values)
+        if not hourly:
+            continue
+        rows.append({
+            "date": date_text,
+            "open": float(hourly[0]["open"]),
+            "high": max(float(item["high"]) for item in hourly),
+            "low": min(float(item["low"]) for item in hourly),
+            "close": float(hourly[-1]["close"]),
+            "volume": 0.0,
+            "source_provider": "yahoo",
+            "source_timeframe": "60MinDerived",
+            "price_basis": "unknown",
+            "is_complete": True,
+        })
+    return rows
+
+
 def fetch_latest_quotes_batch(symbols: list[str]) -> dict[str, dict]:
     clean_symbols = [symbol for symbol in symbols if symbol]
     if not clean_symbols:

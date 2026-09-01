@@ -112,6 +112,41 @@ class BacktestAnalysisTests(unittest.TestCase):
         self.assertTrue(equal["configured_benchmark"])
         self.assertEqual(equal["points"][0]["return_rate"], 0)
 
+    def test_leveraged_benchmarks_use_overall_and_per_symbol_leverage(self) -> None:
+        dates = _dates("2024-01-01", 2)
+        snapshot = _snapshot(
+            dates=dates,
+            design_mode="code",
+            code_key="rapid_drop_wtme_rotation",
+        )
+        snapshot["run"]["settings"]["leverage_multiplier"] = 2
+        definition = snapshot["run"]["strategy_snapshot"]["definition"]
+        definition["symbols"] = [
+            {"symbol": "AAA", "leverage_multiplier": 3},
+            {"symbol": "BBB", "leverage_multiplier": 2},
+        ]
+        definition["params"] = {"allocation_mode": "leveraged_equal"}
+        rows = [
+            {"date": dates[0], "open": 100, "high": 100, "low": 100, "close": 100, "volume": 1},
+            {"date": dates[1], "open": 110, "high": 110, "low": 110, "close": 110, "volume": 1},
+        ]
+
+        with patch.object(analysis, "_daily_rows", return_value=(rows, None)):
+            payload = analysis.build_analysis(snapshot, dates[0], dates[-1])
+
+        aaa = next(item for item in payload["series"] if item["key"] == "asset:AAA")
+        bbb = next(item for item in payload["series"] if item["key"] == "asset:BBB")
+        equal = next(item for item in payload["series"] if item["key"] == "pool:equal")
+        self.assertAlmostEqual(aaa["points"][-1]["return_rate"], 0.1)
+        self.assertAlmostEqual(aaa["leveraged_points"][-1]["return_rate"], 0.6)
+        self.assertAlmostEqual(bbb["leveraged_points"][-1]["return_rate"], 0.4)
+        self.assertAlmostEqual(equal["leveraged_points"][-1]["return_rate"], 0.5)
+        self.assertEqual(aaa["leverage_multiplier"], 6)
+        self.assertTrue(
+            payload["benchmark_leverage"]["dynamic_special_assumed_one"]
+        )
+        self.assertEqual(payload["benchmark_leverage"]["special_multiplier"], 1)
+
     def test_code_competition_decision_is_sorted_and_uses_compact_formula(self) -> None:
         snapshot = _snapshot(
             design_mode="code",

@@ -1077,6 +1077,76 @@ class StrategyModeTests(unittest.TestCase):
         self.assertAlmostEqual(positions["SPY"]["weight"], 0.5, places=8)
         self.assertAlmostEqual(positions["GLD"]["weight"], 0.5, places=8)
 
+    def test_cash_placeholder_buy_is_kept_as_usd_cash(self) -> None:
+        for symbol in ("USDINDEX", "US10Y"):
+            with self.subTest(symbol=symbol):
+                dataset = HistoricalDataSet(
+                    daily={
+                        symbol: daily_rows(
+                            self.dates,
+                            [100.0] * len(self.dates),
+                        )
+                    },
+                    sessions=self.run_dates,
+                )
+                strategy = visual_strategy(
+                    rule={"condition": "true", "value": 100},
+                    symbols=[{"symbol": symbol, "max_weight": 100}],
+                )
+
+                result = BacktestEngine(
+                    strategy,
+                    settings(self.run_dates[0], self.run_dates[-1]),
+                    dataset=dataset,
+                ).run()
+
+                self.assertEqual(result.trades, [])
+                self.assertTrue(all(point["positions"] == {} for point in result.equity_points))
+                self.assertTrue(all(point["cash"] == 10_000 for point in result.equity_points))
+
+    def test_competition_winner_cash_placeholder_liquidates_old_winner(self) -> None:
+        dataset = HistoricalDataSet(
+            daily={
+                "SPY": daily_rows(self.dates, [10.0] * len(self.dates)),
+                "US10Y": daily_rows(self.dates, [5.0] * 10 + [30.0, 30.0]),
+            },
+            sessions=self.run_dates,
+        )
+        strategy = {
+            "name": "现金占位标的竞争测试",
+            "design_mode": "visual",
+            "selection_mode": "competition",
+            "market": {"type": "US_EQUITY"},
+            "definition": {
+                "symbols": [
+                    {"symbol": "SPY", "max_weight": 100},
+                    {"symbol": "US10Y", "max_weight": 100},
+                ],
+                "rules": [],
+                "competition": {
+                    "eligibility": "true",
+                    "score": "price",
+                    "target_weight": 100,
+                    "cash_when_none": True,
+                    "when": "OPEN",
+                },
+            },
+            "default_settings": {},
+        }
+
+        result = BacktestEngine(
+            strategy,
+            settings(self.run_dates[0], self.run_dates[-1]),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(
+            [(trade["side"], trade["symbol"]) for trade in result.trades],
+            [("BUY", "SPY"), ("SELL", "SPY")],
+        )
+        self.assertEqual(result.equity_points[-1]["positions"], {})
+        self.assertEqual(result.equity_points[-1]["cash"], 10_000)
+
     def test_competition_sells_old_winner_before_buying_new_winner(self) -> None:
         spy_closes = [10.0] * 10 + [30.0, 30.0]
         gld_closes = [20.0] * len(self.dates)

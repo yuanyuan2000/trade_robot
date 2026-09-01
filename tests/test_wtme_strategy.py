@@ -8,7 +8,7 @@ from unittest.mock import patch
 from services.backtest.code_strategies import RapidDropWtmeRotationStrategy
 from services.backtest.data import HistoricalDataSet, _epoch_minute
 from services.backtest.engine import BacktestEngine
-from services.backtest.portfolio import Portfolio
+from services.backtest.portfolio import OrderIntent, Portfolio
 
 
 def business_dates(start: str, count: int) -> list[str]:
@@ -42,9 +42,12 @@ class WtmeStrategyTests(unittest.TestCase):
         scores: dict[str, float],
         *,
         portfolio: Portfolio | None = None,
+        prices: dict[str, float] | None = None,
     ) -> tuple[SimpleNamespace, list[dict]]:
         symbols = list(scores)
-        prices = {symbol: 101.0 + index for index, symbol in enumerate(symbols)}
+        prices = prices or {
+            symbol: 101.0 + index for index, symbol in enumerate(symbols)
+        }
         price_scores = {prices[symbol]: score for symbol, score in scores.items()}
 
         class Dataset:
@@ -104,9 +107,12 @@ class WtmeStrategyTests(unittest.TestCase):
         scores: dict[str, float],
         *,
         portfolio: Portfolio | None = None,
+        prices: dict[str, float] | None = None,
     ):
         strategy = RapidDropWtmeRotationStrategy(params)
-        context, logs = self._selection_context(scores, portfolio=portfolio)
+        context, logs = self._selection_context(
+            scores, portfolio=portfolio, prices=prices
+        )
         type(self)._active_price_scores = context.price_scores
         with patch(
             "services.backtest.code_strategies.calculate_wtme_components",
@@ -121,11 +127,13 @@ class WtmeStrategyTests(unittest.TestCase):
         self.assertEqual(params["allocation_mode"], "equal")
         self.assertEqual(params["buy_top_n"], 1)
         self.assertEqual(params["buy_score_threshold"], 9999)
+        self.assertEqual(params["max_simultaneous_holdings"], 1)
         for retired in RapidDropWtmeRotationStrategy.retired_parameters:
             self.assertNotIn(retired, params)
         self.assertEqual(params["wtme_period"], 40)
         self.assertEqual(params["wtme_half_life"], 15.0)
         self.assertEqual(params["wtme_epsilon"], 1e-8)
+        self.assertFalse(params["enable_upside_sell_protection"])
         self.assertIn("enable_percent_drop_filter", params)
         self.assertNotIn("enable_atr_drop_filter", params)
         self.assertNotIn("drop_threshold_atr", params)
@@ -138,11 +146,169 @@ class WtmeStrategyTests(unittest.TestCase):
             ("09:40", "10:00"),
         )
 
+    @staticmethod
+    def _portfolio_holding(symbol: str) -> Portfolio:
+        portfolio = Portfolio(10_000, allow_fractional_shares=True)
+        portfolio.execute(
+            OrderIntent(symbol, "BUY", "TARGET", 100, "测试期初持仓"),
+            reference_price=100,
+            marks={symbol: 100},
+            max_weight_percent=100,
+            event_time="2024-01-30 10:00",
+        )
+        return portfolio
+
+    def test_upside_protection_suppresses_rotation_sell_for_rising_holding(self) -> None:
+        portfolio = self._portfolio_holding("AAA")
+        _strategy, _context, logs, intents = self._select_with_scores(
+            {
+                "buy_top_n": 1,
+                "enable_upside_sell_protection": True,
+            },
+            {"AAA": 10, "BBB": 20},
+            portfolio=portfolio,
+            prices={"AAA": 105, "BBB": 101},
+        )
+
+        self.assertNotIn(
+            ("SELL", "AAA"),
+            [(intent.action, intent.symbol) for intent in intents],
+        )
+        self.assertEqual(intents, [])
+        protection = next(
+            item for item in logs
+            if item["event_type"] == "RAPID_DROP_WTME_UPSIDE_SELL_PROTECTION"
+        )
+        self.assertEqual(protection["symbol"], "AAA")
+        self.assertAlmostEqual(protection["context"]["change"], 0.05)
+        score_log = next(
+            item for item in logs
+            if item["event_type"] == "RAPID_DROP_WTME_DAILY_SCORE"
+            and item["symbol"] == "AAA"
+        )
+        self.assertTrue(score_log["context"]["upside_sell_protection_applied"])
+        holdings_block = next(
+            item for item in logs
+            if item["event_type"] == "RAPID_DROP_WTME_MAX_HOLDINGS_BLOCK"
+        )
+        self.assertEqual(holdings_block["symbol"], "BBB")
+        self.assertEqual(
+            holdings_block["context"]["upside_protected_symbols"], ["AAA"]
+        )
+
+    def test_upside_protection_does_not_suppress_sell_without_strict_rise(self) -> None:
+        portfolio = self._portfolio_holding("AAA")
+        _strategy, _context, logs, intents = self._select_with_scores(
+            {
+                "buy_top_n": 1,
+                "enable_upside_sell_protection": True,
+            },
+            {"AAA": 10, "BBB": 20},
+            portfolio=portfolio,
+            prices={"AAA": 100, "BBB": 101},
+        )
+
+        self.assertIn(
+            ("SELL", "AAA"),
+            [(intent.action, intent.symbol) for intent in intents],
+        )
+        self.assertFalse(any(
+            item["event_type"] == "RAPID_DROP_WTME_UPSIDE_SELL_PROTECTION"
+            for item in logs
+        ))
+
+    def test_upside_protection_also_suppresses_partial_rotation_reduction(self) -> None:
+        portfolio = self._portfolio_holding("AAA")
+        _strategy, _context, logs, intents = self._select_with_scores(
+            {
+                "buy_top_n": 2,
+                "allocation_mode": "linear_rank",
+                "enable_upside_sell_protection": True,
+                "max_simultaneous_holdings": 2,
+            },
+            {"AAA": 10, "BBB": 20},
+            portfolio=portfolio,
+            prices={"AAA": 105, "BBB": 101},
+        )
+
+        self.assertNotIn(
+            ("SELL", "AAA"),
+            [(intent.action, intent.symbol) for intent in intents],
+        )
+        protection = next(
+            item for item in logs
+            if item["event_type"] == "RAPID_DROP_WTME_UPSIDE_SELL_PROTECTION"
+        )
+        self.assertEqual(protection["context"]["planned_order"]["value_percent"], 100 / 3)
+
+    def test_upside_protection_does_not_block_rapid_drop_risk_sell(self) -> None:
+        strategy = RapidDropWtmeRotationStrategy({
+            "enable_upside_sell_protection": True,
+            "drop_threshold_percent": 5,
+        })
+        context, _logs = self._selection_context(
+            {"AAA": 1},
+            portfolio=self._portfolio_holding("AAA"),
+            prices={"AAA": 90},
+        )
+        context.event = "09:40"
+
+        intents = strategy._risk_check(context)
+
+        self.assertEqual(
+            [(intent.action, intent.symbol) for intent in intents],
+            [("SELL", "AAA")],
+        )
+
+    def test_unleveraged_full_fractional_holding_has_no_capacity_for_second_buy(self) -> None:
+        portfolio = self._portfolio_holding("AAA")
+
+        trade = portfolio.execute(
+            OrderIntent("BBB", "BUY", "TARGET", 100, "测试第二持仓"),
+            reference_price=100,
+            marks={"AAA": 105, "BBB": 100},
+            max_weight_percent=100,
+            event_time="2024-01-31 10:00",
+        )
+
+        self.assertIsNone(trade)
+        self.assertEqual(float(portfolio.cash), 0.0)
+        self.assertEqual(float(portfolio.quantity("BBB")), 0.0)
+
+    def test_leveraged_gain_creates_financing_headroom_without_positive_cash(self) -> None:
+        portfolio = Portfolio(
+            10_000,
+            allow_fractional_shares=True,
+            symbol_leverage_multipliers={"AAA": 3, "BBB": 3},
+        )
+        portfolio.execute(
+            OrderIntent("AAA", "BUY", "TARGET", 100, "测试杠杆期初持仓"),
+            reference_price=100,
+            marks={"AAA": 100, "BBB": 100},
+            max_weight_percent=100,
+            event_time="2024-01-30 10:00",
+        )
+        cash_before = float(portfolio.cash)
+
+        trade = portfolio.execute(
+            OrderIntent("BBB", "BUY", "TARGET", 100, "测试融资空间"),
+            reference_price=100,
+            marks={"AAA": 105, "BBB": 100},
+            max_weight_percent=100,
+            event_time="2024-01-31 10:00",
+        )
+
+        self.assertLess(cash_before, 0)
+        self.assertIsNotNone(trade)
+        self.assertLess(float(portfolio.cash), cash_before)
+        self.assertGreater(float(portfolio.quantity("BBB")), 0)
+
     def test_buy_conditions_use_or_and_equal_allocation_uses_actual_count(self) -> None:
         _strategy, _context, logs, intents = self._select_with_scores(
             {
                 "buy_top_n": 1,
                 "buy_score_threshold": 10,
+                "max_simultaneous_holdings": 2,
             },
             {"AAA": 30, "BBB": 20, "CCC": 10},
         )
@@ -165,9 +331,33 @@ class WtmeStrategyTests(unittest.TestCase):
             item["message"] for item in logs if item["symbol"] == "CCC"
         ))
 
+    def test_max_simultaneous_holdings_caps_symbols_passing_buy_conditions(self) -> None:
+        _strategy, _context, logs, intents = self._select_with_scores(
+            {
+                "buy_top_n": 1,
+                "buy_score_threshold": 10,
+                "max_simultaneous_holdings": 1,
+            },
+            {"AAA": 30, "BBB": 20, "CCC": 10},
+        )
+
+        self.assertEqual(
+            [(intent.action, intent.symbol) for intent in intents],
+            [("BUY", "AAA")],
+        )
+        by_symbol = {item["symbol"]: item for item in logs}
+        self.assertTrue(
+            by_symbol["BBB"]["context"]["excluded_by_max_simultaneous_holdings"]
+        )
+        self.assertIn("最多同时持仓 1 只", by_symbol["BBB"]["message"])
+
     def test_linear_rank_allocation_gives_first_place_the_largest_weight(self) -> None:
         _strategy, _context, logs, intents = self._select_with_scores(
-            {"buy_top_n": 3, "allocation_mode": "linear_rank"},
+            {
+                "buy_top_n": 3,
+                "allocation_mode": "linear_rank",
+                "max_simultaneous_holdings": 3,
+            },
             {"AAA": 60, "BBB": 30, "CCC": -10},
         )
 
@@ -190,7 +380,11 @@ class WtmeStrategyTests(unittest.TestCase):
 
     def test_leveraged_equal_allocation_gives_each_target_full_gross_exposure(self) -> None:
         _strategy, context, _logs, intents = self._select_with_scores(
-            {"buy_top_n": 3, "allocation_mode": "leveraged_equal"},
+            {
+                "buy_top_n": 3,
+                "allocation_mode": "leveraged_equal",
+                "max_simultaneous_holdings": 3,
+            },
             {"AAA": 30, "BBB": 20, "CCC": 10},
         )
 
@@ -214,7 +408,11 @@ class WtmeStrategyTests(unittest.TestCase):
 
     def test_leveraged_linear_rank_combines_rank_weights_and_target_count_leverage(self) -> None:
         _strategy, context, _logs, intents = self._select_with_scores(
-            {"buy_top_n": 3, "allocation_mode": "leveraged_linear_rank"},
+            {
+                "buy_top_n": 3,
+                "allocation_mode": "leveraged_linear_rank",
+                "max_simultaneous_holdings": 3,
+            },
             {"AAA": 30, "BBB": 20, "CCC": 10},
         )
 
@@ -256,7 +454,11 @@ class WtmeStrategyTests(unittest.TestCase):
             symbol_leverage_multipliers={"AAA": 1.5, "BBB": 2, "CCC": 1},
         )
         strategy, context, _logs, _intents = self._select_with_scores(
-            {"buy_top_n": 3, "allocation_mode": "leveraged_linear_rank"},
+            {
+                "buy_top_n": 3,
+                "allocation_mode": "leveraged_linear_rank",
+                "max_simultaneous_holdings": 3,
+            },
             {"AAA": 30, "BBB": 20, "CCC": 10},
             portfolio=portfolio,
         )

@@ -37,6 +37,49 @@ class BacktestIntradayGapTests(unittest.TestCase):
             patcher.stop()
         self.temp_dir.cleanup()
 
+    def test_us10y_exact_event_uses_previous_session_close_without_minutes(self) -> None:
+        trading_date = "2024-01-03"
+        sessions = [{
+            "trading_date": trading_date,
+            "open_minute_utc": _epoch_minute(trading_date, "09:30"),
+            "close_minute_utc": _epoch_minute(trading_date, "16:00"),
+            "is_early_close": False,
+        }]
+        daily = [
+            {
+                "date": "2024-01-02", "open": 3.9, "high": 4.1,
+                "low": 3.8, "close": 4.0, "volume": 0, "is_complete": 1,
+            },
+            {
+                "date": trading_date, "open": 4.2, "high": 4.3,
+                "low": 4.1, "close": 4.25, "volume": 0, "is_complete": 1,
+            },
+        ]
+        with (
+            patch("services.backtest.data.repository.get_daily_prices", return_value=daily),
+            patch("services.backtest.data.repository.get_symbol", return_value={"asset_class": "fixed_income"}),
+            patch("services.backtest.data.ensure_market_sessions", return_value=sessions),
+            patch("services.backtest.data.ensure_corporate_actions", return_value=[]),
+            patch("services.backtest.data.intraday_repository.get_sync_state", side_effect=AssertionError("US10Y must not request Alpaca sync state")),
+            patch("services.backtest.data.intraday_repository.get_minute_bars_at", side_effect=AssertionError("US10Y must not request minute bars")),
+        ):
+            dataset = load_historical_dataset(
+                universe=["US10Y"],
+                additional_symbols=[],
+                start_date=trading_date,
+                end_date=trading_date,
+                intraday_events=["10:00"],
+                minimum_lookback=1,
+            )
+
+        price = dataset.event_price("US10Y", trading_date, "10:00")
+        self.assertEqual(price.signal_price, 4.0)
+        self.assertEqual(price.fill_price, 4.0)
+        self.assertEqual(
+            dataset.manifest["symbols"]["US10Y"]["intraday_price_fallback"]["mode"],
+            "previous_session_close",
+        )
+
     def test_sparse_halt_minutes_resolve_to_last_signal_and_first_fill(self) -> None:
         target = _epoch_minute("2020-03-09", "09:40")
         intraday_repository.upsert_minute_bars(

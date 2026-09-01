@@ -74,7 +74,7 @@ WTME = 100 * R_w / (A_w + epsilon)
 
 ```text
 code_key: rapid_drop_wtme_rotation
-version: 1.7.0
+version: 1.9.0
 selection_mode: competition
 ```
 
@@ -85,8 +85,8 @@ selection_mode: competition
 1. 在 `risk_check_time` 对全部候选标的执行急跌检查。
 2. 命中任一已启用规则的标的加入当日过滤集合；若当前持有则立即生成清仓目标。
 3. 在 `selection_time` 为所有标的计算 WTME，并从未被急跌过滤的标的中按“分数降序、代码升序”计算横截面排名。代码升序只用于分数完全相同的确定性决胜。
-4. 每个标的依次判断两个买入条件：急跌过滤后排名 `rank <= buy_top_n`，或评分 `score > buy_score_threshold`。两个条件采用 OR；任意一个通过即进入目标名单。
-5. 清仓不在目标名单内的持仓；目标为空时保持现金。
+4. 每个标的依次判断两个买入条件：急跌过滤后排名 `rank <= buy_top_n`，或评分 `score > buy_score_threshold`。两个条件采用 OR；任意一个通过即进入合格名单，再按 WTME 排名取不超过 `max_simultaneous_holdings` 只作为目标名单。
+5. 清仓不在目标名单内的持仓，并按需降低目标名单内持仓；若开启上涨保护，WTME 轮动原计划卖出的已有持仓在卖出时点价严格高于上一交易日收盘价时，本次不卖出。受保护持仓占用同时持仓名额，达到上限时不再买入新的目标标的。目标为空时保持现金。
 6. 按 `allocation_mode` 计算各目标仓位。等权和动态杠杆模式仅在目标集合发生变化时再平衡；线性排名模式在目标集合或入选名次顺序改变时按新排名再平衡，不因普通价格漂移每日重复调仓。
 
 风险检查时间必须严格早于评分时间。
@@ -124,9 +124,11 @@ change = current_price / previous_close - 1
 | `allocation_mode` | `equal` | `equal` 平均买入；`linear_rank` 按线性排名权重分配；`leveraged_equal` 平均买入并动态加杠杆；`leveraged_linear_rank` 按线性排名权重买入并动态加杠杆 |
 | `buy_top_n` | 1 | 买入条件 1：急跌过滤后评分位于前 n 名，包含第 n 名 |
 | `buy_score_threshold` | 9999 | 买入条件 2：评分严格大于 x；默认值使正常 WTME 评分无法仅靠条件 2 入选 |
+| `max_simultaneous_holdings` | 1 | 最多同时持仓个数；合格标的按 WTME 排名优先，上涨保护保留的旧持仓也占用名额 |
 | `wtme_period` | 40 | WTME 窗口 `N` |
 | `wtme_half_life` | 15 | WTME 半衰期 `h` |
 | `wtme_epsilon` | `1e-8` | WTME 防除零项 |
+| `enable_upside_sell_protection` | 关闭 | 上涨保护；WTME 轮动计划卖出已有持仓时，若卖出时点价严格高于上一交易日收盘价则不卖出 |
 | `enable_percent_drop_filter` | 开启 | 启用百分比急跌过滤 |
 | `drop_threshold_percent` | 5% | 百分比急跌阈值 |
 | `drop_lookback_sessions` | 3 | 急跌观察交易日 |
@@ -153,7 +155,7 @@ change = current_price / previous_close - 1
 
 ### 6. 审计日志
 
-风险检查写入 `RAPID_DROP_WTME_RISK_CHECK`；WTME 评分写入 `RAPID_DROP_WTME_DAILY_SCORE`。每个评分日志至少包含：
+风险检查写入 `RAPID_DROP_WTME_RISK_CHECK`；WTME 评分写入 `RAPID_DROP_WTME_DAILY_SCORE`；上涨保护实际拦截卖出时写入 `RAPID_DROP_WTME_UPSIDE_SELL_PROTECTION`；已有持仓占满名额而阻止新增买入时写入 `RAPID_DROP_WTME_MAX_HOLDINGS_BLOCK`。上涨保护只处理 `selection_time` 的 WTME 轮动卖出，不拦截 `risk_check_time` 的急跌风控卖出。每个评分日志至少包含：
 
 - `score`、`weighted_return`、`weighted_true_range`；
 - 当前决策价、前收盘价和当前观测 TR；

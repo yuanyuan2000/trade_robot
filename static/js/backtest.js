@@ -16,7 +16,12 @@ const bt = {
   readOnly: false,
   returnToResults: false,
   resultsPage: 1,
+  resultsPageSize: 20,
   resultsTotalPages: 1,
+  resultsItems: [],
+  resultsSort: { key: "id", direction: "desc" },
+  symbolTooltipTimer: null,
+  symbolTooltipElement: null,
 };
 
 const btListPage = document.getElementById("backtest-list-page");
@@ -264,29 +269,21 @@ async function loadBacktestResultsOverview(page = 1) {
   btResultsStatus.textContent = "正在加载回测结果...";
   btResultsStatus.className = "status neutral";
   try {
-    const payload = await btJson(await fetch(`/api/backtest/runs?page=${page}&page_size=25`));
+    const payload = await btJson(await fetch(`/api/backtest/runs?page=${page}&page_size=${bt.resultsPageSize}`));
+    if (payload.total_rows > 0 && page > payload.total_pages) {
+      await loadBacktestResultsOverview(payload.total_pages);
+      return;
+    }
     bt.resultsPage = payload.page;
+    bt.resultsPageSize = payload.page_size;
     bt.resultsTotalPages = payload.total_pages;
+    bt.resultsItems = payload.items || [];
+    document.getElementById("backtest-results-page-size").value = String(payload.page_size);
     document.getElementById("backtest-results-count").textContent = `共 ${payload.total_rows} 条`;
     document.getElementById("backtest-results-page-text").textContent = `第 ${payload.page} 页 / 共 ${payload.total_pages} 页`;
     document.getElementById("backtest-results-prev").disabled = payload.page <= 1;
     document.getElementById("backtest-results-next").disabled = payload.page >= payload.total_pages;
-    const headers = ["", "编号", "回测时间", "策略名称", "回测区间", "标的", "杠杆", "状态", "收益率", "最大回撤", "成交"];
-    const rows = (payload.items || []).map((run) => `
-      <tr data-result-run-id="${run.id}">
-        <td><label class="bt-result-select-hitbox" aria-label="选择回测 #${run.id}"><input class="bt-result-select" type="checkbox" value="${run.id}" ${["queued", "validating", "running", "cancelling"].includes(run.status) ? "disabled" : ""}></label></td>
-        <td>#${run.id}</td>
-        <td>${btEscape(btDateTime(run.created_at))}</td>
-        <td>${btEscape(run.strategy_name)}</td>
-        <td class="backtest-result-compact">${btCompactDate(run.settings?.start_date)}<br>${btCompactDate(run.settings?.end_date)}</td>
-        <td class="backtest-result-compact backtest-result-symbols">${btEscape((run.symbols || []).join(" / ") || "—")}</td>
-        <td>${btEscape(run.settings?.leverage_multiplier == null ? "—" : `${run.settings.leverage_multiplier}×`)}</td>
-        <td>${btEscape(btRunOutcomeLabel(run))}</td>
-        <td>${btPercent(run.metrics?.total_return)}</td>
-        <td>${btPercent(run.metrics?.max_drawdown)}</td>
-        <td>${btEscape(run.metrics?.trade_count ?? "—")}</td>
-      </tr>`).join("");
-    btResultsTable.innerHTML = `<thead><tr>${headers.map((item) => `<th>${item}</th>`).join("")}</tr></thead><tbody>${rows || '<tr><td colspan="11">暂无回测结果</td></tr>'}</tbody>`;
+    renderBacktestResultsOverview();
     document.getElementById("backtest-delete-runs").disabled = true;
     btResultsStatus.textContent = "回测结果已加载。";
     btResultsStatus.className = "status success";
@@ -294,6 +291,116 @@ async function loadBacktestResultsOverview(page = 1) {
     btResultsStatus.textContent = btErrorText(error);
     btResultsStatus.className = "status error";
   }
+}
+
+const btResultHeaders = [
+  { label: "", key: "" },
+  { label: "编号", key: "id", type: "number", binary: true },
+  { label: "回测日期", key: "created_at", type: "date", binary: true },
+  { label: "策略名称", key: "strategy_name", type: "string" },
+  { label: "回测区间", key: "period", type: "string" },
+  { label: "标的", key: "symbols", type: "string" },
+  { label: "买入数", key: "max_buy_count", type: "number" },
+  { label: "杠杆率", key: "leverage_display", type: "string" },
+  { label: "状态", key: "status", type: "string" },
+  { label: "收益率", key: "total_return", type: "number" },
+  { label: "最大回撤", key: "max_drawdown", type: "number" },
+];
+
+function renderBacktestResultsOverview() {
+  btHideSymbolTooltip();
+  const rows = getSortedBacktestResults().map((run) => `
+      <tr data-result-run-id="${run.id}">
+        <td><label class="bt-result-select-hitbox" aria-label="选择回测 #${run.id}"><input class="bt-result-select" type="checkbox" value="${run.id}" ${["queued", "validating", "running", "cancelling"].includes(run.status) ? "disabled" : ""}></label></td>
+        <td>#${run.id}</td>
+        <td>${btEscape(btDateOnly(run.created_at))}</td>
+        <td>${btEscape(run.strategy_name)}</td>
+        <td class="backtest-result-compact">${btEscape(btCompactDate(run.settings?.start_date))}<br>${btEscape(btCompactDate(run.settings?.end_date))}</td>
+        <td class="backtest-result-compact backtest-result-symbols">${btRunSymbols(run)}</td>
+        <td>${btEscape(run.max_buy_count ?? "-")}</td>
+        <td>${btEscape(run.leverage_display || "-")}</td>
+        <td>${btEscape(btRunOutcomeLabel(run))}</td>
+        <td>${btPercent(run.metrics?.total_return)}</td>
+        <td>${btPercent(run.metrics?.max_drawdown)}</td>
+      </tr>`).join("");
+  const headers = btResultHeaders.map(renderBacktestResultHeader).join("");
+  btResultsTable.innerHTML = `<thead><tr>${headers}</tr></thead><tbody>${rows || '<tr><td colspan="11">暂无回测结果</td></tr>'}</tbody>`;
+}
+
+function renderBacktestResultHeader(header) {
+  if (!header.key) return "<th></th>";
+  const active = bt.resultsSort.key === header.key;
+  const direction = active ? bt.resultsSort.direction : "";
+  const directionText = direction === "asc" ? "升序" : direction === "desc" ? "降序" : "默认排序";
+  return `
+    <th>
+      <span class="overview-th-content">
+        <span>${btEscape(header.label)}</span>
+        <button class="overview-sort-button ${active ? "is-active" : ""}" type="button"
+          title="${btEscape(`${header.label} · ${directionText}`)}"
+          aria-label="${btEscape(`${header.label} · ${directionText}`)}"
+          data-bt-result-sort="${btEscape(header.key)}" data-sort-direction="${btEscape(direction)}">
+          <span class="sort-triangle sort-triangle-up"></span>
+          <span class="sort-triangle sort-triangle-down"></span>
+        </button>
+      </span>
+    </th>`;
+}
+
+function btResultSortValue(run, key) {
+  if (key === "period") return `${run.settings?.start_date || ""}/${run.settings?.end_date || ""}`;
+  if (key === "symbols") return (run.symbols || []).join(" / ");
+  if (key === "status") return btRunOutcomeLabel(run);
+  if (key === "total_return") return run.metrics?.total_return;
+  if (key === "max_drawdown") return run.metrics?.max_drawdown;
+  return run[key];
+}
+
+function btCompareResultValues(left, right, header, direction) {
+  let leftValue = btResultSortValue(left, header.key);
+  let rightValue = btResultSortValue(right, header.key);
+  if (header.type === "date") {
+    leftValue = Date.parse(leftValue);
+    rightValue = Date.parse(rightValue);
+  }
+  const leftMissing = leftValue == null || leftValue === "" || (header.type !== "string" && !Number.isFinite(Number(leftValue)));
+  const rightMissing = rightValue == null || rightValue === "" || (header.type !== "string" && !Number.isFinite(Number(rightValue)));
+  if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
+  let compared = 0;
+  if (!leftMissing) {
+    compared = header.type === "string"
+      ? String(leftValue).localeCompare(String(rightValue), "zh-CN", { numeric: true, sensitivity: "base" })
+      : Number(leftValue) - Number(rightValue);
+  }
+  if (compared) return compared * (direction === "desc" ? -1 : 1);
+  const idCompared = Number(left.id) - Number(right.id);
+  return header.binary ? idCompared * (direction === "desc" ? -1 : 1) : -idCompared;
+}
+
+function getSortedBacktestResults() {
+  const header = btResultHeaders.find((item) => item.key === bt.resultsSort.key) || btResultHeaders[1];
+  return [...bt.resultsItems].sort((left, right) => (
+    btCompareResultValues(left, right, header, bt.resultsSort.direction)
+  ));
+}
+
+function applyBacktestResultsSort(key) {
+  const header = btResultHeaders.find((item) => item.key === key);
+  if (!header) return;
+  if (header.binary) {
+    bt.resultsSort = {
+      key,
+      direction: bt.resultsSort.key === key && bt.resultsSort.direction === "asc" ? "desc" : "asc",
+    };
+  } else if (bt.resultsSort.key !== key) {
+    bt.resultsSort = { key, direction: "asc" };
+  } else if (bt.resultsSort.direction === "asc") {
+    bt.resultsSort = { key, direction: "desc" };
+  } else {
+    bt.resultsSort = { key: "id", direction: "desc" };
+  }
+  renderBacktestResultsOverview();
+  document.getElementById("backtest-delete-runs").disabled = true;
 }
 
 async function openBacktestRunDetail(runId) {
@@ -371,6 +478,22 @@ function renderBacktestEditor() {
   renderBacktestRunHistory();
 }
 
+const BT_CASH_PLACEHOLDER_SYMBOLS = new Set(["USDINDEX", "US10Y"]);
+
+function btIsCashPlaceholderSymbol(symbol) {
+  return document.getElementById("backtest-market-type").value === "US_EQUITY"
+    && BT_CASH_PLACEHOLDER_SYMBOLS.has(String(symbol || "").trim().toUpperCase());
+}
+
+function btCashPlaceholderNote(symbol) {
+  const normalized = String(symbol || "").trim().toUpperCase();
+  const base = "买入该标的默认为空仓；实际计算不建立该标的持仓，而是持有美元现金。";
+  if (normalized === "US10Y") {
+    return `${base} 历史回测需要分钟级价格时，临时使用上一交易日收盘价；实时决策使用当前价格。`;
+  }
+  return base;
+}
+
 function renderBacktestSymbols() {
   const isSevenStar = bt.current.design_mode === "code" && bt.current.code_key === "sevenstar_etf_rotation";
   btSymbols.innerHTML = (bt.current.definition.symbols || []).map((item, index) => `
@@ -383,8 +506,18 @@ function renderBacktestSymbols() {
         <button class="bt-move-symbol" data-direction="down" type="button" aria-label="下移标的" ${index === bt.current.definition.symbols.length - 1 ? "disabled" : ""}>↓</button>
       </div>
       <button class="backtest-remove-button bt-remove-symbol" type="button" aria-label="移除标的">×</button>
+      <p class="backtest-symbol-cash-note" ${btIsCashPlaceholderSymbol(item.symbol) ? "" : "hidden"}>${btEscape(btCashPlaceholderNote(item.symbol))}</p>
     </div>
   `).join("");
+}
+
+function updateBacktestCashPlaceholderNote(input) {
+  const row = input.closest(".backtest-symbol-row");
+  const note = row?.querySelector(".backtest-symbol-cash-note");
+  if (note) {
+    note.hidden = !btIsCashPlaceholderSymbol(input.value);
+    note.textContent = btCashPlaceholderNote(input.value);
+  }
 }
 
 function syncBacktestSymbolsFromEditor() {
@@ -1067,8 +1200,71 @@ function btDateTime(value) {
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("zh-CN", { hour12: false });
 }
 
+function btDateOnly(value) {
+  if (!value) return "-";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return String(value).slice(0, 10);
+  const year = parsed.getFullYear();
+  const month = String(parsed.getMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 function btCompactDate(value) {
-  return String(value || "—").replaceAll("-", "");
+  return String(value || "-").replaceAll("-", "");
+}
+
+function btRunSymbols(run) {
+  const entries = Array.isArray(run?.symbol_leverages)
+    ? run.symbol_leverages
+    : (run?.symbols || []).map((symbol) => ({ symbol, leverage_multiplier: null }));
+  if (!entries.length) return "-";
+  const summary = entries.map((entry, index) => (
+    `${index ? " / <wbr>" : ""}<span class="backtest-result-symbol">${btEscape(entry.symbol)}</span>`
+  )).join("");
+  const details = entries.map((entry) => {
+    const leverage = Number(entry.leverage_multiplier);
+    const label = entry.leverage_multiplier != null && Number.isFinite(leverage)
+      ? `${leverage}x`
+      : "-";
+    return `<span class="backtest-symbol-tooltip-row"><span>${btEscape(entry.symbol)}</span><span>${btEscape(label)}</span></span>`;
+  }).join("");
+  return `<span class="backtest-symbol-summary" tabindex="0">${summary}<span class="backtest-symbol-tooltip-source">${details}</span></span>`;
+}
+
+function btHideSymbolTooltip() {
+  window.clearTimeout(bt.symbolTooltipTimer);
+  bt.symbolTooltipTimer = null;
+  if (bt.symbolTooltipElement) bt.symbolTooltipElement.hidden = true;
+}
+
+function btShowSymbolTooltip(summary) {
+  btHideSymbolTooltip();
+  bt.symbolTooltipTimer = window.setTimeout(() => {
+    const source = summary.querySelector(".backtest-symbol-tooltip-source");
+    if (!source || !summary.isConnected) return;
+    if (!bt.symbolTooltipElement) {
+      bt.symbolTooltipElement = document.createElement("div");
+      bt.symbolTooltipElement.className = "backtest-symbol-tooltip";
+      bt.symbolTooltipElement.setAttribute("role", "tooltip");
+      document.body.append(bt.symbolTooltipElement);
+    }
+    const tooltip = bt.symbolTooltipElement;
+    tooltip.innerHTML = source.innerHTML;
+    tooltip.hidden = false;
+    const anchor = summary.getBoundingClientRect();
+    const margin = 8;
+    let left = anchor.left;
+    let top = anchor.bottom + 6;
+    if (left + tooltip.offsetWidth > window.innerWidth - margin) {
+      left = window.innerWidth - tooltip.offsetWidth - margin;
+    }
+    if (top + tooltip.offsetHeight > window.innerHeight - margin) {
+      top = anchor.top - tooltip.offsetHeight - 6;
+    }
+    tooltip.style.left = `${Math.max(margin, left)}px`;
+    tooltip.style.top = `${Math.max(margin, top)}px`;
+  }, 400);
 }
 
 function btMoney(value) {
@@ -1133,10 +1329,33 @@ function initBacktest() {
   document.getElementById("backtest-results-next").addEventListener("click", () => {
     if (bt.resultsPage < bt.resultsTotalPages) loadBacktestResultsOverview(bt.resultsPage + 1);
   });
+  document.getElementById("backtest-results-page-size").addEventListener("change", (event) => {
+    bt.resultsPageSize = Number(event.target.value) || 20;
+    loadBacktestResultsOverview(1);
+  });
   btResultsTable.addEventListener("change", () => {
     document.getElementById("backtest-delete-runs").disabled = !btResultsTable.querySelector(".bt-result-select:checked");
   });
+  btResultsTable.addEventListener("mouseover", (event) => {
+    const summary = event.target.closest(".backtest-symbol-summary");
+    if (summary && !summary.contains(event.relatedTarget)) btShowSymbolTooltip(summary);
+  });
+  btResultsTable.addEventListener("mouseout", (event) => {
+    const summary = event.target.closest(".backtest-symbol-summary");
+    if (summary && !summary.contains(event.relatedTarget)) btHideSymbolTooltip();
+  });
+  btResultsTable.addEventListener("focusin", (event) => {
+    const summary = event.target.closest(".backtest-symbol-summary");
+    if (summary) btShowSymbolTooltip(summary);
+  });
+  btResultsTable.addEventListener("focusout", btHideSymbolTooltip);
   btResultsTable.addEventListener("click", (event) => {
+    const sortButton = event.target.closest("[data-bt-result-sort]");
+    if (sortButton) {
+      event.stopPropagation();
+      applyBacktestResultsSort(sortButton.dataset.btResultSort);
+      return;
+    }
     if (event.target.closest(".bt-result-select-hitbox")) return;
     const row = event.target.closest("[data-result-run-id]");
     if (row) openBacktestRunDetail(Number(row.dataset.resultRunId));
@@ -1145,16 +1364,16 @@ function initBacktest() {
     const runIds = Array.from(btResultsTable.querySelectorAll(".bt-result-select:checked"))
       .map((item) => Number(item.value));
     if (!runIds.length) return;
-    if (!window.confirm(`将不可撤销地从回测结果中删除 ${runIds.length} 条记录，并清除详细日志和每日权益/持仓节点。确认继续？`)) return;
+    if (!window.confirm(`将不可撤销地彻底删除 ${runIds.length} 次回测及其全部数据，包括策略快照、收益指标、权益节点、成交明细和日志。确认继续？`)) return;
     try {
       const result = await btJson(await fetch("/api/backtest/runs/deletions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ run_ids: runIds, confirm: true }),
       }));
-      btResultsStatus.textContent = `已删除 ${result.run_ids.length} 条回测记录的重数据（${result.deleted_log_rows.toLocaleString()} 条日志、${result.deleted_equity_rows.toLocaleString()} 个每日节点）。`;
-      btResultsStatus.className = "status success";
       await loadBacktestResultsOverview(bt.resultsPage);
+      btResultsStatus.textContent = `已彻底删除 ${result.deleted_run_rows.toLocaleString()} 次回测及全部关联数据（${result.deleted_trade_rows.toLocaleString()} 笔成交、${result.deleted_log_rows.toLocaleString()} 条日志、${result.deleted_equity_rows.toLocaleString()} 个权益节点）。`;
+      btResultsStatus.className = "status success";
     } catch (error) {
       btResultsStatus.textContent = btErrorText(error);
       btResultsStatus.className = "status error";
@@ -1297,6 +1516,9 @@ function initBacktest() {
     const index = Number(button.closest(".backtest-symbol-row").dataset.index);
     bt.current.definition.symbols.splice(index, 1);
     renderBacktestSymbols();
+  });
+  btSymbols.addEventListener("input", (event) => {
+    if (event.target.matches(".bt-symbol-code")) updateBacktestCashPlaceholderNote(event.target);
   });
   document.getElementById("backtest-reset-symbols").addEventListener("click", () => {
     bt.current.definition.symbols = structuredClone(bt.symbolDefaults);

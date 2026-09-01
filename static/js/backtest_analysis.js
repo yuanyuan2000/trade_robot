@@ -6,6 +6,7 @@ const bta = {
   candles: null,
   months: 3,
   hiddenSeries: new Set(),
+  leveragedBenchmarks: false,
   selectedDate: null,
   selectedSymbol: null,
   pinned: false,
@@ -65,6 +66,12 @@ function btaSetStatus(message, type = "neutral") {
   btaStatus.className = `status ${type}`;
 }
 
+function btaSyncLeverageButton() {
+  const button = document.getElementById("backtest-analysis-leverage");
+  button.setAttribute("aria-pressed", String(bta.leveragedBenchmarks));
+  button.textContent = bta.leveragedBenchmarks ? "✓ 杠杆" : "杠杆";
+}
+
 function btaSeriesColor(series, index) {
   if (series.type === "strategy") return "#2563eb";
   if (series.type === "equal_weight") return "#f59e0b";
@@ -105,11 +112,23 @@ function btaRenderLegend() {
     const color = btaSeriesColor(item, index);
     const active = !bta.hiddenSeries.has(item.key);
     const benchmark = item.configured_benchmark && !item.label.includes("配置基准") ? "（配置基准）" : "";
+    const leverage = bta.leveragedBenchmarks && item.type !== "strategy"
+      ? item.leverage_mode === "per_asset"
+        ? "（按标的杠杆）"
+        : `（${Number(item.leverage_multiplier || 1).toFixed(2).replace(/\.?0+$/, "")}x）`
+      : "";
     return `<button type="button" data-series-key="${btEscape(item.key)}" data-series-type="${btEscape(item.type)}" aria-pressed="${active}">
       <span class="backtest-analysis-legend-dot" style="background:${color}"></span>
-      <span>${btEscape(item.label + benchmark)}</span>
+      <span>${btEscape(item.label + benchmark + leverage)}</span>
     </button>`;
   }).join("");
+}
+
+function btaSeriesPoints(item) {
+  if (bta.leveragedBenchmarks && item.type !== "strategy") {
+    return item.leveraged_points || item.points || [];
+  }
+  return item.points || [];
 }
 
 function btaVisibleSeries() {
@@ -122,7 +141,7 @@ function btaDrawChart() {
   const empty = document.getElementById("backtest-analysis-chart-empty");
   const dates = bta.analysis?.range?.trading_dates || [];
   const series = btaVisibleSeries();
-  const values = series.flatMap((item) => (item.points || []).map((point) => Number(point.return_rate))).filter(Number.isFinite);
+  const values = series.flatMap((item) => btaSeriesPoints(item).map((point) => Number(point.return_rate))).filter(Number.isFinite);
   empty.hidden = Boolean(dates.length && values.length);
   if (!dates.length || !values.length) return;
 
@@ -170,7 +189,7 @@ function btaDrawChart() {
     context.setLineDash(item.type === "equal_weight" || item.type === "benchmark" ? [6, 4] : []);
     context.beginPath();
     let started = false;
-    (item.points || []).forEach((point) => {
+    btaSeriesPoints(item).forEach((point) => {
       const index = dateIndex.get(point.trading_date);
       if (index == null || !Number.isFinite(Number(point.return_rate))) return;
       if (!started) context.moveTo(x(index), y(Number(point.return_rate)));
@@ -435,6 +454,10 @@ async function btaLoadRange() {
     bta.selectedDate = bta.selectedDate && actual.trading_dates.includes(bta.selectedDate)
       ? bta.selectedDate : actual.actual_end_date;
     btaRenderMetrics(analysis.metrics);
+    const leverageButton = document.getElementById("backtest-analysis-leverage");
+    leverageButton.title = analysis.benchmark_leverage?.dynamic_special_assumed_one
+      ? "各基准按整体杠杆 × 单标的杠杆计算；WTME 动态特殊杠杆按 1 倍假设。期间不调仓，不计融资利息和手续费。"
+      : "各基准按整体杠杆 × 单标的杠杆 × 特殊杠杆计算。期间不调仓，不计融资利息和手续费。";
     btaRenderLegend();
     btaDrawChart();
     btaDrawCandles();
@@ -464,6 +487,8 @@ async function openBacktestAnalysis() {
   bta.runId = bt.currentRunId;
   bta.open = true;
   bta.hiddenSeries.clear();
+  bta.leveragedBenchmarks = false;
+  btaSyncLeverageButton();
   bta.decisionCache.clear();
   bta.pinned = false;
   bta.followLatest = true;
@@ -566,6 +591,12 @@ document.querySelector(".backtest-analysis-legend-actions").addEventListener("cl
       if (!keep) bta.hiddenSeries.add(item.key);
     });
   }
+  btaRenderLegend();
+  btaDrawChart();
+});
+document.getElementById("backtest-analysis-leverage").addEventListener("click", () => {
+  bta.leveragedBenchmarks = !bta.leveragedBenchmarks;
+  btaSyncLeverageButton();
   btaRenderLegend();
   btaDrawChart();
 });

@@ -491,9 +491,10 @@ def list_runs_overview(
     page_size: int = 25,
     strategy_id: int | None = None,
     status: str | None = None,
+    include_snapshot: bool = False,
 ) -> dict:
     clean_page = max(1, int(page))
-    clean_size = max(1, min(int(page_size), 100))
+    clean_size = max(1, min(int(page_size), 200))
     clauses: list[str] = ["deleted_at IS NULL"]
     params: list[Any] = []
     if strategy_id is not None:
@@ -520,12 +521,22 @@ def list_runs_overview(
     items = []
     for row in rows:
         item = _run_row(row, include_snapshot=True)
-        snapshot = item.pop("strategy_snapshot", {})
+        snapshot = item.get("strategy_snapshot") or {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        definition = snapshot.get("definition") or {}
+        if not isinstance(definition, dict):
+            definition = {}
+        raw_symbols = definition.get("symbols") or []
+        if not isinstance(raw_symbols, list):
+            raw_symbols = []
         item["symbols"] = [
             value.get("symbol")
-            for value in snapshot.get("definition", {}).get("symbols", [])
-            if value.get("symbol")
+            for value in raw_symbols
+            if isinstance(value, dict) and value.get("symbol")
         ]
+        if not include_snapshot:
+            item.pop("strategy_snapshot", None)
         items.append(item)
     return {
         "items": items,
@@ -556,9 +567,8 @@ def delete_runs(run_ids: list[int]) -> dict:
     if not normalized:
         raise ValueError("请至少选择一条回测记录。")
     if len(normalized) > 200:
-        raise ValueError("一次最多清理 200 条回测记录。")
+        raise ValueError("一次最多删除 200 条回测记录。")
     placeholders = ",".join("?" for _ in normalized)
-    now = utc_now_iso()
     with get_connection() as conn:
         rows = conn.execute(
             f"""
@@ -595,6 +605,14 @@ def delete_runs(run_ids: list[int]) -> dict:
             """,
             normalized,
         ).fetchone()
+        trade_stats = conn.execute(
+            f"""
+            SELECT COUNT(*) AS rows
+            FROM backtest_trades
+            WHERE run_id IN ({placeholders})
+            """,
+            normalized,
+        ).fetchone()
         conn.execute(
             f"DELETE FROM backtest_logs WHERE run_id IN ({placeholders})",
             normalized,
@@ -604,21 +622,21 @@ def delete_runs(run_ids: list[int]) -> dict:
             normalized,
         )
         conn.execute(
-            f"""
-            UPDATE backtest_runs
-            SET logs_deleted_at = COALESCE(logs_deleted_at, ?),
-                deleted_at = ?
-            WHERE id IN ({placeholders})
-            """,
-            (now, now, *normalized),
+            f"DELETE FROM backtest_trades WHERE run_id IN ({placeholders})",
+            normalized,
+        )
+        deleted_runs = conn.execute(
+            f"DELETE FROM backtest_runs WHERE id IN ({placeholders})",
+            normalized,
         )
     return {
         "run_ids": normalized,
+        "deleted_run_rows": int(deleted_runs.rowcount),
         "deleted_log_rows": int(log_stats["rows"]),
         "deleted_log_bytes": int(log_stats["bytes"]),
         "deleted_equity_rows": int(equity_stats["rows"]),
         "deleted_equity_bytes": int(equity_stats["bytes"]),
-        "deleted_at": now,
+        "deleted_trade_rows": int(trade_stats["rows"]),
     }
 
 

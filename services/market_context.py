@@ -13,6 +13,35 @@ SUPPORTED_MARKET_TYPES = {"US_EQUITY"}
 US_SESSION_SERIES = "US_EQUITY_SESSION"
 NATIVE_DAILY_SERIES = "NATIVE_DAILY"
 
+# These market series can be used by US strategies for signals and ranking, but
+# they are not tradable portfolio assets.  Selecting either one represents
+# keeping the corresponding allocation in US-dollar cash.
+US_CASH_PLACEHOLDER_SYMBOLS = frozenset({"USDINDEX", "US10Y"})
+US_PREVIOUS_CLOSE_INTRADAY_SYMBOLS = frozenset({"US10Y"})
+
+
+def is_cash_placeholder_symbol(
+    symbol: str,
+    market: dict | str | None = None,
+) -> bool:
+    normalized = normalize_market_config(market)
+    return (
+        normalized["type"] == "US_EQUITY"
+        and str(symbol or "").strip().upper() in US_CASH_PLACEHOLDER_SYMBOLS
+    )
+
+
+def uses_previous_close_for_historical_intraday(
+    symbol: str,
+    market: dict | str | None = None,
+) -> bool:
+    normalized = normalize_market_config(market)
+    return (
+        normalized["type"] == "US_EQUITY"
+        and str(symbol or "").strip().upper()
+        in US_PREVIOUS_CLOSE_INTRADAY_SYMBOLS
+    )
+
 
 def normalize_market_config(value: dict | str | None) -> dict:
     from services.backtest.errors import BacktestValidationError

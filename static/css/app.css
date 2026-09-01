@@ -2327,6 +2327,14 @@ td {
   gap: 7px;
 }
 
+.backtest-symbol-cash-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .backtest-section-actions,
 .backtest-symbol-order {
   display: flex;
@@ -2811,13 +2819,46 @@ td {
 .backtest-result-symbols {
   max-width: 190px;
   white-space: normal;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
+  word-break: normal;
 }
+
+.backtest-result-symbol { white-space: nowrap; }
+.backtest-symbol-summary { cursor: help; outline: none; }
+.backtest-symbol-tooltip-source { display: none; }
+
+.backtest-symbol-tooltip {
+  position: fixed;
+  z-index: 10000;
+  display: grid;
+  grid-template-columns: max-content max-content;
+  gap: 5px 16px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 8px 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font: 12px/1.35 ui-monospace, SFMono-Regular, Consolas, monospace;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.backtest-symbol-tooltip[hidden] { display: none; }
+.backtest-symbol-tooltip-row { display: contents; }
+.backtest-symbol-tooltip-row > span:last-child { text-align: right; color: var(--muted); }
 
 .backtest-header-actions {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+#backtest-results-page-size {
+  width: 76px;
+  height: 32px;
+  padding: 0 7px;
+  font-size: 12px;
 }
 
 .backtest-readonly .backtest-designer input,
@@ -2940,6 +2981,12 @@ td {
 
 .backtest-analysis-periods button.active {
   border-color: var(--accent);
+  color: var(--accent);
+}
+
+#backtest-analysis-leverage[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface-muted));
   color: var(--accent);
 }
 

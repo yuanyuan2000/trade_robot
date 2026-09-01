@@ -126,6 +126,47 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         self.assertEqual(provider, "yahoo")
         fetch_yahoo.assert_called_once()
 
+    def test_usdindex_repairs_missing_yahoo_daily_bar_from_hourly_rows(self) -> None:
+        alias = {
+            "common_symbol": "USDINDEX",
+            "display_name": "USDIndex",
+            "yahoo_symbol": "DX-Y.NYB",
+            "twelvedata_symbol": None,
+        }
+        derived = [{
+            "date": "2026-08-28",
+            "open": 99.11,
+            "high": 99.73,
+            "low": 99.10,
+            "close": 99.70,
+            "volume": 0,
+            "source_timeframe": "60MinDerived",
+        }]
+        with (
+            patch.object(service.repository, "resolve_symbol_alias", return_value=alias),
+            patch.object(service, "_fetch_daily_prices_with_fallback", return_value=([], "yahoo", "DX-Y.NYB")),
+            patch.object(service.repository, "upsert_symbol"),
+            patch.object(service.repository, "upsert_daily_prices", side_effect=[2, 1]) as upsert,
+            patch.object(service, "latest_completed_session_dates", return_value=["2026-08-27", "2026-08-28"]),
+            patch.object(service, "assess_daily_history", return_value={
+                "missing_sessions": ["2026-08-28"],
+                "incomplete_sessions": [],
+            }),
+            patch.object(service, "fetch_yahoo_hourly_derived_daily_prices", return_value=derived) as hourly,
+        ):
+            result = service.refresh_symbol_daily_history(
+                "USDINDEX",
+                start_date="2026-08-28",
+            )
+
+        hourly.assert_called_once_with("DX-Y.NYB", ["2026-08-28"])
+        self.assertEqual(upsert.call_count, 2)
+        self.assertEqual(result["updated_rows"], 3)
+        self.assertEqual(
+            result["hourly_daily_repair"]["repaired_dates"],
+            ["2026-08-28"],
+        )
+
     @patch.object(service, "update_full_market_data")
     def test_query_checkbox_requests_intraday_initialization(self, update) -> None:
         update.return_value = {"ok": True}

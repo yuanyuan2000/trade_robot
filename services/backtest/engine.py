@@ -18,6 +18,7 @@ from services.backtest.errors import (
 from services.backtest.metrics import calculate_metrics
 from services.backtest.portfolio import OrderIntent, Portfolio
 from services.backtest.validation import validate_settings, validate_strategy_payload
+from services.market_context import is_cash_placeholder_symbol
 
 
 def _event_sort_key(event: str) -> tuple[int, str]:
@@ -881,28 +882,57 @@ class BacktestEngine:
                 log_callback=self._log,
                 logging_enabled=self.logging_enabled,
             )
-            return list(self.code_strategy.on_event(context))
-        if self.strategy["selection_mode"] == "competition":
-            return self._competition_intents(
+            intents = list(self.code_strategy.on_event(context))
+        elif self.strategy["selection_mode"] == "competition":
+            intents = self._competition_intents(
                 trading_date=trading_date,
                 event=event,
                 event_prices=event_prices,
                 marks=marks,
             )
-        intents = []
-        for symbol in event_prices:
-            if symbol not in self.universe:
+        else:
+            intents = []
+            for symbol in event_prices:
+                if symbol not in self.universe:
+                    continue
+                intent, _ = self._first_matching_rule(
+                    symbol=symbol,
+                    trading_date=trading_date,
+                    event=event,
+                    event_prices=event_prices,
+                    marks=marks,
+                )
+                if intent:
+                    intents.append(intent)
+        return self._cash_adjusted_intents(
+            intents,
+            trading_date=trading_date,
+            event=event,
+        )
+
+    def _cash_adjusted_intents(
+        self,
+        intents: list[OrderIntent],
+        *,
+        trading_date: str,
+        event: str,
+    ) -> list[OrderIntent]:
+        """Keep cash-placeholder market series observable but never trade them."""
+        adjusted: list[OrderIntent] = []
+        for intent in intents:
+            if not is_cash_placeholder_symbol(intent.symbol, self.strategy.get("market")):
+                adjusted.append(intent)
                 continue
-            intent, _ = self._first_matching_rule(
-                symbol=symbol,
-                trading_date=trading_date,
-                event=event,
-                event_prices=event_prices,
-                marks=marks,
-            )
-            if intent:
-                intents.append(intent)
-        return intents
+            if intent.action == "BUY":
+                self._log(
+                    "INFO",
+                    "CASH_PLACEHOLDER_SELECTED",
+                    f"{intent.symbol} 被选中，按空仓处理并持有美元现金。",
+                    event_time=f"{trading_date} {event}",
+                    symbol=intent.symbol,
+                    context={"order": intent.__dict__, "cash_currency": "USD"},
+                )
+        return adjusted
 
     def _first_matching_rule(
         self,

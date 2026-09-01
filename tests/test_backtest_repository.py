@@ -301,6 +301,60 @@ class BacktestRepositoryTests(unittest.TestCase):
         for retired in RapidDropWtmeRotationStrategy.retired_parameters:
             self.assertNotIn(retired, upgraded["definition"]["params"])
 
+    def test_seeded_wtme_upgrade_adds_disabled_upside_protection(self) -> None:
+        _, shipped = next(
+            item
+            for item in shipped_strategy_presets()
+            if item[0] == "builtin-rapid-drop-wtme-rotation-v1"
+        )
+        legacy = deepcopy(shipped)
+        legacy["name"] = "WTME 上涨保护迁移测试"
+        legacy["code_version"] = "1.7.0"
+        legacy["definition"]["params"].pop("enable_upside_sell_protection")
+        seed_key = "test-wtme-upside-sell-protection"
+        backtest_repository.seed_strategy_once(seed_key, legacy)
+
+        upgraded = backtest_repository.upgrade_seeded_strategy_code_version_once(
+            seed_key,
+            "test-wtme-upside-sell-protection-v1.8.0",
+            code_key="rapid_drop_wtme_rotation",
+            from_versions=("1.7.0",),
+            to_version="1.8.0",
+            parameter_defaults={"enable_upside_sell_protection": False},
+        )
+
+        self.assertEqual(upgraded["code_version"], "1.8.0")
+        self.assertFalse(
+            upgraded["definition"]["params"]["enable_upside_sell_protection"]
+        )
+
+    def test_seeded_wtme_upgrade_adds_max_simultaneous_holdings(self) -> None:
+        _, shipped = next(
+            item
+            for item in shipped_strategy_presets()
+            if item[0] == "builtin-rapid-drop-wtme-rotation-v1"
+        )
+        legacy = deepcopy(shipped)
+        legacy["name"] = "WTME 最大持仓迁移测试"
+        legacy["code_version"] = "1.8.0"
+        legacy["definition"]["params"].pop("max_simultaneous_holdings")
+        seed_key = "test-wtme-max-simultaneous-holdings"
+        backtest_repository.seed_strategy_once(seed_key, legacy)
+
+        upgraded = backtest_repository.upgrade_seeded_strategy_code_version_once(
+            seed_key,
+            "test-wtme-max-simultaneous-holdings-v1.9.0",
+            code_key="rapid_drop_wtme_rotation",
+            from_versions=("1.8.0",),
+            to_version="1.9.0",
+            parameter_defaults={"max_simultaneous_holdings": 1},
+        )
+
+        self.assertEqual(upgraded["code_version"], "1.9.0")
+        self.assertEqual(
+            upgraded["definition"]["params"]["max_simultaneous_holdings"], 1
+        )
+
     def test_output_round_trip_preserves_equity_trade_and_log(self) -> None:
         strategy = create_default_strategy(
             name="结果测试",
@@ -446,7 +500,7 @@ class BacktestRepositoryTests(unittest.TestCase):
             [],
         )
 
-    def test_run_soft_delete_hides_summary_and_removes_heavy_rows(self) -> None:
+    def test_run_hard_delete_removes_summary_and_every_child_row(self) -> None:
         strategy = create_default_strategy(
             name="日志清理测试",
             design_mode="visual",
@@ -469,7 +523,23 @@ class BacktestRepositoryTests(unittest.TestCase):
                     "positions": {"SPY": {"quantity": 1}},
                 }
             ],
-            trades=[],
+            trades=[
+                {
+                    "event_time": "2024-01-02 OPEN",
+                    "symbol": "SPY",
+                    "side": "BUY",
+                    "quantity": 1,
+                    "reference_price": 100,
+                    "fill_price": 100,
+                    "gross_amount": 100,
+                    "commission": 0,
+                    "slippage_amount": 0,
+                    "cash_after": 0,
+                    "position_quantity_after": 1,
+                    "position_value_after": 100,
+                    "position_weight_after": 1,
+                }
+            ],
             logs=[
                 {
                     "level": "INFO",
@@ -489,6 +559,13 @@ class BacktestRepositoryTests(unittest.TestCase):
         self.assertEqual(
             overview["items"][0]["settings"]["leverage_multiplier"], 1.0
         )
+        overview_with_snapshot = backtest_repository.list_runs_overview(
+            page=1, page_size=10, include_snapshot=True
+        )
+        self.assertEqual(
+            overview_with_snapshot["items"][0]["strategy_snapshot"]["name"],
+            "日志清理测试",
+        )
         detail = backtest_repository.get_run_detail(run["id"])
         self.assertEqual(detail["strategy_snapshot"]["name"], "日志清理测试")
         self.assertEqual(detail["available_log_count"], 1)
@@ -497,18 +574,55 @@ class BacktestRepositoryTests(unittest.TestCase):
 
         self.assertEqual(deleted["deleted_log_rows"], 1)
         self.assertEqual(deleted["deleted_equity_rows"], 1)
+        self.assertEqual(deleted["deleted_trade_rows"], 1)
+        self.assertEqual(deleted["deleted_run_rows"], 1)
         self.assertEqual(backtest_repository.get_logs(run["id"]), [])
         self.assertEqual(backtest_repository.get_equity_points(run["id"]), [])
+        self.assertEqual(backtest_repository.get_trades(run["id"]), [])
         self.assertEqual(
             backtest_repository.list_runs_overview(page=1, page_size=10)["total_rows"],
             0,
         )
         with self.assertRaises(ValueError):
             backtest_repository.get_run_detail(run["id"])
-        retained = backtest_repository.get_run(run["id"], include_deleted=True)
-        self.assertIsNotNone(retained["deleted_at"])
-        self.assertEqual(retained["metrics"]["total_return"], 0.1)
-        self.assertEqual(retained["strategy_snapshot"]["name"], "日志清理测试")
+        with self.assertRaises(ValueError):
+            backtest_repository.get_run(run["id"], include_deleted=True)
+        with main_db.get_connection() as conn:
+            for table in (
+                "backtest_runs", "backtest_logs", "backtest_equity_points",
+                "backtest_trades",
+            ):
+                count = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE "
+                    + ("id = ?" if table == "backtest_runs" else "run_id = ?"),
+                    (run["id"],),
+                ).fetchone()[0]
+                self.assertEqual(count, 0, table)
+
+    def test_database_migration_purges_legacy_soft_deleted_runs(self) -> None:
+        strategy = create_default_strategy(
+            name="旧软删除清理测试",
+            design_mode="visual",
+            selection_mode="single",
+        )
+        run = backtest_repository.create_run(strategy, strategy["default_settings"])
+        backtest_repository.replace_run_output(
+            run["id"],
+            equity_points=[],
+            trades=[],
+            logs=[{"level": "INFO", "event_type": "TEST", "message": "旧日志"}],
+        )
+        with main_db.get_connection() as conn:
+            conn.execute(
+                "UPDATE backtest_runs SET deleted_at = ? WHERE id = ?",
+                ("2026-01-01T00:00:00+00:00", run["id"]),
+            )
+
+        main_db.init_database()
+
+        with self.assertRaises(ValueError):
+            backtest_repository.get_run(run["id"], include_deleted=True)
+        self.assertEqual(backtest_repository.get_logs(run["id"]), [])
 
 
 if __name__ == "__main__":

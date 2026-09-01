@@ -46,6 +46,22 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertIn('id="backtest-syntax-help-open"', html)
         self.assertIn("r_square(25)", html)
         self.assertIn("bt-result-select-hitbox", script)
+        overview_renderer = script[
+            script.index("async function loadBacktestResultsOverview"):
+            script.index("async function openBacktestRunDetail")
+        ]
+        self.assertIn('"买入数"', overview_renderer)
+        self.assertIn('"杠杆率"', overview_renderer)
+        self.assertIn("btDateOnly(run.created_at)", overview_renderer)
+        self.assertNotIn("trade_count", overview_renderer)
+        self.assertIn('" / <wbr>"', script)
+        self.assertIn("applyBacktestResultsSort", script)
+        self.assertIn('resultsSort: { key: "id", direction: "desc" }', script)
+        self.assertIn('id="backtest-results-page-size"', html)
+        for size in (20, 50, 100, 200):
+            self.assertIn(f'<option value="{size}">{size}条</option>', html)
+        self.assertIn(".backtest-result-symbol { white-space: nowrap; }", styles)
+        self.assertIn(".backtest-symbol-tooltip-row { display: contents; }", styles)
         self.assertIn(".backtest-syntax-help-dialog { width: min(760px, calc(100vw - 32px)); overflow: hidden; }", styles)
         self.assertIn(".backtest-syntax-help-content { min-height: 0; overflow: auto; }", styles)
 
@@ -58,6 +74,7 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertIn('id="backtest-analysis-open"', html)
         self.assertIn('id="backtest-analysis-page"', html)
         self.assertIn('id="backtest-analysis-candles"', html)
+        self.assertIn('id="backtest-analysis-leverage"', html)
         self.assertIn('data-months="12"', html)
         self.assertIn("backtest-analysis-progress", analysis_script)
         self.assertIn("/analysis/decision", analysis_script)
@@ -65,6 +82,7 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertIn("backtest-analysis-pnl-negative", analysis_script)
         self.assertIn('item.type === "strategy" ? 3.0', analysis_script)
         self.assertIn('data-series-type="${btEscape(item.type)}"', analysis_script)
+        self.assertIn("leveragedBenchmarks", analysis_script)
 
     def test_backtest_analysis_routes_forward_range_and_date_parameters(self) -> None:
         snapshot = {"run": {"id": 19}}
@@ -254,7 +272,14 @@ class BacktestRouteTests(unittest.TestCase):
             item for item in catalog.get_json()["strategies"]
             if item["key"] == "rapid_drop_wtme_rotation"
         )
-        self.assertEqual(wtme["version"], "1.7.0")
+        self.assertEqual(wtme["version"], "1.9.0")
+        self.assertFalse(
+            wtme["parameter_schema"]["enable_upside_sell_protection"]["default"]
+        )
+        self.assertEqual(
+            wtme["parameter_schema"]["max_simultaneous_holdings"]["default"],
+            1,
+        )
         self.assertEqual(wtme["parameter_schema"]["buy_top_n"]["default"], 1)
         self.assertEqual(
             wtme["parameter_schema"]["buy_score_threshold"]["default"],
@@ -328,7 +353,14 @@ class BacktestRouteTests(unittest.TestCase):
             for item in listed
             if item["code_key"] == "rapid_drop_wtme_rotation"
         )
-        self.assertEqual(wtme_strategy["code_version"], "1.7.0")
+        self.assertEqual(wtme_strategy["code_version"], "1.9.0")
+        self.assertFalse(
+            wtme_strategy["definition"]["params"]["enable_upside_sell_protection"]
+        )
+        self.assertEqual(
+            wtme_strategy["definition"]["params"]["max_simultaneous_holdings"],
+            1,
+        )
         self.assertEqual(wtme_strategy["definition"]["params"]["wtme_period"], 40)
 
         created = self.client.post(
@@ -363,7 +395,7 @@ class BacktestRouteTests(unittest.TestCase):
             "OPEN",
         )
 
-    def test_run_overview_readonly_detail_and_soft_delete_routes(self) -> None:
+    def test_run_overview_readonly_detail_and_hard_delete_routes(self) -> None:
         created = self.client.post(
             "/api/backtest/strategies",
             json={
@@ -386,6 +418,19 @@ class BacktestRouteTests(unittest.TestCase):
         overview = self.client.get("/api/backtest/runs?page=1&page_size=10")
         self.assertEqual(overview.status_code, 200)
         self.assertGreaterEqual(overview.get_json()["total_rows"], 1)
+        overview_item = next(
+            item for item in overview.get_json()["items"] if item["id"] == run["id"]
+        )
+        self.assertEqual(
+            overview_item["symbol_leverages"],
+            [{"symbol": "SPY", "leverage_multiplier": 1.0}],
+        )
+        self.assertEqual(overview_item["max_buy_count"], 1)
+        self.assertEqual(overview_item["leverage_display"], "1x")
+        self.assertEqual(
+            self.client.get("/api/backtest/runs?page=1&page_size=200").get_json()["page_size"],
+            200,
+        )
         detail = self.client.get(f"/api/backtest/runs/{run['id']}/detail")
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(
@@ -402,12 +447,55 @@ class BacktestRouteTests(unittest.TestCase):
         )
         self.assertEqual(cleaned.status_code, 200)
         self.assertEqual(cleaned.get_json()["deleted_log_rows"], 1)
+        self.assertEqual(cleaned.get_json()["deleted_run_rows"], 1)
+        self.assertEqual(cleaned.get_json()["deleted_trade_rows"], 0)
         after = self.client.get("/api/backtest/runs?page=1&page_size=10")
         self.assertEqual(after.get_json()["total_rows"], 0)
         self.assertEqual(
             self.client.get(f"/api/backtest/runs/{run['id']}/detail").status_code,
             400,
         )
+
+    def test_run_overview_uses_historical_wtme_and_missing_snapshot_metadata(self) -> None:
+        wtme = backtest_service.create_default_strategy(
+            name="WTME 总览快照测试",
+            design_mode="code",
+            selection_mode="competition",
+            code_key="rapid_drop_wtme_rotation",
+        )
+        wtme["definition"]["params"]["allocation_mode"] = "leveraged_linear_rank"
+        wtme["definition"]["params"]["buy_top_n"] = 3
+        wtme["definition"]["params"]["max_simultaneous_holdings"] = 2
+        wtme["definition"]["symbols"][0]["leverage_multiplier"] = 3.0
+        wtme_settings = {**wtme["default_settings"], "leverage_multiplier": 1.5}
+        wtme_run = backtest_repository.create_run(wtme, wtme_settings)
+
+        visual = backtest_service.create_default_strategy(
+            name="旧快照缺失字段测试",
+            design_mode="visual",
+            selection_mode="distribution",
+        )
+        visual["definition"]["symbols"][0].pop("leverage_multiplier")
+        visual_settings = dict(visual["default_settings"])
+        visual_settings.pop("leverage_multiplier")
+        visual_run = backtest_repository.create_run(visual, visual_settings)
+
+        response = self.client.get("/api/backtest/runs?page=1&page_size=10")
+        self.assertEqual(response.status_code, 200)
+        items = {item["id"]: item for item in response.get_json()["items"]}
+
+        wtme_item = items[wtme_run["id"]]
+        self.assertEqual(wtme_item["max_buy_count"], 2)
+        self.assertEqual(wtme_item["leverage_display"], "1.5x持仓数")
+        self.assertEqual(
+            wtme_item["symbol_leverages"][0],
+            {"symbol": "SPY", "leverage_multiplier": 3.0},
+        )
+
+        visual_item = items[visual_run["id"]]
+        self.assertEqual(visual_item["max_buy_count"], 2)
+        self.assertEqual(visual_item["leverage_display"], "-")
+        self.assertIsNone(visual_item["symbol_leverages"][0]["leverage_multiplier"])
 
     @patch.object(app_module, "build_run_xls", return_value=b"excel-data")
     def test_xls_log_download_uses_excel_attachment(self, build_xls) -> None:

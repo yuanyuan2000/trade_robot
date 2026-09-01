@@ -31,6 +31,7 @@ from services.twelve_data_client import (
 )
 from services.yahoo_finance_client import (
     fetch_daily_prices as fetch_yahoo_daily_prices,
+    fetch_hourly_derived_daily_prices as fetch_yahoo_hourly_derived_daily_prices,
     fetch_recent_daily_prices_fast as fetch_yahoo_recent_daily_prices_fast,
 )
 
@@ -555,12 +556,42 @@ def refresh_symbol_daily_history(
             source_provider=provider,
             source_timeframe="1Day",
         )
+        hourly_repair = None
+        if normalized == "USDINDEX" and provider == "yahoo":
+            expected = [
+                value
+                for value in latest_completed_session_dates(35)
+                if value >= start_value.isoformat()
+            ]
+            audit = assess_daily_history(normalized, expected)
+            problem_dates = [
+                *audit.get("missing_sessions", []),
+                *audit.get("incomplete_sessions", []),
+            ]
+            if problem_dates:
+                derived = fetch_yahoo_hourly_derived_daily_prices(
+                    provider_symbol,
+                    problem_dates,
+                )
+                if derived:
+                    repaired_rows = repository.upsert_daily_prices(
+                        normalized,
+                        derived,
+                        source_provider="yahoo",
+                        source_timeframe="60MinDerived",
+                    )
+                    updated_rows += repaired_rows
+                    hourly_repair = {
+                        "requested_dates": problem_dates,
+                        "repaired_dates": [row["date"] for row in derived],
+                    }
         return {
             "symbol": normalized,
             "source": provider,
             "provider_symbol": provider_symbol,
             "start_date": start_value.isoformat(),
             "updated_rows": updated_rows,
+            "hourly_daily_repair": hourly_repair,
         }
 
     return market_data_request_coordinator.run(
@@ -642,11 +673,13 @@ def update_full_market_data(
     try:
         integrity = _manual_integrity(normalized)
         if not integrity["complete"] and integrity.get("repair_start_date"):
-            refresh_symbol_daily_history(
+            repair_result = refresh_symbol_daily_history(
                 normalized,
                 start_date=integrity["repair_start_date"],
                 priority=priority,
             )
+            result["source"] = repair_result.get("source") or result.get("source")
+            result["daily_repair"] = repair_result
             integrity = _manual_integrity(normalized)
             # Preserve minute-import metadata while replacing the display
             # rows with the post-repair database snapshot.
