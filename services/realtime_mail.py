@@ -260,7 +260,7 @@ def _limit_decimal_places(value: str) -> str:
 
 def _wtme_score_table(score_logs: list[dict]) -> list[str]:
     lines = [
-        "| 标的 | 持仓比例 | WTME评分 | 急跌过滤后排名 |",
+        "| 标的 | 模型目标敞口 | WTME评分 | 急跌过滤后排名 |",
         "| --- | ---: | ---: | ---: |",
     ]
     for log in score_logs[:12]:
@@ -303,7 +303,7 @@ def _decision_template_text(recommendations: list[dict]) -> str:
     return "\n".join(
         f"{item['action']} {item['symbol']} "
         f"{_format_number(item.get('target_weight_percent', 0))}%，"
-        f"持仓比例 {_format_number(item.get('holding_percent', 0))}%"
+        f"目标敞口 {_format_number(item.get('holding_percent', 0))}%"
         for item in recommendations
     )
 
@@ -398,15 +398,15 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
             lines.extend(f"- {log.get('message', '')}" for log in risk_logs[:12])
         else:
             lines.append("- 本次事件没有生成风险检查明细。")
-        lines.extend(["", "持仓处置："])
+        lines.extend(["", "模型目标调整："])
         if recommendations:
             for item in recommendations[:12]:
                 lines.append(
                     f"- {item['action']} {item['symbol']}，目标仓位 {item['target_weight_percent']:.2f}%，"
-                    f"持仓比例 {item.get('holding_percent', 0):.2f}%；{item['reason']}"
+                    f"目标敞口 {item.get('holding_percent', 0):.2f}%；{item['reason']}"
                 )
         else:
-            lines.append("- 没有已持仓标的触发风险卖出。")
+            lines.append("- 没有模型目标触发风险退出。")
     elif rapid_drop_code and event == params.get("selection_time"):
         score_event_type = (
             "RAPID_DROP_WTME_DAILY_SCORE"
@@ -433,7 +433,7 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
             for item in recommendations[:12]:
                 lines.append(
                     f"- {item['action']} {item['symbol']}，目标仓位 {item['target_weight_percent']:.2f}%，"
-                    f"持仓比例 {item.get('holding_percent', 0):.2f}%，"
+                    f"目标敞口 {item.get('holding_percent', 0):.2f}%，"
                     f"有效杠杆 {item['effective_leverage']:.2f}×；{item['reason']}"
                 )
         else:
@@ -444,11 +444,23 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
             for item in recommendations[:12]:
                 lines.append(
                     f"- {item['action']} {item['symbol']}，目标仓位 {item['target_weight_percent']:.2f}%，"
-                    f"持仓比例 {item.get('holding_percent', 0):.2f}%，"
+                    f"目标敞口 {item.get('holding_percent', 0):.2f}%，"
                     f"有效杠杆 {item['effective_leverage']:.2f}×；{item['reason']}"
                 )
         else:
-            lines.append("- 当前事件没有新的调仓建议。")
+            lines.append("- 当前事件没有新的模型目标变化。")
+    targets = decision.get("target_portfolio") or []
+    lines.extend(["", "完整模型目标组合："])
+    if targets:
+        change_labels = {"ENTER": "进入", "EXIT": "退出", "ADJUST": "调整", "HOLD": "不变"}
+        for item in targets:
+            lines.append(
+                f"- {item['symbol']}：目标仓位 {item.get('target_weight_percent', 0):.2f}%，"
+                f"目标敞口 {item.get('target_exposure_percent', 0):.2f}%；"
+                f"相对上次模型建议{change_labels.get(item.get('change'), item.get('change', ''))}"
+            )
+    else:
+        lines.append("- 全部标的目标仓位为 0%，模型建议保持现金。")
     if strategy_snapshot.get("design_mode") == "visual":
         lines.extend(["", "决策依据：", *[f"- {item}" for item in basis_text.splitlines()]])
     warnings = decision.get("data_warnings") or result.get("data_manifest", {}).get("missing") or []
@@ -467,7 +479,8 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
             lines.extend(["", "评分摘要：", *[f"- {item}" for item in calculations[:12]]])
     lines.extend([
         "",
-        "本邮件为实时决策辅助信息，需人工核验行情、风险和实际持仓后再决定是否交易。",
+        "系统未连接交易账户，不掌握实际持仓，也不会计算交易股数、费用或盈亏。",
+        "本邮件为实时决策辅助信息，请结合实际账户、交易成本和平台规则自行决定是否交易。",
     ])
     event_label = event
     if rapid_drop_code:
@@ -539,6 +552,22 @@ class NotificationDispatcher:
         settings = task.get("notification_settings") or {}
         if not settings.get("enabled"):
             return 0
+        selected_events = {
+            str(item).strip().upper()
+            for item in (settings.get("events") or [])
+            if str(item).strip()
+        }
+        if selected_events and str(result["decision"]["event"]).upper() not in selected_events:
+            return 0
+        if settings.get("only_when") == "changes":
+            targets = result["decision"].get("target_portfolio")
+            changed = (
+                any(item.get("change") != "HOLD" for item in targets)
+                if targets is not None
+                else bool(result["decision"].get("recommendations"))
+            )
+            if not changed:
+                return 0
         channel_id = settings.get("channel_id")
         if not channel_id:
             raise MailError("已启用邮件但未选择邮件通道。", code="CHANNEL_MISSING")
@@ -550,11 +579,21 @@ class NotificationDispatcher:
         )
         if not allowed:
             return 0
+        next_attempt_at = None
+        delivery_time = str(settings.get("delivery_time") or "").strip()
+        if delivery_time:
+            hour, minute = map(int, delivery_time.split(":"))
+            now_ny = datetime.now(NEW_YORK)
+            send_at = now_ny.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if send_at <= now_ny:
+                send_at += timedelta(days=1)
+            next_attempt_at = send_at.astimezone(timezone.utc).isoformat()
         for recipient in recipients:
             dedupe = f"event:{event['id']}:channel:{channel_id}:recipient:{recipient}"
             realtime_repository.create_notification(
                 event_id=event["id"], task_id=task["id"], channel_id=int(channel_id),
                 recipient=recipient, subject=subject, body=body, dedupe_key=dedupe,
+                next_attempt_at=next_attempt_at,
             )
             inserted += 1
         self.wake()

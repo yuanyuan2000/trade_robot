@@ -195,23 +195,6 @@ class BacktestEngine:
         requirements = self._build_requirements()
         self.events = requirements["events"]
         self.minimum_lookback = requirements["minimum_lookback"]
-        if self.code_strategy is not None:
-            minimum_trade = float(self.code_strategy.params.get("minimum_trade_value_usd", 0))
-            holdings = int(self.code_strategy.params.get("holdings_num", 1))
-            minimum_symbol_leverage = (
-                1.0
-                if self.dynamic_leverage_enabled
-                else min(self.symbol_leverages.values(), default=1)
-            )
-            if minimum_trade >= (
-                self.settings["initial_capital"]
-                * self.settings["leverage_multiplier"]
-                * minimum_symbol_leverage
-                / holdings
-            ):
-                raise BacktestValidationError(
-                    "最小非清仓交易额必须小于杠杆后可用敞口除以目标持仓数量。"
-                )
         self.tradable_symbols = list(
             dict.fromkeys([*self.universe, *self.auxiliary_symbols])
         )

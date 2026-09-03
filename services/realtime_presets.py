@@ -3,6 +3,7 @@ from __future__ import annotations
 from database import backtest_repository, realtime_repository
 from services.backtest.presets import SEVENSTAR_SMALL
 from services.realtime_panel_script import generate_panel_settings
+from services.realtime_config import empty_recommendation_state, realtime_settings_from
 
 
 SEVENSTAR_SMALL_TASK_SEED = "builtin-sevenstar-small-realtime-v1"
@@ -44,8 +45,7 @@ def ensure_shipped_realtime_tasks() -> dict | None:
     }
     if name in existing_names:
         name += "（内置）"
-    settings = dict(strategy.get("default_settings") or {})
-    capital = float(settings.get("initial_capital", 100_000))
+    settings = realtime_settings_from(strategy.get("default_settings"))
     return realtime_repository.seed_task_once(
         SEVENSTAR_SMALL_TASK_SEED,
         name=name,
@@ -53,6 +53,6 @@ def ensure_shipped_realtime_tasks() -> dict | None:
         follow_strategy=True,
         settings=settings,
         notification_settings={"enabled": False},
-        portfolio_state={"cash": capital, "positions": {}},
+        portfolio_state=empty_recommendation_state(),
         panel_settings=generate_panel_settings(strategy),
     )

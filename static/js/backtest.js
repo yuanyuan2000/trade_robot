@@ -572,6 +572,12 @@ function renderBacktestCodeParameters() {
   const spec = bt.codeCatalog.find((item) => item.key === bt.current.code_key);
   document.getElementById("backtest-code-title").textContent = spec?.name || bt.current.code_key;
   document.getElementById("backtest-code-description").textContent = spec?.description || "";
+  if (window.StrategyForm?.renderCodeParameters) {
+    window.StrategyForm.renderCodeParameters(btCodeParams, bt.current, bt.codeCatalog, {
+      readOnly: bt.readOnly,
+    });
+    return;
+  }
   if (!spec) {
     btCodeParams.innerHTML = '<div class="backtest-empty">代码策略未注册。</div>';
     return;

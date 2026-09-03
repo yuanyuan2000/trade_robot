@@ -1,5 +1,5 @@
 const rt = {
-  tasks: [], strategies: [], channels: [], current: null,
+  tasks: [], strategies: [], codeCatalog: [], channels: [], current: null,
   activePanel: "dashboard", dashboard: null,
   sort: null, listRefreshInFlight: false, dashboardInFlight: false,
   lastListRefreshAt: 0, refreshTimer: null, dashboardTimer: null,
@@ -73,9 +73,28 @@ function rtVisualDecisionSchedule(strategy) {
   return unique.length ? `当前决策时点：${unique.map(describe).join("、")}` : "当前任务没有已启用的决策时点。";
 }
 
+function rtSettingsFromStrategy(strategy) {
+  const defaults = strategy?.default_settings || {};
+  const dynamic = defaults.dynamic_leverage || {};
+  return {
+    leverage_multiplier: defaults.leverage_multiplier ?? 1,
+    dynamic_leverage: {
+      volatility_period: dynamic.volatility_period ?? 30,
+      stress_days: dynamic.stress_days ?? 13,
+      max_loss_percent: dynamic.max_loss_percent ?? 25,
+      max_leverage: dynamic.max_leverage ?? 3,
+      rebalance_on_change: dynamic.rebalance_on_change !== false,
+    },
+  };
+}
+
 async function loadRealtimeStrategies() {
-  const payload = await rtJson(await fetch("/api/backtest/strategies"));
+  const [payload, catalog] = await Promise.all([
+    rtJson(await fetch("/api/backtest/strategies")),
+    rtJson(await fetch("/api/backtest/code-strategies")),
+  ]);
   rt.strategies = payload.strategies || [];
+  rt.codeCatalog = catalog.strategies || [];
   document.getElementById("realtime-create-strategy").innerHTML = rt.strategies.map((strategy) => (
     `<option value="${strategy.id}">${rtEscape(strategy.name)} · ${strategy.design_mode === "code" ? "代码" : "非代码"}</option>`
   )).join("");
@@ -180,13 +199,29 @@ function renderRealtimeDetail() {
   refreshRealtimeDetailStatus(task);
   document.getElementById("realtime-name").value = task.name;
   document.getElementById("realtime-follow").checked = Boolean(task.follow_strategy);
-  document.getElementById("realtime-capital").value = task.settings?.initial_capital ?? 100000;
   document.getElementById("realtime-leverage").value = task.settings?.leverage_multiplier ?? 1;
+  const dynamic = task.settings?.dynamic_leverage || {};
+  document.getElementById("realtime-dynamic-volatility-period").value = dynamic.volatility_period ?? 30;
+  document.getElementById("realtime-dynamic-stress-days").value = dynamic.stress_days ?? 13;
+  document.getElementById("realtime-dynamic-max-loss").value = dynamic.max_loss_percent ?? 25;
+  document.getElementById("realtime-dynamic-max-leverage").value = dynamic.max_leverage ?? 3;
   const dynamicLeverageEnabled = Boolean(task.strategy_snapshot?.definition?.dynamic_leverage_enabled);
-  document.getElementById("realtime-dynamic-rebalance-field").hidden = !dynamicLeverageEnabled;
   document.getElementById("realtime-dynamic-rebalance-on-change").checked = task.settings?.dynamic_leverage?.rebalance_on_change !== false;
   document.getElementById("realtime-strategy-summary").textContent = `${task.strategy_snapshot?.name || ""}\n设计模式：${task.strategy_snapshot?.design_mode || ""}\n选标模式：${task.strategy_snapshot?.selection_mode || ""}\n正式候选池：${(task.strategy_snapshot?.definition?.symbols || []).map((item) => item.symbol).join(", ")}`;
   document.getElementById("realtime-definition-json").value = JSON.stringify(task.strategy_snapshot?.definition || {}, null, 2);
+  const running = ["starting", "running", "degraded", "stopping"].includes(task.runtime_state);
+  StrategyForm.render(
+    document.getElementById("realtime-strategy-form"),
+    task.strategy_snapshot,
+    rt.codeCatalog,
+    { readOnly: running || Boolean(task.follow_strategy) },
+  );
+  document.querySelectorAll(".realtime-dynamic-setting").forEach((field) => {
+    field.hidden = false;
+    field.classList.toggle("is-disabled", !dynamicLeverageEnabled);
+    const input = field.querySelector("input");
+    if (input) input.disabled = running || Boolean(task.follow_strategy) || !dynamicLeverageEnabled;
+  });
   const visual = task.strategy_snapshot?.design_mode === "visual";
   document.getElementById("realtime-panel-script-fields").hidden = !visual;
   document.getElementById("realtime-code-panel-note").hidden = visual;
@@ -196,6 +231,9 @@ function renderRealtimeDetail() {
   document.getElementById("realtime-mail-enabled").checked = Boolean(notification.enabled);
   document.getElementById("realtime-channel").value = notification.channel_id || "";
   document.getElementById("realtime-recipients").value = Array.isArray(notification.recipients) ? notification.recipients.join(", ") : (notification.recipients || "");
+  document.getElementById("realtime-mail-events").value = (notification.events || []).join(", ");
+  document.getElementById("realtime-mail-only-when").value = notification.only_when || "all";
+  document.getElementById("realtime-mail-delivery-time").value = notification.delivery_time || "";
   document.getElementById("realtime-subject-template").value = notification.subject_template || "";
   document.getElementById("realtime-body-template").value = notification.body_template || "";
   document.getElementById("realtime-body-template-help").hidden = !visual;
@@ -203,17 +241,22 @@ function renderRealtimeDetail() {
   const preview = document.getElementById("realtime-code-body-preview");
   preview.hidden = visual || Boolean(notification.body_template);
   preview.textContent = preview.hidden ? "" : rtCodeBodyPreview(task.strategy_snapshot);
-  const running = ["starting", "running", "degraded", "stopping"].includes(task.runtime_state);
-  ["realtime-name", "realtime-capital", "realtime-leverage", "realtime-dynamic-rebalance-on-change", "realtime-follow", "realtime-definition-json", "realtime-save"].forEach((id) => {
-    document.getElementById(id).disabled = running || (id === "realtime-definition-json" && Boolean(task.follow_strategy));
+  ["realtime-leverage", "realtime-definition-json"].forEach((id) => {
+    document.getElementById(id).disabled = running || Boolean(task.follow_strategy);
   });
-  ["realtime-mail-enabled", "realtime-channel", "realtime-recipients", "realtime-subject-template", "realtime-body-template", "realtime-save-mail"].forEach((id) => {
+  ["realtime-name", "realtime-follow", "realtime-save"].forEach((id) => {
+    document.getElementById(id).disabled = running;
+  });
+  ["realtime-mail-enabled", "realtime-channel", "realtime-recipients", "realtime-mail-events", "realtime-mail-only-when", "realtime-mail-delivery-time", "realtime-subject-template", "realtime-body-template", "realtime-save-mail"].forEach((id) => {
     document.getElementById(id).disabled = running;
   });
 }
 
 async function openRealtimeTask(taskId) {
   try {
+    // Refresh the source list every time so switching to follow cannot reuse
+    // defaults cached before the user edited the backtest strategy.
+    await loadRealtimeStrategies();
     const payload = await rtJson(await fetch(`/api/realtime/tasks/${taskId}`));
     rt.current = payload.task;
     rt.dashboard = null;
@@ -286,7 +329,7 @@ function renderRealtimeDashboardTable() {
     ["symbol", "标的", "展示行情总览中的全部标的；蓝点表示属于当前任务候选池。"],
     ["status", "状态", "仅代表当前价下的面板观察结果，不等同于正式邮件决策。"],
     ["latest_price", "最新价格", "直接读取行情总览内部数据库。"],
-    ["holding_percent", "仓位", "若此刻买入该标的，按当前策略目标权重、整体杠杆、单标的杠杆及策略附加杠杆计算的持仓敞口；正式入选时与决策邮件口径一致。"],
+    ["holding_percent", "目标敞口", "若此刻入选，按策略目标权重、整体杠杆、单标的杠杆及策略附加杠杆计算的模型目标敞口；不代表实际账户持仓。"],
     ...columns.map((column) => [column.key, column.label, column.help]),
     ["rank", "面板排名", "只在行情总览展示范围内排名，不改变正式任务目标。"],
     ["price_updated_at", "更新时间", "内部数据库中该价格的更新时间。"],
@@ -348,30 +391,61 @@ async function loadRealtimeDashboard(force = false) {
 async function saveRealtimeTask() {
   const task = rt.current;
   if (!task) return;
+  const invalid = document.querySelector('[data-realtime-panel="parameters"] input:invalid, [data-realtime-panel="parameters"] select:invalid, [data-realtime-panel="parameters"] textarea:invalid');
+  if (invalid) {
+    invalid.reportValidity();
+    rtSetStatus("请先修正超出范围或格式不正确的参数。", "error", true);
+    return;
+  }
   const follow = document.getElementById("realtime-follow").checked;
   const snapshot = structuredClone(task.strategy_snapshot);
   if (!follow) {
-    try { snapshot.definition = JSON.parse(document.getElementById("realtime-definition-json").value); }
-    catch (_error) { rtSetStatus("策略定义 JSON 格式错误。", "error", true); return; }
+    try {
+      snapshot.definition = StrategyForm.collect(
+        document.getElementById("realtime-strategy-form"), snapshot, rt.codeCatalog
+      );
+    } catch (_error) { rtSetStatus("策略可视化配置格式错误。", "error", true); return; }
+  }
+  const selectedSettings = {
+    leverage_multiplier: Number(document.getElementById("realtime-leverage").value),
+    dynamic_leverage: {
+      volatility_period: Number(document.getElementById("realtime-dynamic-volatility-period").value),
+      stress_days: Number(document.getElementById("realtime-dynamic-stress-days").value),
+      max_loss_percent: Number(document.getElementById("realtime-dynamic-max-loss").value),
+      max_leverage: Number(document.getElementById("realtime-dynamic-max-leverage").value),
+      rebalance_on_change: document.getElementById("realtime-dynamic-rebalance-on-change").checked,
+    },
+  };
+  const followedSource = follow
+    ? rt.strategies.find((item) => Number(item.id) === Number(task.strategy_id))
+    : null;
+  const sourceSettings = (followedSource || snapshot).default_settings || {};
+  const sourceDynamic = sourceSettings.dynamic_leverage || {};
+  const settingsOverrides = {};
+  if (!follow) {
+    if (Number(selectedSettings.leverage_multiplier) !== Number(sourceSettings.leverage_multiplier ?? 1)) {
+      settingsOverrides.leverage_multiplier = selectedSettings.leverage_multiplier;
+    }
+    Object.entries(selectedSettings.dynamic_leverage).forEach(([key, value]) => {
+      if (value !== sourceDynamic[key]) {
+        settingsOverrides.dynamic_leverage ||= {};
+        settingsOverrides.dynamic_leverage[key] = value;
+      }
+    });
   }
   const payload = {
     revision: task.revision,
     name: document.getElementById("realtime-name").value.trim(),
     follow_strategy: follow,
     strategy_snapshot: snapshot,
-    settings: {
-      ...task.settings,
-      initial_capital: Number(document.getElementById("realtime-capital").value),
-      leverage_multiplier: Number(document.getElementById("realtime-leverage").value),
-      dynamic_leverage: {
-        ...(task.settings?.dynamic_leverage || {}),
-        rebalance_on_change: document.getElementById("realtime-dynamic-rebalance-on-change").checked,
-      },
-    },
+    settings_overrides: settingsOverrides,
     notification_settings: {
       enabled: document.getElementById("realtime-mail-enabled").checked,
       channel_id: Number(document.getElementById("realtime-channel").value) || null,
       recipients: document.getElementById("realtime-recipients").value,
+      events: document.getElementById("realtime-mail-events").value,
+      only_when: document.getElementById("realtime-mail-only-when").value,
+      delivery_time: document.getElementById("realtime-mail-delivery-time").value || null,
       subject_template: document.getElementById("realtime-subject-template").value,
       body_template: document.getElementById("realtime-body-template").value,
     },
@@ -449,6 +523,45 @@ async function createRealtimeChannel(event) {
 }
 
 function initRealtime() {
+  const strategyForm = document.getElementById("realtime-strategy-form");
+  const syncRealtimeStrategyForm = (event) => {
+    if (!rt.current || document.getElementById("realtime-follow").checked) return;
+    try {
+      const definition = StrategyForm.collect(strategyForm, rt.current.strategy_snapshot, rt.codeCatalog);
+      document.getElementById("realtime-definition-json").value = JSON.stringify(definition, null, 2);
+      document.querySelectorAll(".realtime-dynamic-setting").forEach((field) => {
+        field.hidden = false;
+        field.classList.toggle("is-disabled", !definition.dynamic_leverage_enabled);
+        const input = field.querySelector("input");
+        if (input) input.disabled = !definition.dynamic_leverage_enabled;
+      });
+      if (event?.target?.matches("[data-dynamic-enabled]")) {
+        rt.current.strategy_snapshot.definition = definition;
+        StrategyForm.render(strategyForm, rt.current.strategy_snapshot, rt.codeCatalog, { readOnly: false });
+      }
+    } catch (_error) { /* server validation reports incomplete edits on save */ }
+  };
+  StrategyForm.bind(
+    strategyForm,
+    (definition) => {
+      if (!rt.current) return;
+      rt.current.strategy_snapshot.definition = definition;
+      StrategyForm.render(strategyForm, rt.current.strategy_snapshot, rt.codeCatalog, { readOnly: false });
+      document.getElementById("realtime-definition-json").value = JSON.stringify(definition, null, 2);
+    },
+    () => StrategyForm.collect(strategyForm, rt.current.strategy_snapshot, rt.codeCatalog),
+  );
+  strategyForm.addEventListener("input", syncRealtimeStrategyForm);
+  strategyForm.addEventListener("change", syncRealtimeStrategyForm);
+  document.getElementById("realtime-definition-json").addEventListener("change", (event) => {
+    if (!rt.current || document.getElementById("realtime-follow").checked) return;
+    try {
+      const definition = JSON.parse(event.target.value);
+      rt.current.strategy_snapshot.definition = definition;
+      StrategyForm.render(strategyForm, rt.current.strategy_snapshot, rt.codeCatalog, { readOnly: false });
+      rtSetStatus("高级 JSON 已同步到可视化表单，保存后生效。", "neutral", true);
+    } catch (_error) { rtSetStatus("策略定义 JSON 格式错误。", "error", true); }
+  });
   window.addEventListener("market-overview-auto-refresh-changed", (event) => {
     document.getElementById("realtime-overview-auto-toggle").checked = Boolean(event.detail?.enabled);
   });
@@ -508,17 +621,44 @@ function initRealtime() {
   document.getElementById("realtime-test-channel").addEventListener("click", async () => {
     const channelId = Number(document.getElementById("realtime-channel").value);
     const channel = rt.channels.find((item) => Number(item.id) === channelId);
-    const recipient = window.prompt("测试邮件收件地址：", document.getElementById("realtime-recipients").value.split(/[,;\s]+/)[0] || channel?.sender_email || "");
-    if (!channelId || !recipient) return;
-    try { await rtJson(await fetch(`/api/realtime/email-channels/${channelId}/test`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ recipient }) })); rtSetStatus("测试邮件已提交。", "success", true); }
+    const recipients = window.prompt("测试邮件收件地址（可用逗号分隔）：", document.getElementById("realtime-recipients").value || channel?.sender_email || "");
+    if (!channelId || !recipients || !rt.current?.id) return;
+    const button = document.getElementById("realtime-test-channel");
+    button.disabled = true;
+    rtSetStatus("正在读取数据面板的本地最新行情并逐项生成策略决策邮件…", "neutral", true);
+    try {
+      const payload = await rtJson(await fetch(`/api/realtime/tasks/${rt.current.id}/test-email`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ channel_id: channelId, recipients }) }));
+      rtSetStatus(`${payload.message}（事件：${payload.events.join("、")}）`, "success", true);
+    }
     catch (error) { rtSetStatus(error.message, "error", true); }
+    finally { button.disabled = false; }
   });
   document.getElementById("realtime-body-template").addEventListener("input", (event) => {
     const preview = document.getElementById("realtime-code-body-preview");
     if (rt.current?.strategy_snapshot?.design_mode === "code") preview.hidden = Boolean(event.target.value.trim());
   });
   document.getElementById("realtime-follow").addEventListener("change", (event) => {
-    document.getElementById("realtime-definition-json").disabled = event.target.checked;
+    if (rt.current) {
+      rt.current.follow_strategy = event.target.checked;
+      if (event.target.checked) {
+        const source = rt.strategies.find(
+          (item) => Number(item.id) === Number(rt.current.strategy_id)
+        );
+        if (source) {
+          rt.current.strategy_snapshot = structuredClone(source);
+          rt.current.settings = rtSettingsFromStrategy(source);
+          rt.current.settings_overrides = {};
+        }
+      }
+      renderRealtimeDetail();
+      rtSetStatus(
+        event.target.checked
+          ? "已回填源策略的定义和共用运行设置，点击保存后生效。"
+          : "已取消跟随，现在可以独立修改策略和共用运行设置。",
+        "neutral",
+        true,
+      );
+    }
   });
   document.getElementById("realtime-back").addEventListener("click", async () => { window.clearInterval(rt.dashboardTimer); rtDetailPage.hidden = true; rtListPage.hidden = false; rt.current = null; await loadRealtimeTasks(); });
   document.getElementById("realtime-start").addEventListener("click", async () => { try { rt.current = (await rtJson(await fetch(`/api/realtime/tasks/${rt.current.id}/start`, { method: "POST" }))).task; renderRealtimeDetail(); await loadRealtimeTasks({ silent: true }); } catch (error) { rtSetStatus(error.message, "error", true); } });
@@ -568,7 +708,7 @@ function initRealtime() {
     if (action === "delete") { if (!confirm("删除任务？历史决策和邮件审计将保留。")) return; try { await rtJson(await fetch(`/api/realtime/tasks/${id}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirm: true }) })); await loadRealtimeTasks(); } catch (error) { rtSetStatus(error.message, "error"); } return; }
     await openRealtimeTask(id);
   });
-  loadRealtimeChannels(); loadRealtimeTasks();
+  loadRealtimeStrategies(); loadRealtimeChannels(); loadRealtimeTasks();
   rt.refreshTimer = window.setInterval(() => {
     if (rtDetailPage.hidden) { renderRealtimeCards(); if (Date.now() - rt.lastListRefreshAt >= 15_000) loadRealtimeTasks({ silent: true }); }
     else if (Date.now() - rt.lastListRefreshAt >= 15_000) { loadRealtimeTaskStatus(); rt.lastListRefreshAt = Date.now(); }

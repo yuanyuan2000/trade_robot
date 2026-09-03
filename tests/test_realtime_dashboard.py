@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date, timedelta
 from pathlib import Path
 import tempfile
@@ -11,6 +12,7 @@ from database import backtest_repository, realtime_repository, repository
 from services.backtest.presets import ensure_shipped_strategy_presets
 from services.market_overview_coordinator import MarketOverviewRefreshCoordinator
 from services.realtime_dashboard_service import (
+    build_database_decision_observation,
     build_realtime_dashboard,
     clear_realtime_dashboard_cache,
     dashboard_recommendations,
@@ -86,6 +88,71 @@ class RealtimeDashboardTests(unittest.TestCase):
             [item["rank"] for item in recommendations],
             list(range(1, len(recommendations) + 1)),
         )
+
+    def test_test_mail_observation_reuses_dashboard_database_prices(self) -> None:
+        task = next(
+            task for task in realtime_repository.list_tasks()
+            if task["strategy_snapshot"].get("code_key") == "sevenstar_etf_rotation"
+        )
+        strategy = task["strategy_snapshot"]
+        symbols = ["SPY", "GLD"]
+        with (
+            patch.object(
+                IEXMarketDataHub,
+                "event_snapshot",
+                side_effect=AssertionError("must not call external event API"),
+            ),
+            patch(
+                "services.realtime_market_data.fetch_stock_bars",
+                side_effect=AssertionError("must not fetch Alpaca prices"),
+            ),
+        ):
+            dashboard = build_realtime_dashboard(task["id"], force=True)
+            observation = build_database_decision_observation(strategy, symbols)
+
+        dashboard_rows = {row["symbol"]: row for row in dashboard["rows"]}
+        for symbol in symbols:
+            self.assertEqual(
+                observation["payload"]["symbols"][symbol]["signal_price"],
+                dashboard_rows[symbol]["latest_price"],
+            )
+        self.assertEqual(
+            observation["payload"]["source"], "market_overview_database"
+        )
+        self.assertEqual(observation["payload"]["feed"], "database")
+
+    def test_detached_legacy_sevenstar_snapshot_drops_retired_amount_parameter(self) -> None:
+        import app as app_module
+
+        strategy = next(
+            item for item in backtest_repository.list_strategies()
+            if item.get("code_key") == "sevenstar_etf_rotation"
+        )
+        legacy = deepcopy(strategy)
+        legacy["code_version"] = "1.1.0"
+        legacy["definition"]["params"]["minimum_trade_value_usd"] = 0
+        task = realtime_repository.create_task(
+            name="旧七星独立快照",
+            strategy=legacy,
+            follow_strategy=False,
+            settings=legacy["default_settings"],
+            notification_settings={},
+            portfolio_state={},
+        )
+
+        response = app_module.app.test_client().patch(
+            f"/api/realtime/tasks/{task['id']}",
+            json={
+                "revision": task["revision"],
+                "follow_strategy": False,
+                "strategy_snapshot": legacy,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        snapshot = response.get_json()["task"]["strategy_snapshot"]
+        self.assertEqual(snapshot["code_version"], "1.2.0")
+        self.assertNotIn("minimum_trade_value_usd", snapshot["definition"]["params"])
 
     def test_running_dashboard_candidate_marker_uses_run_snapshot(self) -> None:
         task = next(
@@ -640,7 +707,15 @@ class RealtimeDashboardTests(unittest.TestCase):
         html = client.get("/").get_data(as_text=True)
         self.assertIn('data-realtime-panel="dashboard"', html)
         self.assertIn('data-realtime-tab="parameters"', html)
+        self.assertIn('id="realtime-strategy-form"', html)
+        self.assertNotIn('id="realtime-capital"', html)
+        self.assertIn("历史成交模拟", html)
+        self.assertIn('id="realtime-mail-events"', html)
+        self.assertIn('id="realtime-mail-delivery-time"', html)
         self.assertIn('id="realtime-dynamic-rebalance-on-change"', html)
+        self.assertEqual(html.count("动态杠杆变化时自动再平衡"), 2)
+        self.assertEqual(html.count("整体杠杆倍率"), 2)
+        self.assertEqual(html.count("动态单标的杠杆上限 max_l"), 2)
         self.assertNotIn('class="realtime-dashboard-summary"', html)
         self.assertIn('class="realtime-back-icon"', html)
         self.assertIn("按任务策略模拟最新时点，非正式决策", html)
@@ -650,7 +725,7 @@ class RealtimeDashboardTests(unittest.TestCase):
         self.assertIn('`已过滤 ${summary.filtered ?? 0}`', script)
         self.assertNotIn('<small class="realtime-reason">', script)
         self.assertIn('title="${rtEscape(row.reason', script)
-        self.assertIn('["holding_percent", "仓位"', script)
+        self.assertIn('["holding_percent", "目标敞口"', script)
         self.assertIn('rtFormatMetric(row.holding_percent, "percent_value")', script)
         self.assertIn("maximumSignificantDigits: 4", script)
         self.assertNotIn('["status", "策略状态"', script)
@@ -688,6 +763,9 @@ class RealtimeDashboardTests(unittest.TestCase):
             "follow_strategy": True,
         })
         self.assertEqual(created.status_code, 201)
+        created_task = created.get_json()["task"]
+        self.assertEqual(set(created_task["settings"]), {"leverage_multiplier", "dynamic_leverage"})
+        self.assertNotIn("initial_capital", created_task["settings"])
         task = created.get_json()["task"]
         self.assertTrue(task["panel_settings"]["script"])
         realtime_repository.set_task_runtime(task["id"], runtime_state="running")
@@ -714,6 +792,48 @@ class RealtimeDashboardTests(unittest.TestCase):
         script = (Path(__file__).parents[1] / "static" / "js" / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("overviewLiveRefreshMs", script)
         self.assertNotIn("refreshOverviewLivePrices", script)
+
+    def test_current_decision_test_email_route_reports_all_sent_events(self) -> None:
+        import app as app_module
+
+        summary = {
+            "task_id": 9,
+            "trading_date": "2026-08-03",
+            "observation_at": "2026-08-03T14:05:00Z",
+            "events": ["09:50", "10:00"],
+            "recipient_count": 1,
+            "sent_count": 2,
+            "messages": [],
+        }
+        with (
+            patch.object(
+                app_module.realtime_repository,
+                "get_email_channel",
+                return_value={"id": 3, "sender_email": "sender@example.com"},
+            ),
+            patch.object(
+                app_module,
+                "send_current_decision_test_emails",
+                return_value=summary,
+            ) as sender,
+            patch.object(
+                app_module.realtime_repository,
+                "mark_email_channel_test",
+            ) as mark_test,
+        ):
+            response = app_module.app.test_client().post(
+                "/api/realtime/tasks/9/test-email",
+                json={"channel_id": 3, "recipients": "me@example.com"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["events"], ["09:50", "10:00"])
+        self.assertEqual(payload["sent_count"], 2)
+        sender.assert_called_once_with(
+            9, channel_id=3, recipients="me@example.com"
+        )
+        mark_test.assert_called_once_with(3, ok=True)
 
     def test_overview_coordinator_persists_one_shared_switch(self) -> None:
         coordinator = MarketOverviewRefreshCoordinator(sync_callback=lambda: {"updated_rows": 0})

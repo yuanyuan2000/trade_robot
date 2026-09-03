@@ -25,16 +25,30 @@ def _decode(value: str | None, default: Any) -> Any:
     return json.loads(value)
 
 
+def _project_realtime_settings(value: dict | None) -> dict:
+    source = value or {}
+    return {
+        key: source[key]
+        for key in ("leverage_multiplier", "dynamic_leverage")
+        if key in source
+    }
+
+
 def _task_row(row: sqlite3.Row | dict) -> dict:
     item = dict(row)
     for column, key, default in (
         ("strategy_snapshot_json", "strategy_snapshot", {}),
         ("settings_json", "settings", {}),
+        ("settings_overrides_json", "settings_overrides", {}),
         ("panel_settings_json", "panel_settings", {}),
         ("notification_settings_json", "notification_settings", {}),
         ("portfolio_state_json", "portfolio_state", {}),
     ):
         item[key] = _decode(item.pop(column, None), default)
+    item["settings"] = _project_realtime_settings(item["settings"])
+    item["settings_overrides"] = _project_realtime_settings(
+        item["settings_overrides"]
+    )
     return item
 
 
@@ -94,6 +108,7 @@ def create_task(
     settings: dict,
     notification_settings: dict,
     portfolio_state: dict,
+    settings_overrides: dict | None = None,
     panel_settings: dict | None = None,
 ) -> dict:
     now = utc_now_iso()
@@ -105,11 +120,11 @@ def create_task(
                 INSERT INTO realtime_decision_tasks (
                     name, strategy_id, follow_strategy,
                     source_strategy_revision, source_code_version,
-                    strategy_snapshot_json, settings_json,
+                    strategy_snapshot_json, settings_json, settings_overrides_json,
                     panel_settings_json, notification_settings_json, portfolio_state_json,
                     desired_state, runtime_state, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', 'stopped', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stopped', 'stopped', ?, ?)
                 """,
                 (
                     str(name).strip(),
@@ -118,7 +133,8 @@ def create_task(
                     int(strategy["revision"]),
                     strategy.get("code_version"),
                     _json(snapshot),
-                    _json(settings),
+                    _json(_project_realtime_settings(settings)),
+                    _json(_project_realtime_settings(settings_overrides)),
                     _json(panel_settings or {}),
                     _json(notification_settings),
                     _json(portfolio_state),
@@ -143,6 +159,7 @@ def seed_task_once(
     settings: dict,
     notification_settings: dict,
     portfolio_state: dict,
+    settings_overrides: dict | None = None,
     panel_settings: dict | None = None,
 ) -> dict | None:
     """Create one built-in task once, including across a later soft delete."""
@@ -164,6 +181,7 @@ def seed_task_once(
         strategy=strategy,
         follow_strategy=follow_strategy,
         settings=settings,
+        settings_overrides=settings_overrides,
         notification_settings=notification_settings,
         portfolio_state=portfolio_state,
         panel_settings=panel_settings,
@@ -193,6 +211,7 @@ def update_task(
     source_code_version: str | None = None,
     follow_strategy: bool | None = None,
     settings: dict | None = None,
+    settings_overrides: dict | None = None,
     notification_settings: dict | None = None,
     portfolio_state: dict | None = None,
     expected_revision: int | None = None,
@@ -219,6 +238,11 @@ def update_task(
             else bool(current["follow_strategy"])
         ),
         "settings": settings or current["settings"],
+        "settings_overrides": (
+            settings_overrides
+            if settings_overrides is not None
+            else current.get("settings_overrides") or {}
+        ),
         "notification_settings": (
             notification_settings
             if notification_settings is not None
@@ -234,7 +258,7 @@ def update_task(
                 UPDATE realtime_decision_tasks
                 SET name = ?, strategy_snapshot_json = ?,
                     source_strategy_revision = ?, source_code_version = ?,
-                    follow_strategy = ?, settings_json = ?,
+                    follow_strategy = ?, settings_json = ?, settings_overrides_json = ?,
                     notification_settings_json = ?, portfolio_state_json = ?,
                     revision = revision + 1, updated_at = ?
                 WHERE id = ? AND deleted_at IS NULL
@@ -245,7 +269,8 @@ def update_task(
                     int(values["source_strategy_revision"]),
                     values["source_code_version"],
                     int(values["follow_strategy"]),
-                    _json(values["settings"]),
+                    _json(_project_realtime_settings(values["settings"])),
+                    _json(_project_realtime_settings(values["settings_overrides"])),
                     _json(values["notification_settings"]),
                     _json(values["portfolio_state"]),
                     now,
@@ -381,7 +406,8 @@ def create_run(task: dict, *, started_at: str | None = None) -> dict:
             """,
             (
                 int(task["id"]), _json(task["strategy_snapshot"]),
-                _json(task["settings"]), _json(task["notification_settings"]),
+                _json(_project_realtime_settings(task["settings"])),
+                _json(task["notification_settings"]),
                 _json({"portfolio": task.get("portfolio_state") or {}}),
                 started, started, started,
             ),
@@ -630,6 +656,7 @@ def reserve_normal_send(task_id: int, *, now: datetime, cooldown_seconds: int = 
 def create_notification(
     *, event_id: int, task_id: int, channel_id: int, recipient: str,
     subject: str, body: str, dedupe_key: str, is_retry: bool = False,
+    next_attempt_at: str | None = None,
 ) -> dict:
     now = utc_now_iso()
     with get_connection() as conn:
@@ -638,11 +665,11 @@ def create_notification(
                 """
                 INSERT INTO realtime_notifications (
                     event_id, task_id, channel_id, recipient, subject, body,
-                    dedupe_key, is_retry, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    dedupe_key, is_retry, next_attempt_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (int(event_id), int(task_id), int(channel_id), recipient, subject, body,
-                 dedupe_key, int(is_retry), now, now),
+                 dedupe_key, int(is_retry), next_attempt_at, now, now),
             )
             notification_id = int(cursor.lastrowid)
         except sqlite3.IntegrityError:

@@ -16,6 +16,11 @@ from services.realtime_market_data import IEXMarketDataHub
 from services.market_data_request_coordinator import PRIORITY_FORMAL_DECISION
 from services.market_data_service import refresh_strategy_daily_history
 from services.market_context import market_sessions
+from services.realtime_config import (
+    REALTIME_MODEL_NOTIONAL,
+    normalize_recommendation_state,
+    realtime_engine_settings,
+)
 from services.realtime_history_service import prepare_strategy_history
 
 
@@ -59,89 +64,96 @@ def _restore_strategy_state(strategy_instance, state: dict | None) -> None:
 
 
 def _restore_portfolio(portfolio: Portfolio, state: dict | None) -> None:
-    if not state:
-        return
-    portfolio.cash = D(state.get("cash", float(portfolio.initial_cash)))
-    configured_leverages = dict(
-        state.get("configured_symbol_leverage_multipliers") or {}
-    )
-    effective_leverages = dict(state.get("symbol_leverage_multipliers") or {})
-    if not configured_leverages and effective_leverages:
-        # Legacy realtime states persisted only the final symbol multiplier.
-        # Treat values up to the configured-layer limit as that layer itself;
-        # otherwise preserve the excess as a strategy multiplier. Do not
-        # compare them with today's manual inputs: dynamic leverage replaces
-        # those inputs, and that comparison can infer a multiplier below 1
-        # (for example restored 2x / manual 3x).
-        for symbol, multiplier in effective_leverages.items():
-            effective = float(multiplier)
-            configured = min(10.0, effective)
-            portfolio.configured_symbol_leverage_multipliers.pop(str(symbol), None)
-            portfolio.symbol_leverage_multipliers.pop(str(symbol), None)
-            portfolio.set_configured_symbol_leverage_multiplier(
-                str(symbol), configured
-            )
-            if abs(effective - configured) > 1e-12:
-                portfolio.set_symbol_leverage_multiplier(str(symbol), effective)
-    for symbol, multiplier in configured_leverages.items():
-        portfolio.set_configured_symbol_leverage_multiplier(
-            str(symbol), float(multiplier)
-        )
-    for symbol, multiplier in effective_leverages.items():
-        portfolio.set_symbol_leverage_multiplier(str(symbol), float(multiplier))
-    portfolio.strategy_target_weights = {
-        str(symbol): D(weight)
-        for symbol, weight in (state.get("strategy_target_weights") or {}).items()
-    }
-    portfolio.receivables = [
-        {
-            **item,
-            "amount": D(item.get("amount", 0)),
-            "rate": D(item.get("rate", 0)),
+    """Compatibility helper for legacy leverage state.
+
+    New realtime runs use `_restore_recommendation_state`; this narrow helper
+    remains for old snapshots and callers that only need leverage migration.
+    """
+    raw = dict(state or {})
+    configured = dict(raw.get("configured_symbol_leverage_multipliers") or {})
+    effective = dict(raw.get("symbol_leverage_multipliers") or {})
+    if not configured:
+        configured = {
+            str(symbol): min(10.0, float(multiplier))
+            for symbol, multiplier in effective.items()
         }
-        for item in (state.get("receivables") or [])
-    ]
-    portfolio.total_commission = D(state.get("total_commission", 0))
-    portfolio.total_slippage = D(state.get("total_slippage", 0))
-    for symbol, item in (state.get("positions") or {}).items():
-        quantity = D(item.get("quantity", 0))
-        if quantity <= 0:
+    for symbol, multiplier in configured.items():
+        portfolio.set_configured_symbol_leverage_multiplier(symbol, float(multiplier))
+    for symbol, multiplier in effective.items():
+        portfolio.set_symbol_leverage_multiplier(symbol, float(multiplier))
+
+
+def _restore_recommendation_state(
+    portfolio: Portfolio,
+    state: dict | None,
+    marks: dict[str, float],
+) -> dict:
+    """Rehydrate a scale-neutral portfolio view for legacy strategy code.
+
+    Realtime tasks persist percentages only. The shared strategy evaluator still
+    exposes Portfolio methods to built-in strategies, so this adapter creates
+    fractional model quantities at the current marks. No cash, fills or P&L are
+    carried between events.
+    """
+    normalized = normalize_recommendation_state(state)
+    configured = normalized["configured_symbol_leverage_multipliers"]
+    effective = normalized["symbol_leverage_multipliers"]
+    for symbol, multiplier in configured.items():
+        portfolio.set_configured_symbol_leverage_multiplier(symbol, float(multiplier))
+    for symbol, multiplier in effective.items():
+        portfolio.set_symbol_leverage_multiplier(symbol, float(multiplier))
+    portfolio.strategy_target_weights = {
+        str(symbol): D(float(percent) / 100.0)
+        for symbol, percent in normalized["recommended_targets"].items()
+        if float(percent) > 0
+    }
+    portfolio.positions.clear()
+    portfolio.cash = D(REALTIME_MODEL_NOTIONAL)
+    exposures = dict(normalized["recommended_exposures"])
+    for symbol, target_percent in normalized["recommended_targets"].items():
+        if symbol not in exposures:
+            leverage = float(portfolio.effective_leverage(symbol))
+            exposures[symbol] = float(target_percent) * leverage
+    for symbol, exposure_percent in exposures.items():
+        price = float(marks.get(symbol) or 0)
+        if price <= 0 or float(exposure_percent) <= 0:
             continue
-        average_cost = D(item.get("average_cost", item.get("price", 0)))
+        market_value = REALTIME_MODEL_NOTIONAL * float(exposure_percent) / 100.0
+        quantity = D(market_value / price)
         position = Position(symbol=symbol, quantity=quantity)
-        position.lots.append(Lot(quantity=quantity, unit_cost=average_cost))
-        position.cost_basis_value = quantity * average_cost
+        position.lots.append(Lot(quantity=quantity, unit_cost=D(price)))
+        position.cost_basis_value = D(market_value)
         portfolio.positions[symbol] = position
-    portfolio.realized_pnl = D(state.get("realized_pnl", 0))
+        portfolio.cash -= D(market_value)
+    return normalized
 
 
-def _portfolio_state(portfolio: Portfolio, marks: dict[str, float]) -> dict:
+def _recommendation_state(
+    portfolio: Portfolio,
+    holdings: dict[str, float],
+) -> dict:
+    targets = {
+        str(symbol): float(weight) * 100.0
+        for symbol, weight in portfolio.strategy_target_weights.items()
+        if float(weight) > 1e-12
+    }
+    exposures = {
+        str(symbol): float(percent)
+        for symbol, percent in holdings.items()
+        if float(percent) > 1e-12
+    }
     return {
-        "cash": float(portfolio.cash),
-        "realized_pnl": float(portfolio.realized_pnl),
-        "symbol_leverage_multipliers": {
-            symbol: float(multiplier)
-            for symbol, multiplier in portfolio.symbol_leverage_multipliers.items()
-        },
+        "state_version": 2,
+        "recommended_targets": targets,
+        "recommended_exposures": exposures,
         "configured_symbol_leverage_multipliers": {
-            symbol: float(multiplier)
-            for symbol, multiplier in portfolio.configured_symbol_leverage_multipliers.items()
+            str(symbol): float(value)
+            for symbol, value in portfolio.configured_symbol_leverage_multipliers.items()
         },
-        "strategy_target_weights": {
-            symbol: float(weight)
-            for symbol, weight in portfolio.strategy_target_weights.items()
+        "symbol_leverage_multipliers": {
+            str(symbol): float(value)
+            for symbol, value in portfolio.symbol_leverage_multipliers.items()
         },
-        "receivables": [
-            {
-                **item,
-                "amount": float(item["amount"]),
-                "rate": float(item["rate"]),
-            }
-            for item in portfolio.receivables
-        ],
-        "total_commission": float(portfolio.total_commission),
-        "total_slippage": float(portfolio.total_slippage),
-        "positions": portfolio.snapshot(marks),
     }
 
 
@@ -256,6 +268,7 @@ class RealtimeDecisionEvaluator:
         trading_date: str,
         event: str,
         scheduled_at: datetime | None = None,
+        prepared_observation: dict | None = None,
     ) -> dict:
         strategy = validate_strategy_payload(deepcopy(run["strategy_snapshot"]))
         definition = strategy["definition"]
@@ -263,11 +276,14 @@ class RealtimeDecisionEvaluator:
         symbols = list(candidate_symbols)
         saved_run_state = run.get("state") or {}
         restored_portfolio_state = saved_run_state.get("portfolio") or {}
-        # A followed revision may remove a symbol while the simulated account
-        # still owns it. It remains necessary for valuation and safe exit.
+        restored_recommendations = normalize_recommendation_state(
+            restored_portfolio_state
+        )
+        # A followed revision may remove a previously recommended symbol. It
+        # remains observable until the model publishes its zero target.
         symbols.extend(
             str(symbol).upper()
-            for symbol in (restored_portfolio_state.get("positions") or {})
+            for symbol in restored_recommendations["recommended_targets"]
         )
         include_volume = False
         auxiliary_symbols: list[str] = []
@@ -282,25 +298,31 @@ class RealtimeDecisionEvaluator:
             **strategy.get("default_settings", {}),
             **(run.get("settings") or {}),
         }
-        history_snapshot = prepare_strategy_history(
-            strategy,
-            trading_date=trading_date,
-            settings=effective_settings,
-            refresh=lambda symbol, start_date: refresh_strategy_daily_history(
-                symbol,
-                start_date=start_date,
-                market_type=strategy["market"]["type"],
-                priority=PRIORITY_FORMAL_DECISION,
-            ),
-        )
-        session_rows = market_sessions(
-            trading_date,
-            trading_date,
-            strategy["market"],
-        )
-        if not session_rows:
-            raise RuntimeError(f"{trading_date} 不是策略市场交易日。")
-        market_session = session_rows[0]
+        if prepared_observation is None:
+            history_snapshot = prepare_strategy_history(
+                strategy,
+                trading_date=trading_date,
+                settings=effective_settings,
+                refresh=lambda symbol, start_date: refresh_strategy_daily_history(
+                    symbol,
+                    start_date=start_date,
+                    market_type=strategy["market"]["type"],
+                    priority=PRIORITY_FORMAL_DECISION,
+                ),
+            )
+            session_rows = market_sessions(
+                trading_date,
+                trading_date,
+                strategy["market"],
+            )
+            if not session_rows:
+                raise RuntimeError(f"{trading_date} 不是策略市场交易日。")
+            market_session = session_rows[0]
+        else:
+            if str(prepared_observation.get("trading_date")) != trading_date:
+                raise ValueError("本地测试快照日期与决策日期不一致。")
+            history_snapshot = deepcopy(prepared_observation["history_snapshot"])
+            market_session = deepcopy(prepared_observation["market_session"])
         effective_target_at = scheduled_at
         if effective_target_at is None and event not in {"OPEN", "CLOSE"}:
             requested = datetime.fromisoformat(
@@ -333,16 +355,26 @@ class RealtimeDecisionEvaluator:
             for symbol, rows in history_snapshot["daily"].items()
             if rows
         }
-        payload = self.hub.event_snapshot(
-            symbols,
-            trading_date=trading_date,
-            event=event,
-            include_cumulative_volume=include_volume,
-            allow_missing=allow_partial,
-            market_session=market_session,
-            effective_target_at=effective_target_at,
-            previous_session_closes=previous_session_closes,
-        )
+        if prepared_observation is None:
+            payload = self.hub.event_snapshot(
+                symbols,
+                trading_date=trading_date,
+                event=event,
+                include_cumulative_volume=include_volume,
+                allow_missing=allow_partial,
+                market_session=market_session,
+                effective_target_at=effective_target_at,
+                previous_session_closes=previous_session_closes,
+            )
+        else:
+            payload = deepcopy(prepared_observation["payload"])
+            payload["event"] = event
+            requested_symbols = set(symbols)
+            payload["symbols"] = {
+                symbol: item
+                for symbol, item in payload.get("symbols", {}).items()
+                if symbol in requested_symbols
+            }
         payload["trading_date"] = trading_date
         payload["event"] = event
         available = set(payload["symbols"])
@@ -374,20 +406,12 @@ class RealtimeDecisionEvaluator:
             trading_date,
             history_daily=history_snapshot["daily"],
             market_session=market_session,
-            runtime_symbols=list((restored_portfolio_state.get("positions") or {})),
+            runtime_symbols=list(restored_recommendations["recommended_targets"]),
         )
-        settings = {
-            **effective_settings,
-            "start_date": trading_date,
-            "end_date": trading_date,
-            "benchmark": "none",
-            "strict_data": True,
-            # Realtime explanations and emails consume structured engine logs.
-            "generate_logs": True,
-        }
+        settings = realtime_engine_settings(effective_settings, trading_date)
         engine = BacktestEngine(strategy, settings, dataset=dataset)
         held_runtime_symbols = list(
-            (restored_portfolio_state.get("positions") or {}).keys()
+            restored_recommendations["recommended_targets"].keys()
         )
         for symbol in held_runtime_symbols:
             if symbol not in engine.tradable_symbols:
@@ -399,7 +423,6 @@ class RealtimeDecisionEvaluator:
             _restore_strategy_state(engine.code_strategy, saved_strategy_state)
         else:
             engine.restore_visual_strategy_state(saved_strategy_state)
-        _restore_portfolio(engine.portfolio, restored_portfolio_state)
         event_prices: dict[str, EventPrice] = {}
         for symbol, item in payload["symbols"].items():
             event_prices[symbol] = EventPrice(
@@ -408,8 +431,12 @@ class RealtimeDecisionEvaluator:
                 signal_time=item.get("signal_time") or f"{trading_date} {event}",
                 fill_time=item.get("fill_time"),
             )
-        if saved_run_state.get("last_corporate_action_date") != trading_date:
-            engine.apply_day_start(trading_date)
+        marks = {symbol: value.signal_price for symbol, value in event_prices.items()}
+        restored_recommendations = _restore_recommendation_state(
+            engine.portfolio,
+            restored_portfolio_state,
+            marks,
+        )
 
         pending_close = [
             OrderIntent(**item)
@@ -430,9 +457,8 @@ class RealtimeDecisionEvaluator:
             event=event,
             event_prices=event_prices,
         )
-        # A followed revision can remove a currently held symbol. It remains
-        # market-data-visible and is closed through the same order engine so a
-        # strategy update cannot leave an unvalued, unmanaged orphan position.
+        # A followed revision can remove a previous model target. Publish an
+        # explicit zero target so the user is never left with an orphaned idea.
         for symbol in held_runtime_symbols:
             if (
                 symbol not in engine.universe
@@ -447,8 +473,6 @@ class RealtimeDecisionEvaluator:
                     value_percent=0,
                     reason="跟随源策略更新：标的已移出策略范围",
                 ))
-        marks = {symbol: value.signal_price for symbol, value in event_prices.items()}
-        trades = []
         if event == "CLOSE":
             pending_close = list(intents)
         elif all(
@@ -461,7 +485,6 @@ class RealtimeDecisionEvaluator:
                 event=event,
                 event_prices=event_prices,
             )
-            trades = list(engine.trades)
         recommendations = []
         for intent in intents:
             recommendations.append({
@@ -476,6 +499,47 @@ class RealtimeDecisionEvaluator:
                 ),
                 "reason": intent.reason,
             })
+        recommendation_state = _recommendation_state(
+            engine.portfolio,
+            engine.last_decision_holdings,
+        )
+        persisted_recommendation_state = recommendation_state
+        if event == "CLOSE":
+            # CLOSE publishes a prospective target but remains pending until
+            # the next OPEN. Preserve active exposure separately so the next
+            # event can apply the transition without assuming an early fill.
+            persisted_recommendation_state = {
+                **recommendation_state,
+                "recommended_exposures": dict(
+                    restored_recommendations["recommended_exposures"]
+                ),
+            }
+        target_symbols = set(restored_recommendations["recommended_targets"]) | set(
+            recommendation_state["recommended_targets"]
+        )
+        target_portfolio = []
+        for symbol in sorted(target_symbols):
+            previous = float(
+                restored_recommendations["recommended_targets"].get(symbol, 0)
+            )
+            target = float(recommendation_state["recommended_targets"].get(symbol, 0))
+            exposure = float(
+                recommendation_state["recommended_exposures"].get(symbol, 0)
+            )
+            change = target - previous
+            target_portfolio.append({
+                "symbol": symbol,
+                "previous_target_weight_percent": previous,
+                "target_weight_percent": target,
+                "target_exposure_percent": exposure,
+                "change_percent_points": change,
+                "change": (
+                    "ENTER" if previous <= 0 < target
+                    else "EXIT" if previous > 0 >= target
+                    else "ADJUST" if abs(change) > 1e-10
+                    else "HOLD"
+                ),
+            })
         decision = {
             "task_id": task["id"],
             "run_id": run["id"],
@@ -484,9 +548,9 @@ class RealtimeDecisionEvaluator:
             "source": payload.get("source") or "alpaca",
             "feed": payload.get("feed") or "iex",
             "recommendations": recommendations,
+            "target_portfolio": target_portfolio,
             "orders": [intent.__dict__ for intent in intents],
-            "trades": trades,
-            "portfolio": _portfolio_state(engine.portfolio, marks),
+            "trades": [],
             "data_warnings": list(payload.get("missing") or []),
         }
         audit_logs = []
@@ -550,9 +614,8 @@ class RealtimeDecisionEvaluator:
         }
         state = {
             "strategy_state": calculation["strategy_state"],
-            "portfolio": decision["portfolio"],
+            "portfolio": persisted_recommendation_state,
             "pending_close_orders": [intent.__dict__ for intent in pending_close],
-            "last_corporate_action_date": trading_date,
         }
         return {
             "data_manifest": payload,

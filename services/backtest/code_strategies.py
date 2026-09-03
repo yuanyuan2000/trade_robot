@@ -20,12 +20,18 @@ class CodeStrategy:
     selection_modes: tuple[str, ...] = ()
     parameter_schema: dict[str, dict] = {}
     default_symbols: list[dict] = []
+    retired_parameters: set[str] = set()
 
     def __init__(self, params: dict | None = None):
         self.params = self.validate_params(params or {})
 
     @classmethod
     def validate_params(cls, params: dict) -> dict:
+        params = {
+            name: value
+            for name, value in dict(params).items()
+            if name not in cls.retired_parameters
+        }
         result: dict[str, Any] = {}
         for name, spec in cls.parameter_schema.items():
             value = params.get(name, spec.get("default"))
@@ -1551,7 +1557,7 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
 
 class SevenStarEtfRotationStrategy(CodeStrategy):
     key = "sevenstar_etf_rotation"
-    version = "1.1.0"
+    version = "1.2.0"
     name = "七星 ETF 轮动"
     description = (
         "以加权对数回归年化趋势乘可选 R² 口径排名；默认使用一致加权 R²，"
@@ -1560,6 +1566,10 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
         "无候选时转入 BIL。"
     )
     selection_modes = ("competition",)
+    # v1.2.0 removes this historical dollar-order threshold. Its shipped
+    # default was zero, so accepting and discarding it keeps old snapshots
+    # behaviorally identical while new definitions no longer expose it.
+    retired_parameters = {"minimum_trade_value_usd"}
     default_symbols = [
         {"symbol": symbol, "max_weight": 100, "leverage_multiplier": 1}
         for symbol in ("GLD", "USO", "SPY", "QQQ", "DIA", "IWM", "TLT")
@@ -1613,13 +1623,6 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
             "unit": "%", "step": 0.1,
             "help": "目标金额偏差严格超过该比例时才调整；空仓始终允许买入。",
             "suggestion": "默认 5%，可减少小额反复交易。",
-        },
-        "minimum_trade_value_usd": {
-            "label": "最小非清仓交易额",
-            "type": "number", "default": 0.0, "minimum": 0.0, "maximum": 100000.0,
-            "unit": "USD", "step": 1.0,
-            "help": "小于该金额的加仓或部分减仓跳过；完整清仓不受限制。",
-            "suggestion": "默认 0；如真实账户会忽略小单，可按实际金额设置。",
         },
         "enable_profit_protection": {
             "label": "启用高点回撤保护", "type": "boolean", "default": True,
@@ -2189,7 +2192,6 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
                     action="BUY" if current_value < target_value else "SELL",
                     sizing_mode="TARGET", value_percent=target_percent,
                     reason=f"七星目标等权 {target_percent:.4f}%",
-                    minimum_trade_value=self.params["minimum_trade_value_usd"],
                 )
             )
         return intents

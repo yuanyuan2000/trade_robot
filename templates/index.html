@@ -342,15 +342,27 @@
           <section class="panel realtime-strategy-panel" data-realtime-panel="parameters" hidden>
               <div class="panel-title"><h3>策略参数</h3><span id="realtime-revision"></span></div>
               <label class="backtest-field"><span>任务名称</span><input id="realtime-name" maxlength="100"></label>
-              <label class="realtime-follow-field"><input id="realtime-follow" type="checkbox"><span>自动跟随源策略（运行中使用当前快照，停止后同步）</span></label>
+              <label class="realtime-follow-field"><input id="realtime-follow" type="checkbox"><span>自动跟随源策略（策略定义及共用运行设置均采用源策略）</span></label>
               <div id="realtime-strategy-summary" class="realtime-json-summary"></div>
-              <label class="backtest-field"><span>策略定义 JSON（取消跟随后可编辑）</span><textarea id="realtime-definition-json" rows="12"></textarea></label>
-              <label class="backtest-field"><span>模拟初始资金</span><input id="realtime-capital" type="number" min="0.01" step="0.01"></label>
-              <label class="backtest-field"><span>整体杠杆</span><input id="realtime-leverage" type="number" min="1" max="10" step="0.1"></label>
-              <label id="realtime-dynamic-rebalance-field" class="realtime-follow-field" title="仅控制动态杠杆变化额外触发的调仓，不会阻止策略自身的交易信号">
-                <input id="realtime-dynamic-rebalance-on-change" type="checkbox">
-                <span>动态杠杆变化时自动再平衡</span>
-              </label>
+              <div id="realtime-strategy-form" class="backtest-designer-scroll"></div>
+              <section class="backtest-editor-section">
+                <h4>目标敞口设置</h4>
+                <p class="backtest-help">实时任务只生成模型目标仓位，不连接交易账户，也不模拟资金、股数、手续费、滑点或盈亏。</p>
+                <div class="backtest-settings-grid">
+                  <label class="backtest-field"><span>整体杠杆倍率</span><input id="realtime-leverage" type="number" min="1" max="10" step="0.1"></label>
+                  <label class="backtest-field realtime-dynamic-setting"><span>历史波动率观察期 T</span><input id="realtime-dynamic-volatility-period" type="number" min="2" max="500" step="1"></label>
+                  <label class="backtest-field realtime-dynamic-setting"><span>3σ 压力持续交易日 n</span><input id="realtime-dynamic-stress-days" type="number" min="1" max="252" step="1"></label>
+                  <label class="backtest-field realtime-dynamic-setting"><span>允许最大跌幅 x%</span><input id="realtime-dynamic-max-loss" type="number" min="0.1" max="100" step="0.1"></label>
+                  <label class="backtest-field realtime-dynamic-setting"><span>动态单标的杠杆上限 max_l</span><input id="realtime-dynamic-max-leverage" type="number" min="1" max="10" step="0.1"></label>
+                  <label class="backtest-check-field realtime-dynamic-setting" title="仅控制因动态杠杆数值变化而额外产生的调仓，不会阻止策略自身的交易信号"><input id="realtime-dynamic-rebalance-on-change" type="checkbox"><span>动态杠杆变化时自动再平衡</span></label>
+                </div>
+                <p class="backtest-help realtime-dynamic-setting">VOLAT(T) × 3 × √(n/252) 估算无杠杆压力跌幅；动态单标的杠杆向下保留 1 位小数，并限制在 1.0 至 max_l。自动再平衡仅控制杠杆变化额外触发的调仓；关闭后新杠杆仍用于策略下一次主动信号。</p>
+              </section>
+              <details class="backtest-editor-section realtime-advanced-config">
+                <summary>高级配置 JSON</summary>
+                <p class="backtest-help">JSON 与可视化表单双向对应；跟随源策略时只读。保存仍执行完整服务端校验。</p>
+                <label class="backtest-field"><span>策略定义 JSON</span><textarea id="realtime-definition-json" rows="12" spellcheck="false"></textarea></label>
+              </details>
               <div id="realtime-panel-script-fields" hidden>
                 <label class="backtest-field"><span>实时面板列脚本（受限 JSON，仅影响展示）</span><textarea id="realtime-panel-script" rows="14" spellcheck="false"></textarea></label>
                 <div class="realtime-inline-actions"><button id="realtime-panel-validate" type="button">校验脚本</button><button id="realtime-panel-regenerate" type="button">恢复自动生成</button><button id="realtime-panel-save" class="primary-action" type="button">保存面板脚本</button><span id="realtime-panel-revision"></span></div>
@@ -363,6 +375,9 @@
               <label class="realtime-follow-field"><input id="realtime-mail-enabled" type="checkbox"><span>发送提示邮件</span></label>
               <label class="backtest-field"><span>邮件通道（发件身份）</span><select id="realtime-channel"></select></label>
               <label class="backtest-field"><span>收件邮箱（可多个，可与发件邮箱相同）</span><input id="realtime-recipients" placeholder="a@example.com, b@example.com"></label>
+              <label class="backtest-field"><span>发送事件（留空表示全部）</span><input id="realtime-mail-events" placeholder="OPEN, CLOSE, 10:00"></label>
+              <label class="backtest-field"><span>发送条件</span><select id="realtime-mail-only-when"><option value="all">每个选定事件</option><option value="changes">仅模型目标有变化</option></select></label>
+              <label class="backtest-field"><span>固定发送时间（美东，可留空立即发送）</span><input id="realtime-mail-delivery-time" type="time"></label>
               <label class="backtest-field"><span>主题模板</span><input id="realtime-subject-template" placeholder="实时决策｜&#123;&#123;task.name&#125;&#125;｜&#123;&#123;decision.datetime&#125;&#125;"></label>
               <label class="backtest-field">
                 <span class="field-label-with-help">
@@ -386,7 +401,7 @@
               </label>
               <div id="realtime-code-body-preview" class="realtime-template-preview" hidden></div>
               <button id="realtime-new-channel" type="button">新增 QQ/Gmail 通道</button>
-              <button id="realtime-test-channel" type="button">发送测试邮件</button>
+              <button id="realtime-test-channel" type="button">按本地最新行情发送测试决策邮件</button>
               <div class="realtime-panel-footer"><button id="realtime-save-mail" class="primary-action" type="button">保存通知设置</button></div>
           </section>
           <section class="panel realtime-log-panel" data-realtime-panel="logs" hidden>
@@ -770,6 +785,7 @@
           <button type="button" data-close-dialog="backtest-settings-dialog">×</button>
         </div>
         <div class="backtest-settings-grid">
+          <h4 class="backtest-settings-group-title">回测区间与分析</h4>
           <label class="backtest-field">
             <span>开始日期</span>
             <input id="backtest-start-date" type="date" required>
@@ -779,32 +795,27 @@
             <input id="backtest-end-date" type="date" required>
           </label>
           <label class="backtest-field">
+            <span>比较基准</span>
+            <select id="backtest-benchmark">
+              <option value="none">无</option>
+              <option value="SPY">SPY</option>
+              <option value="GLD">GLD</option>
+              <option value="auto">自动</option>
+            </select>
+          </label>
+          <label class="backtest-field"><span>无风险年化利率</span><input id="backtest-risk-free" type="number" min="-1" max="1" step="0.001"></label>
+          <label class="backtest-check-field"><input id="backtest-generate-logs" type="checkbox"><span>生成详细日志（关闭可进一步提升长回测速度）</span></label>
+          <h4 class="backtest-settings-group-title">目标仓位与风险</h4>
+          <label class="backtest-field"><span>整体杠杆倍率</span><input id="backtest-leverage" type="number" min="1" max="10" step="0.1" required></label>
+          <label class="backtest-field backtest-dynamic-leverage-setting"><span>历史波动率观察期 T</span><input id="backtest-dynamic-volatility-period" type="number" min="2" max="500" step="1" required></label>
+          <label class="backtest-field backtest-dynamic-leverage-setting"><span>3σ 压力持续交易日 n</span><input id="backtest-dynamic-stress-days" type="number" min="1" max="252" step="1" required></label>
+          <label class="backtest-field backtest-dynamic-leverage-setting"><span>允许最大跌幅 x%</span><input id="backtest-dynamic-max-loss" type="number" min="0.1" max="100" step="0.1" required></label>
+          <label class="backtest-field backtest-dynamic-leverage-setting"><span>动态单标的杠杆上限 max_l</span><input id="backtest-dynamic-max-leverage" type="number" min="1" max="10" step="0.1" required></label>
+          <label class="backtest-check-field backtest-dynamic-leverage-setting" title="仅控制因动态杠杆数值变化而额外产生的调仓，不会阻止策略自身的交易信号"><input id="backtest-dynamic-rebalance-on-change" type="checkbox"><span>动态杠杆变化时自动再平衡</span></label>
+          <h4 class="backtest-settings-group-title">历史成交模拟</h4>
+          <label class="backtest-field">
             <span>初始资金</span>
             <input id="backtest-initial-capital" type="number" min="0.01" step="0.01" required>
-          </label>
-          <label class="backtest-field">
-            <span>整体杠杆倍率</span>
-            <input id="backtest-leverage" type="number" min="1" max="10" step="0.1" required>
-          </label>
-          <label class="backtest-field backtest-dynamic-leverage-setting">
-            <span>历史波动率观察期 T</span>
-            <input id="backtest-dynamic-volatility-period" type="number" min="2" max="500" step="1" required>
-          </label>
-          <label class="backtest-field backtest-dynamic-leverage-setting">
-            <span>3σ 压力持续交易日 n</span>
-            <input id="backtest-dynamic-stress-days" type="number" min="1" max="252" step="1" required>
-          </label>
-          <label class="backtest-field backtest-dynamic-leverage-setting">
-            <span>允许最大跌幅 x%</span>
-            <input id="backtest-dynamic-max-loss" type="number" min="0.1" max="100" step="0.1" required>
-          </label>
-          <label class="backtest-field backtest-dynamic-leverage-setting">
-            <span>动态单标的杠杆上限 max_l</span>
-            <input id="backtest-dynamic-max-leverage" type="number" min="1" max="10" step="0.1" required>
-          </label>
-          <label class="backtest-check-field backtest-dynamic-leverage-setting" title="仅控制因动态杠杆数值变化而额外产生的调仓，不会阻止策略自身的交易信号">
-            <input id="backtest-dynamic-rebalance-on-change" type="checkbox">
-            <span>动态杠杆变化时自动再平衡</span>
           </label>
           <label class="backtest-field">
             <span>每股手续费</span>
@@ -818,26 +829,9 @@
             <span>滑点（基点）</span>
             <input id="backtest-slippage" type="number" min="0" max="1000" step="0.01" required>
           </label>
-          <label class="backtest-field">
-            <span>比较基准</span>
-            <select id="backtest-benchmark">
-              <option value="none">无</option>
-              <option value="SPY">SPY</option>
-              <option value="GLD">GLD</option>
-              <option value="auto">自动</option>
-            </select>
-          </label>
-          <label class="backtest-field">
-            <span>无风险年化利率</span>
-            <input id="backtest-risk-free" type="number" min="-1" max="1" step="0.001">
-          </label>
           <label class="backtest-check-field">
             <input id="backtest-fractional" type="checkbox">
             <span>允许碎股（默认关闭）</span>
-          </label>
-          <label class="backtest-check-field">
-            <input id="backtest-generate-logs" type="checkbox">
-            <span>生成详细日志（关闭可进一步提升长回测速度）</span>
           </label>
         </div>
         <p id="backtest-dynamic-leverage-help" class="backtest-help">VOLAT(T) × 3 × √(n/252) 估算无杠杆压力跌幅；动态单标的杠杆向下保留 1 位小数，并限制在 1.0 至 max_l。自动再平衡仅控制杠杆变化额外触发的调仓；关闭后新杠杆仍用于策略下一次主动下单。x 与 max_l 只是计算参数，不构成爆仓保证。</p>
@@ -905,9 +899,10 @@ price &lt; close(1) - 2 * atr(14)</pre></section>
 
     <script src="{{ url_for('static', filename='js/chart.js', v='20260829-02') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260730-02') }}"></script>
-    <script src="{{ url_for('static', filename='js/backtest.js', v='20260903-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/strategy_form.js', v='20260903-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest.js', v='20260903-02') }}"></script>
     <script src="{{ url_for('static', filename='js/backtest_analysis.js', v='20260902-01') }}"></script>
-    <script src="{{ url_for('static', filename='js/realtime.js', v='20260831-01') }}"></script>
+    <script src="{{ url_for('static', filename='js/realtime.js', v='20260903-05') }}"></script>
     <script src="{{ url_for('static', filename='js/app.js', v='20260829-02') }}"></script>
   </body>
 </html>

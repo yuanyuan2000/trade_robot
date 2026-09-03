@@ -265,7 +265,8 @@ class BacktestRouteTests(unittest.TestCase):
             item for item in catalog.get_json()["strategies"]
             if item["key"] == "sevenstar_etf_rotation"
         )
-        self.assertEqual(sevenstar["version"], "1.1.0")
+        self.assertEqual(sevenstar["version"], "1.2.0")
+        self.assertNotIn("minimum_trade_value_usd", sevenstar["parameter_schema"])
         self.assertEqual(
             sevenstar["parameter_schema"]["trend_formula_mode"]["default"],
             "consistent_w2",
@@ -336,7 +337,7 @@ class BacktestRouteTests(unittest.TestCase):
         ]
         self.assertEqual(len(sevenstar_presets), 2)
         self.assertTrue(
-            all(item["code_version"] == "1.1.0" for item in sevenstar_presets)
+            all(item["code_version"] == "1.2.0" for item in sevenstar_presets)
         )
         strategy = next(
             item

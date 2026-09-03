@@ -2355,7 +2355,8 @@ td {
 }
 
 .backtest-dynamic-leverage-setting.is-disabled,
-#backtest-dynamic-leverage-help.is-disabled {
+#backtest-dynamic-leverage-help.is-disabled,
+.realtime-dynamic-setting.is-disabled {
   opacity: 0.55;
 }
 
@@ -2435,6 +2436,25 @@ td {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
+}
+
+.backtest-settings-group-title {
+  grid-column: 1 / -1;
+  margin: 8px 0 0;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 7px;
+  font-size: 13px;
+}
+
+#realtime-strategy-form {
+  max-height: none;
+  overflow: visible;
+}
+
+.realtime-advanced-config summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
 }
 
 .backtest-check-field {

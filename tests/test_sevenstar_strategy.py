@@ -49,6 +49,13 @@ def rows(start: date, count: int, base: float, growth: float) -> list[dict]:
 
 
 class SevenStarAlgorithmTests(unittest.TestCase):
+    def test_retired_minimum_trade_value_is_ignored_for_old_snapshots(self) -> None:
+        values = SevenStarEtfRotationStrategy.validate_params({
+            "minimum_trade_value_usd": 0,
+        })
+
+        self.assertNotIn("minimum_trade_value_usd", values)
+
     def test_rebalance_target_uses_combined_symbol_leverage(self) -> None:
         strategy = SevenStarEtfRotationStrategy(
             {
@@ -82,7 +89,7 @@ class SevenStarAlgorithmTests(unittest.TestCase):
         self.assertEqual(intents[0].value_percent, 100)
 
     def test_pool_contents_match_product_definition(self) -> None:
-        self.assertEqual(SevenStarEtfRotationStrategy.version, "1.1.0")
+        self.assertEqual(SevenStarEtfRotationStrategy.version, "1.2.0")
         self.assertEqual(SEVENSTAR_SMALL, ["GLD", "USO", "SPY", "QQQ", "DIA", "IWM", "TLT"])
         self.assertEqual(len(SEVENSTAR_LARGE), 41)
         for symbol in ("COPX", "MAGS", "EWY", "IGV", "UFOX", "TLT", "CWB", "BTC/USD"):

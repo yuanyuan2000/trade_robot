@@ -396,6 +396,7 @@ CREATE TABLE IF NOT EXISTS realtime_decision_tasks (
     source_code_version TEXT,
     strategy_snapshot_json TEXT NOT NULL,
     settings_json TEXT NOT NULL,
+    settings_overrides_json TEXT NOT NULL DEFAULT '{}',
     panel_settings_json TEXT NOT NULL DEFAULT '{}',
     panel_revision INTEGER NOT NULL DEFAULT 1,
     notification_settings_json TEXT NOT NULL,

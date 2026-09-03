@@ -21,6 +21,7 @@ from services.realtime_decision_service import RealtimeDecisionEvaluator
 from services.realtime_mail import NotificationDispatcher
 from services.realtime_market_data import IEXMarketDataHub
 from services.realtime_panel_script import generate_panel_settings
+from services.realtime_config import merge_realtime_settings, normalize_recommendation_state
 from services.market_data_request_coordinator import PRIORITY_FORMAL_DECISION
 from services.market_data_service import refresh_strategy_daily_history
 from services.realtime_history_service import prepare_strategy_history
@@ -315,6 +316,8 @@ class RealtimeTaskManager:
 
     def status(self, task_id: int) -> dict:
         task = realtime_repository.get_task(task_id)
+        if task["follow_strategy"] and task["runtime_state"] == "stopped":
+            task = self._sync_followed_strategy(task)
         runs = realtime_repository.list_runs(task_id, limit=1)
         if runs:
             task["latest_run"] = runs[0]
@@ -325,21 +328,20 @@ class RealtimeTaskManager:
             return task
         source_strategy = backtest_repository.get_strategy(task["strategy_id"])
         strategy = prepare_strategy_for_execution(source_strategy)
+        followed_settings = merge_realtime_settings(strategy.get("default_settings"))
         if (
             int(task["source_strategy_revision"]) == int(source_strategy["revision"])
             and task["strategy_snapshot"].get("code_version") == strategy.get("code_version")
             and task["strategy_snapshot"] == strategy
+            and task.get("settings") == followed_settings
+            and not (task.get("settings_overrides") or {})
         ):
             return task
-        followed_settings = _rebase_followed_settings(
-            task.get("settings") or {},
-            (task.get("strategy_snapshot") or {}).get("default_settings") or {},
-            strategy.get("default_settings") or {},
-        )
         updated = realtime_repository.update_task(
             task["id"], strategy_snapshot=strategy,
             source_strategy_revision=source_strategy["revision"], source_code_version=strategy.get("code_version"),
             settings=followed_settings,
+            settings_overrides={},
         )
         if (
             strategy.get("design_mode") == "visual"
@@ -360,9 +362,10 @@ class RealtimeTaskManager:
         old_run = realtime_repository.get_run(state["run_id"])
         old_state = old_run.get("state") or {}
         transferable = {
-            "portfolio": old_state.get("portfolio") or updated.get("portfolio_state") or {},
+            "portfolio": normalize_recommendation_state(
+                old_state.get("portfolio") or updated.get("portfolio_state") or {}
+            ),
             "pending_close_orders": old_state.get("pending_close_orders") or [],
-            "last_corporate_action_date": old_state.get("last_corporate_action_date"),
         }
         old_snapshot = old_run.get("strategy_snapshot") or {}
         if (

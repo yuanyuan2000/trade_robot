@@ -25,6 +25,7 @@ from services.realtime_decision_service import (
     _strategy_state,
 )
 from services.realtime_mail import (
+    NotificationDispatcher,
     _plain_text_email_html,
     render_message,
     send_smtp,
@@ -36,6 +37,15 @@ from services.realtime_scheduler import (
     _rebase_followed_settings,
 )
 from services.realtime_market_data import IEXMarketDataHub
+from services.realtime_test_mail_service import (
+    _test_subject,
+    send_current_decision_test_emails,
+)
+from services.realtime_config import (
+    normalize_recommendation_state,
+    realtime_settings_from,
+    validate_realtime_overrides,
+)
 
 
 class RealtimeDecisionSafetyTests(unittest.TestCase):
@@ -53,6 +63,71 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
         self.data_patcher.stop()
         self.db_patcher.stop()
         self.temp_dir.cleanup()
+
+    def test_realtime_settings_exclude_historical_simulation_fields(self) -> None:
+        settings = realtime_settings_from({
+            "initial_capital": 250_000,
+            "commission_per_share": 0.02,
+            "minimum_commission": 3,
+            "slippage_bps": 7,
+            "benchmark": "SPY",
+            "leverage_multiplier": 2,
+        })
+
+        self.assertEqual(set(settings), {"leverage_multiplier", "dynamic_leverage"})
+        self.assertEqual(settings["leverage_multiplier"], 2)
+        self.assertFalse({
+            "initial_capital", "commission_per_share", "minimum_commission",
+            "slippage_bps", "benchmark",
+        } & set(settings))
+
+    def test_realtime_overrides_remain_sparse_for_following(self) -> None:
+        overrides = validate_realtime_overrides({
+            "initial_capital": 999_999,
+            "commission_per_share": 10,
+            "dynamic_leverage": {"stress_days": 21},
+        })
+
+        self.assertEqual(overrides, {"dynamic_leverage": {"stress_days": 21}})
+
+    def test_legacy_account_snapshot_migrates_to_target_state(self) -> None:
+        normalized = normalize_recommendation_state({
+            "cash": 50_000,
+            "strategy_target_weights": {"SPY": 0.5},
+            "positions": {"SPY": {"weight": 0.75}},
+            "total_commission": 12,
+        })
+
+        self.assertEqual(normalized["state_version"], 2)
+        self.assertEqual(normalized["recommended_targets"], {"SPY": 50})
+        self.assertEqual(normalized["recommended_exposures"], {"SPY": 75})
+        self.assertNotIn("cash", normalized)
+        self.assertNotIn("total_commission", normalized)
+
+    def test_notification_filters_run_before_channel_delivery(self) -> None:
+        dispatcher = NotificationDispatcher()
+        result = {"decision": {"event": "OPEN", "recommendations": []}}
+        event = {"id": 1}
+
+        self.assertEqual(dispatcher.enqueue_for_event(
+            {"notification_settings": {"enabled": True, "events": ["CLOSE"]}},
+            event,
+            result,
+        ), 0)
+        self.assertEqual(dispatcher.enqueue_for_event(
+            {"notification_settings": {"enabled": True, "only_when": "changes"}},
+            event,
+            result,
+        ), 0)
+        self.assertEqual(dispatcher.enqueue_for_event(
+            {"notification_settings": {"enabled": True, "only_when": "changes"}},
+            event,
+            {"decision": {
+                "event": "OPEN",
+                "recommendations": [{"action": "BUY"}],
+                "target_portfolio": [{"symbol": "SPY", "change": "HOLD"}],
+            }},
+        ), 0)
 
     def test_legacy_dynamic_leverage_state_does_not_infer_sub_one_strategy_layer(self) -> None:
         portfolio = Portfolio(
@@ -127,6 +202,93 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
         self.assertEqual(rebased["leverage_multiplier"], 2)
         self.assertEqual(rebased["dynamic_leverage"]["volatility_period"], 60)
         self.assertEqual(rebased["dynamic_leverage"]["stress_days"], 13)
+
+    def test_followed_task_discards_realtime_overrides_and_uses_source(self) -> None:
+        strategy = create_default_strategy(
+            name="稀疏覆盖跟随策略", design_mode="visual", selection_mode="single"
+        )
+        task = realtime_repository.create_task(
+            name="稀疏覆盖跟随任务",
+            strategy=strategy,
+            follow_strategy=True,
+            settings=realtime_settings_from(strategy["default_settings"]),
+            settings_overrides={"dynamic_leverage": {"stress_days": 21}},
+            notification_settings={},
+            portfolio_state={},
+        )
+        changed_defaults = deepcopy(strategy["default_settings"])
+        changed_defaults["leverage_multiplier"] = 3
+        changed_defaults["dynamic_leverage"] = {
+            **changed_defaults["dynamic_leverage"],
+            "volatility_period": 60,
+        }
+        update_strategy(
+            strategy["id"],
+            {"revision": strategy["revision"], "default_settings": changed_defaults},
+        )
+        manager = RealtimeTaskManager(max_workers=1)
+        try:
+            updated = manager._sync_followed_strategy(task)
+        finally:
+            manager._executor.shutdown(wait=False, cancel_futures=True)
+
+        self.assertEqual(updated["settings"]["leverage_multiplier"], 3)
+        self.assertEqual(updated["settings"]["dynamic_leverage"]["volatility_period"], 60)
+        self.assertEqual(updated["settings"]["dynamic_leverage"]["stress_days"], 13)
+        self.assertEqual(updated["settings_overrides"], {})
+        self.assertNotIn("initial_capital", updated["settings"])
+
+    def test_followed_task_repairs_all_common_settings_without_revision_change(self) -> None:
+        strategy = create_default_strategy(
+            name="同版本设置纠偏策略", design_mode="visual", selection_mode="single"
+        )
+        source_defaults = deepcopy(strategy["default_settings"])
+        source_defaults["leverage_multiplier"] = 2
+        source_defaults["dynamic_leverage"] = {
+            "volatility_period": 45,
+            "stress_days": 17,
+            "max_loss_percent": 31,
+            "max_leverage": 4,
+            "rebalance_on_change": False,
+        }
+        strategy = update_strategy(
+            strategy["id"],
+            {"revision": strategy["revision"], "default_settings": source_defaults},
+        )
+        stale_settings = realtime_settings_from(strategy["default_settings"])
+        stale_settings["leverage_multiplier"] = 7
+        stale_settings["dynamic_leverage"] = {
+            **stale_settings["dynamic_leverage"],
+            "volatility_period": 20,
+            "stress_days": 8,
+            "max_loss_percent": 15,
+            "max_leverage": 8,
+            "rebalance_on_change": True,
+        }
+        task = realtime_repository.create_task(
+            name="同版本设置纠偏任务",
+            strategy=strategy,
+            follow_strategy=True,
+            settings=stale_settings,
+            settings_overrides={
+                "leverage_multiplier": 7,
+                "dynamic_leverage": stale_settings["dynamic_leverage"],
+            },
+            notification_settings={},
+            portfolio_state={},
+        )
+        manager = RealtimeTaskManager(max_workers=1)
+        try:
+            updated = manager._sync_followed_strategy(task)
+        finally:
+            manager._executor.shutdown(wait=False, cancel_futures=True)
+
+        self.assertEqual(
+            updated["settings"],
+            realtime_settings_from(strategy["default_settings"]),
+        )
+        self.assertFalse(updated["settings"]["dynamic_leverage"]["rebalance_on_change"])
+        self.assertEqual(updated["settings_overrides"], {})
 
     def test_close_strategy_schedules_next_open_fill_boundary(self) -> None:
         strategy = create_default_strategy(
@@ -208,8 +370,15 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
             )
 
         self.assertEqual(open_result["state"]["pending_close_orders"], [])
-        self.assertEqual(len(open_result["decision"]["trades"]), 1)
-        self.assertEqual(open_result["decision"]["trades"][0]["reference_price"], 110)
+        self.assertEqual(open_result["decision"]["trades"], [])
+        self.assertEqual(
+            open_result["state"]["portfolio"]["recommended_targets"]["SPY"],
+            100,
+        )
+        self.assertEqual(
+            open_result["decision"]["target_portfolio"][0]["target_weight_percent"],
+            100,
+        )
 
     def test_normal_notification_slot_is_atomic_and_exactly_one_minute(self) -> None:
         strategy = create_default_strategy(name="限频依赖策略", design_mode="visual", selection_mode="single")
@@ -348,6 +517,109 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
                     event="10:00",
                     now=datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc),
                 )
+
+    def test_current_decision_test_mail_advances_isolated_state_and_marks_subjects(self) -> None:
+        observation_at = datetime(2026, 8, 3, 14, 5, tzinfo=timezone.utc)
+        strategy = {"design_mode": "code", "code_key": "test", "definition": {}}
+        task = {
+            "id": 7,
+            "name": "WTME 测试",
+            "runtime_state": "stopped",
+            "strategy_snapshot": strategy,
+            "settings": {},
+            "notification_settings": {
+                "events": ["09:50", "10:00"],
+                "subject_template": "决策 {{decision.time}}",
+            },
+            "portfolio_state": {},
+        }
+        observed_states = []
+
+        prepared_observation = {"trading_date": "2026-08-03"}
+
+        def evaluate(_task, run, *, trading_date, event, prepared_observation):
+            observed_states.append(deepcopy(run["state"]))
+            self.assertEqual(prepared_observation, {"trading_date": "2026-08-03"})
+            return {
+                "decision": {
+                    "trading_date": trading_date,
+                    "event": event,
+                    "recommendations": [],
+                },
+                "calculation": {"engine_logs": []},
+                "data_manifest": {},
+                "state": {
+                    "portfolio": {},
+                    "strategy_state": {"completed": event},
+                },
+            }
+
+        with (
+            patch(
+                "services.realtime_test_mail_service.run_manager.status",
+                return_value=task,
+            ),
+            patch(
+                "services.realtime_test_mail_service.validate_strategy_payload",
+                return_value=strategy,
+            ),
+            patch(
+                "services.realtime_test_mail_service.validate_realtime_code_version",
+            ),
+            patch(
+                "services.realtime_test_mail_service._events_for_strategy",
+                return_value=["09:50", "10:00"],
+            ),
+            patch(
+                "services.realtime_test_mail_service._observation_symbols",
+                return_value=["SPY"],
+            ),
+            patch(
+                "services.realtime_test_mail_service.build_database_decision_observation",
+                return_value=prepared_observation,
+            ) as build_observation,
+            patch(
+                "services.realtime_test_mail_service.run_manager.evaluator.hub.event_snapshot",
+                side_effect=AssertionError("test mail must not request external event bars"),
+            ),
+            patch(
+                "services.realtime_test_mail_service.realtime_repository.get_email_channel",
+                return_value={"id": 2},
+            ),
+            patch(
+                "services.realtime_test_mail_service.run_manager.evaluator.evaluate",
+                side_effect=evaluate,
+            ),
+            patch(
+                "services.realtime_test_mail_service.render_message",
+                side_effect=lambda _task, result: (
+                    f"决策 {result['decision']['event']}", "正文"
+                ),
+            ),
+            patch(
+                "services.realtime_test_mail_service.send_smtp",
+                return_value="provider-id",
+            ) as smtp,
+        ):
+            summary = send_current_decision_test_emails(
+                7,
+                channel_id=2,
+                recipients="me@example.com",
+                now=observation_at,
+            )
+
+        self.assertEqual(summary["events"], ["09:50", "10:00"])
+        self.assertEqual(summary["sent_count"], 2)
+        build_observation.assert_called_once_with(strategy, ["SPY"])
+        self.assertNotIn("strategy_state", observed_states[0])
+        self.assertEqual(
+            observed_states[1]["strategy_state"], {"completed": "09:50"}
+        )
+        self.assertEqual(
+            [call.kwargs["subject"] for call in smtp.call_args_list],
+            ["决策 09:50（测试）", "决策 10:00（测试）"],
+        )
+        self.assertEqual(len(_test_subject("x" * 300)), 200)
 
     def test_competition_snapshot_supports_stock_and_crypto_candidates(self) -> None:
         hub = IEXMarketDataHub()
@@ -659,7 +931,7 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
 
         _subject, selection_body = render_message(task, selection_result)
 
-        self.assertIn("| 标的 | 持仓比例 | WTME评分 | 急跌过滤后排名 |", selection_body)
+        self.assertIn("| 标的 | 模型目标敞口 | WTME评分 | 急跌过滤后排名 |", selection_body)
         self.assertIn("| GLD | 200% | 12.346 | 1 |", selection_body)
         self.assertIn("| SPY | 0% | 8.2 | 2 |", selection_body)
         self.assertNotIn("100 × Rw", selection_body)
@@ -932,9 +1204,10 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
 
             self.assertNotEqual(new_run["id"], old_run["id"])
             self.assertEqual(new_run["strategy_snapshot"]["revision"], updated_strategy["revision"])
-            self.assertEqual(new_run["settings"]["initial_capital"], 200_000)
-            self.assertEqual(new_run["settings"]["leverage_multiplier"], 2)
-            self.assertEqual(new_run["state"]["portfolio"]["cash"], 99_000)
+            self.assertNotIn("initial_capital", new_run["settings"])
+            self.assertEqual(new_run["settings"]["leverage_multiplier"], 1)
+            self.assertEqual(new_run["state"]["portfolio"]["state_version"], 2)
+            self.assertNotIn("cash", new_run["state"]["portfolio"])
             self.assertEqual(realtime_repository.get_run(old_run["id"])["status"], "stopped")
             self.assertEqual(refreshed["source_strategy_revision"], updated_strategy["revision"])
         finally:

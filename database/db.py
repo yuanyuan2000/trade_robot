@@ -43,6 +43,12 @@ def init_database() -> None:
 
 
 def migrate_database(conn: sqlite3.Connection) -> None:
+    ensure_column(
+        conn,
+        "realtime_decision_tasks",
+        "settings_overrides_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )
     ensure_column(conn, "backtest_runs", "termination_reason", "TEXT")
     ensure_column(conn, "backtest_runs", "configuration_summary", "TEXT")
     ensure_column(conn, "backtest_runs", "log_count", "INTEGER NOT NULL DEFAULT 0")

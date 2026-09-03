@@ -28,10 +28,6 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
-def _minute_timestamp(value: datetime) -> datetime:
-    return _as_utc(value).astimezone(UTC).replace(second=0, microsecond=0)
-
-
 class IEXMarketDataHub:
     """Event-time Alpaca data owner for formal realtime decisions.
 

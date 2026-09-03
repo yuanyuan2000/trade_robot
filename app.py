@@ -69,6 +69,7 @@ from services.backtest.service import (
     create_strategy as create_backtest_strategy_service,
     duplicate_strategy,
     list_run_overviews,
+    prepare_strategy_for_execution,
     repair_saved_strategy_data,
     run_manager as backtest_run_manager,
     update_strategy as update_backtest_strategy_service,
@@ -93,6 +94,7 @@ from services.realtime_mail import (
     validate_message_template,
 )
 from services.realtime_scheduler import run_manager as realtime_run_manager
+from services.realtime_test_mail_service import send_current_decision_test_emails
 from services.market_overview_coordinator import market_overview_coordinator
 from services.realtime_dashboard_service import (
     build_realtime_dashboard,
@@ -105,6 +107,12 @@ from services.realtime_panel_script import (
     validate_panel_settings,
 )
 from services.realtime_presets import ensure_shipped_realtime_tasks
+from services.realtime_config import (
+    empty_recommendation_state,
+    merge_realtime_settings,
+    normalize_recommendation_state,
+    validate_realtime_overrides,
+)
 from services.market_context import annotate_us_market_sessions
 
 
@@ -1823,22 +1831,72 @@ def _realtime_task_payload(payload: dict, *, current: dict | None = None) -> tup
         raise ValueError("必须选择一个历史回测策略。")
     strategy = backtest_repository.get_strategy(int(strategy_id))
     strategy_snapshot = payload.get("strategy_snapshot", current.get("strategy_snapshot", strategy))
-    validate_strategy_payload(strategy_snapshot)
-    settings = {**strategy.get("default_settings", {}), **(current.get("settings") or {}), **(payload.get("settings") or {})}
+    # Realtime tasks retain a complete strategy snapshot, but only settings
+    # that can influence target weights and exposure belong to the task.
+    strategy_snapshot = prepare_strategy_for_execution(strategy_snapshot)
+    current_overrides = current.get("settings_overrides") or {}
+    if current and not current_overrides and "settings" in payload:
+        # The first edit of a legacy task makes its current realtime values
+        # explicit, removing equality-based inheritance ambiguity.
+        current_overrides = current.get("settings") or {}
+    requested_overrides = payload.get("settings_overrides")
+    if requested_overrides is None:
+        requested_overrides = (
+            {**current_overrides, **(payload.get("settings") or {})}
+            if "settings" in payload
+            else current_overrides
+        )
+    will_follow = bool(payload.get("follow_strategy", current.get("follow_strategy", True)))
+    # Following means the complete shared strategy contract follows the source:
+    # definition plus every realtime-relevant default setting. Overrides only
+    # belong to detached task snapshots.
+    overrides = (
+        {}
+        if will_follow
+        else validate_realtime_overrides(requested_overrides)
+    )
+    settings = merge_realtime_settings(
+        (strategy if will_follow else strategy_snapshot).get("default_settings"),
+        overrides,
+    )
     notification = {**(current.get("notification_settings") or {}), **(payload.get("notification_settings") or {})}
     notification.setdefault("enabled", False)
+    raw_events = notification.get("events") or []
+    if isinstance(raw_events, str):
+        raw_events = [item for item in raw_events.replace(";", ",").split(",") if item.strip()]
+    if not isinstance(raw_events, list):
+        raise ValueError("通知事件必须是事件名称数组。")
+    notification["events"] = list(dict.fromkeys(
+        str(item).strip().upper() for item in raw_events if str(item).strip()
+    ))
+    notification["only_when"] = str(notification.get("only_when") or "all").lower()
+    if notification["only_when"] not in {"all", "changes"}:
+        raise ValueError("通知条件必须为 all 或 changes。")
+    delivery_time = str(notification.get("delivery_time") or "").strip()
+    if delivery_time:
+        try:
+            datetime.strptime(delivery_time, "%H:%M")
+        except ValueError as exc:
+            raise ValueError("邮件发送时间必须为 HH:MM。") from exc
+    notification["delivery_time"] = delivery_time or None
     validate_message_template(notification.get("subject_template") or "")
     validate_message_template(notification.get("body_template") or "")
     if notification.get("enabled"):
         if not notification.get("channel_id"):
             raise ValueError("启用邮件通知时必须选择邮件通道。")
         normalize_recipients(notification.get("recipients"))
-        if strategy.get("design_mode") != "code" and not str(notification.get("body_template") or "").strip():
+        if strategy_snapshot.get("design_mode") != "code" and not str(notification.get("body_template") or "").strip():
             raise ValueError("非代码策略启用邮件时必须填写信息内容模板。")
-    portfolio = {**(current.get("portfolio_state") or {}), **(payload.get("portfolio_state") or {})}
-    portfolio.setdefault("cash", float(settings.get("initial_capital", 100000)))
-    portfolio.setdefault("positions", {})
-    return strategy, settings, {"notification": notification, "portfolio": portfolio}
+    portfolio = normalize_recommendation_state({
+        **(current.get("portfolio_state") or empty_recommendation_state()),
+        **(payload.get("portfolio_state") or {}),
+    })
+    return strategy, settings, {
+        "notification": notification,
+        "portfolio": portfolio,
+        "settings_overrides": overrides,
+        "strategy_snapshot": strategy_snapshot,
+    }
 
 
 @app.route("/api/realtime/tasks")
@@ -1884,6 +1942,7 @@ def create_realtime_task():
             strategy=strategy,
             follow_strategy=bool(payload.get("follow_strategy", True)),
             settings=settings,
+            settings_overrides=extras["settings_overrides"],
             notification_settings=extras["notification"],
             portfolio_state=extras["portfolio"],
             panel_settings=generate_panel_settings(strategy),
@@ -1913,13 +1972,7 @@ def patch_realtime_task(task_id: int):
         current = realtime_repository.get_task(task_id)
         strategy, settings, extras = _realtime_task_payload(payload, current=current)
         follow = bool(payload.get("follow_strategy", current["follow_strategy"]))
-        snapshot = current["strategy_snapshot"]
-        if not follow and "strategy_snapshot" in payload:
-            snapshot = payload["strategy_snapshot"]
-        elif follow and current["follow_strategy"]:
-            snapshot = current["strategy_snapshot"]
-        elif follow:
-            snapshot = strategy
+        snapshot = strategy if follow else extras["strategy_snapshot"]
         task = realtime_repository.update_task(
             task_id,
             name=str(payload["name"]).strip() if "name" in payload else None,
@@ -1928,6 +1981,7 @@ def patch_realtime_task(task_id: int):
             source_code_version=snapshot.get("code_version"),
             follow_strategy=follow,
             settings=settings,
+            settings_overrides=extras["settings_overrides"],
             notification_settings=extras["notification"],
             portfolio_state=extras["portfolio"],
             expected_revision=payload.get("revision"),
@@ -2171,6 +2225,39 @@ def test_realtime_email_channel(channel_id: int):
         return jsonify({"ok": True, "message": "测试邮件已提交。"})
     except Exception as exc:
         realtime_repository.mark_email_channel_test(channel_id, ok=False, error=str(exc))
+        return backtest_error_response(exc)
+
+
+@app.route("/api/realtime/tasks/<int:task_id>/test-email", methods=["POST"])
+def test_realtime_task_email(task_id: int):
+    payload = request.get_json(silent=True) or {}
+    channel_id = payload.get("channel_id")
+    try:
+        if not channel_id:
+            raise ValueError("必须选择邮件通道。")
+        channel = realtime_repository.get_email_channel(int(channel_id))
+        recipients = payload.get("recipients") or payload.get("recipient")
+        if not recipients:
+            recipients = channel["sender_email"]
+        result = send_current_decision_test_emails(
+            task_id,
+            channel_id=int(channel_id),
+            recipients=recipients,
+        )
+        realtime_repository.mark_email_channel_test(int(channel_id), ok=True)
+        return jsonify({
+            "ok": True,
+            "message": f"已立即发送 {result['sent_count']} 封当前决策测试邮件。",
+            **result,
+        })
+    except Exception as exc:
+        if channel_id:
+            try:
+                realtime_repository.mark_email_channel_test(
+                    int(channel_id), ok=False, error=str(exc)
+                )
+            except Exception:
+                pass
         return backtest_error_response(exc)
 
 

@@ -152,9 +152,102 @@ def _dataset_for_overview(
         cumulative_volumes=cumulative,
         availability_start={symbol: rows[0]["date"] for symbol, rows in daily.items()},
         corporate_actions=actions,
-        manifest={"source": "database", "as_of": current_date, "market": market},
+        manifest={
+            "source": "database",
+            "as_of": current_date,
+            "market": market,
+            "market_sessions": [dict(sessions[-1])],
+        },
     )
     return dataset, event_prices, current_date
+
+
+def build_database_decision_observation(
+    strategy: dict,
+    symbols: list[str],
+) -> dict:
+    """Build a decision-engine snapshot from the dashboard's local DB inputs.
+
+    This intentionally shares ``_dataset_for_overview`` with the visible data
+    panel. It never invokes an event market-data hub or a history repair callback.
+    """
+    overview = repository.list_market_overview()
+    dataset, event_prices, trading_date = _dataset_for_overview(overview, strategy)
+    requested = list(dict.fromkeys(
+        str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()
+    ))
+    overview_by_symbol = {
+        str(item["symbol"]).upper(): item for item in overview.get("items", [])
+    }
+    payload_symbols: dict[str, dict] = {}
+    history_daily: dict[str, list[dict]] = {}
+    audits: dict[str, dict] = {}
+    missing: list[str] = []
+    for symbol in requested:
+        prices = dataset.daily.get(symbol) or []
+        event_price = event_prices.get(symbol)
+        if not prices or event_price is None:
+            missing.append(f"{symbol}: 数据面板没有可用的本地行情")
+            continue
+        current_row = dict(prices[-1])
+        history = [dict(row) for row in prices[:-1]]
+        history_daily[symbol] = history
+        overview_item = overview_by_symbol.get(symbol) or {}
+        cumulative_volume = dataset.cumulative_volumes.get(symbol, {}).get(
+            f"{trading_date}|LATEST"
+        )
+        payload_symbols[symbol] = {
+            "signal_price": float(event_price.signal_price),
+            # Realtime decisions publish target percentages rather than broker
+            # fills. A local test advances only an isolated model-state copy.
+            "fill_price": float(event_price.signal_price),
+            "signal_time": event_price.signal_time,
+            "fill_time": event_price.signal_time,
+            "latest_minute": current_row,
+            "daily": current_row,
+            "daily_is_complete": False,
+            "cumulative_volume": cumulative_volume,
+            "source": overview_item.get("latest_price_source") or "database",
+            "feed": "database",
+            "requested_at": (
+                overview_item.get("latest_price_updated_at")
+                or repository.utc_now_iso()
+            ),
+        }
+        last_history_date = history[-1].get("date") if history else None
+        snapshot_id = f"dashboard:{symbol}:{last_history_date or 'none'}:{trading_date}"
+        audits[symbol] = {
+            "latest_complete_date": last_history_date,
+            "snapshot_id": snapshot_id,
+            "source": "market_overview_database",
+        }
+
+    combined_snapshot_id = "dashboard:" + "|".join(
+        audits[symbol]["snapshot_id"] for symbol in sorted(audits)
+    )
+    return {
+        "trading_date": trading_date,
+        "market_session": dict(dataset.manifest["market_sessions"][-1]),
+        "history_snapshot": {
+            "required_sessions": None,
+            "expected_dates": [],
+            "symbols": audits,
+            "daily": history_daily,
+            "snapshot_id": combined_snapshot_id,
+            "market": strategy.get("market"),
+        },
+        "payload": {
+            "symbols": payload_symbols,
+            "source": "market_overview_database",
+            "feed": "database",
+            "timeframe": "database_latest",
+            "trading_date": trading_date,
+            "event": "LATEST",
+            "missing": missing,
+            "requested_at": repository.utc_now_iso(),
+            "freshness_seconds": {},
+        },
+    }
 
 
 def _context(

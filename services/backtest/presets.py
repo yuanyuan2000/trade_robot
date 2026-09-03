@@ -210,8 +210,16 @@ def ensure_shipped_strategy_presets() -> None:
                 "sevenstar-formula-mode-v1.1.0",
                 code_key="sevenstar_etf_rotation",
                 from_versions=("1.0.0", "1.0.1"),
-                to_version=payload["code_version"],
+                to_version="1.1.0",
                 parameter_defaults={"trend_formula_mode": "consistent_w2"},
+            )
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "sevenstar-remove-minimum-trade-value-v1.2.0",
+                code_key="sevenstar_etf_rotation",
+                from_versions=("1.0.0", "1.0.1", "1.1.0"),
+                to_version=payload["code_version"],
+                removed_parameters=("minimum_trade_value_usd",),
             )
         if payload.get("code_key") == "rapid_drop_atr_rotation":
             backtest_repository.upgrade_seeded_strategy_code_version_once(
