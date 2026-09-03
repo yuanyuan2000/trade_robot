@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
 import threading
 from zoneinfo import ZoneInfo
@@ -14,6 +15,7 @@ from database import backtest_repository, realtime_repository
 from services.backtest.code_strategies import get_code_strategy
 from services.backtest.errors import BacktestValidationError
 from services.backtest.market_calendar import ensure_market_sessions
+from services.backtest.service import prepare_strategy_for_execution
 from services.backtest.validation import validate_strategy_payload
 from services.realtime_decision_service import RealtimeDecisionEvaluator
 from services.realtime_mail import NotificationDispatcher
@@ -51,7 +53,37 @@ def _events_for_strategy(strategy: dict) -> list[str]:
     else:
         strategy_type = get_code_strategy(strategy["code_key"])
         events.update(strategy_type.required_events(definition.get("params", {})))
+    # CLOSE signals use the next session's OPEN as their fill, exactly as in
+    # BacktestEngine.run(). Schedule that execution boundary even when the
+    # strategy itself has no OPEN rule.
+    if "CLOSE" in events:
+        events.add("OPEN")
     return sorted(events, key=_event_order)
+
+
+def _rebase_followed_settings(
+    current: dict,
+    old_defaults: dict,
+    new_defaults: dict,
+) -> dict:
+    """Apply changed source defaults while retaining explicit task overrides."""
+    result: dict = {}
+    for key in set(current) | set(new_defaults):
+        current_value = current.get(key)
+        old_value = old_defaults.get(key)
+        new_value = new_defaults.get(key)
+        if isinstance(current_value, dict) and isinstance(new_value, dict):
+            result[key] = _rebase_followed_settings(
+                current_value,
+                old_value if isinstance(old_value, dict) else {},
+                new_value,
+            )
+        elif key not in current or current_value == old_value:
+            if key in new_defaults:
+                result[key] = deepcopy(new_value)
+        else:
+            result[key] = deepcopy(current_value)
+    return result
 
 
 def validate_realtime_code_version(strategy: dict) -> None:
@@ -70,7 +102,7 @@ def validate_realtime_code_version(strategy: dict) -> None:
     )
 
 
-def _validate_local_history(strategy: dict) -> None:
+def _validate_local_history(strategy: dict, settings: dict | None = None) -> None:
     """Repair and validate the exact completed-session window before launch."""
     current = datetime.now(UTC).astimezone(NEW_YORK)
     cutoff = current.date()
@@ -79,6 +111,7 @@ def _validate_local_history(strategy: dict) -> None:
     prepare_strategy_history(
         strategy,
         trading_date=cutoff.isoformat(),
+        settings=settings,
         refresh=lambda symbol, start_date: refresh_strategy_daily_history(
             symbol,
             start_date=start_date,
@@ -198,7 +231,7 @@ class RealtimeTaskManager:
         # This must run before history repair, run creation or event scheduling
         # so clicking Run reports an unavailable saved implementation at once.
         validate_realtime_code_version(strategy)
-        _validate_local_history(strategy)
+        _validate_local_history(strategy, task.get("settings") or {})
         events = _events_for_strategy(strategy)
         if not events:
             raise ValueError("策略没有可执行的实时事件。")
@@ -290,15 +323,23 @@ class RealtimeTaskManager:
     def _sync_followed_strategy(self, task: dict) -> dict:
         if not task["follow_strategy"]:
             return task
-        strategy = backtest_repository.get_strategy(task["strategy_id"])
+        source_strategy = backtest_repository.get_strategy(task["strategy_id"])
+        strategy = prepare_strategy_for_execution(source_strategy)
         if (
-            int(task["source_strategy_revision"]) == int(strategy["revision"])
+            int(task["source_strategy_revision"]) == int(source_strategy["revision"])
             and task["strategy_snapshot"].get("code_version") == strategy.get("code_version")
+            and task["strategy_snapshot"] == strategy
         ):
             return task
+        followed_settings = _rebase_followed_settings(
+            task.get("settings") or {},
+            (task.get("strategy_snapshot") or {}).get("default_settings") or {},
+            strategy.get("default_settings") or {},
+        )
         updated = realtime_repository.update_task(
             task["id"], strategy_snapshot=strategy,
-            source_strategy_revision=strategy["revision"], source_code_version=strategy.get("code_version"),
+            source_strategy_revision=source_strategy["revision"], source_code_version=strategy.get("code_version"),
+            settings=followed_settings,
         )
         if (
             strategy.get("design_mode") == "visual"
@@ -307,6 +348,39 @@ class RealtimeTaskManager:
             updated = realtime_repository.update_panel_settings(
                 task["id"], generate_panel_settings(strategy)
             )
+        return updated
+
+    def _refresh_followed_run(self, task: dict, state: dict) -> dict:
+        """Roll a running followed task to a new immutable run at an event boundary."""
+        updated = self._sync_followed_strategy(task)
+        if int(updated["revision"]) == int(task["revision"]):
+            return task
+        strategy = validate_strategy_payload(updated["strategy_snapshot"])
+        validate_realtime_code_version(strategy)
+        old_run = realtime_repository.get_run(state["run_id"])
+        old_state = old_run.get("state") or {}
+        transferable = {
+            "portfolio": old_state.get("portfolio") or updated.get("portfolio_state") or {},
+            "pending_close_orders": old_state.get("pending_close_orders") or [],
+            "last_corporate_action_date": old_state.get("last_corporate_action_date"),
+        }
+        old_snapshot = old_run.get("strategy_snapshot") or {}
+        if (
+            old_snapshot.get("design_mode") == strategy.get("design_mode")
+            and old_snapshot.get("code_key") == strategy.get("code_key")
+        ):
+            transferable["strategy_state"] = old_state.get("strategy_state") or {}
+        now = datetime.now(UTC).replace(microsecond=0).isoformat()
+        new_run = realtime_repository.create_run(updated, started_at=now)
+        realtime_repository.update_run(
+            new_run["id"], status="running", state=transferable, heartbeat_at=now,
+        )
+        realtime_repository.update_run(
+            old_run["id"], status="stopped", stopped_at=now, heartbeat_at=now,
+        )
+        state["run_id"] = int(new_run["id"])
+        state["strategy"] = strategy
+        state["events"] = _events_for_strategy(strategy)
         return updated
 
     def _sessions_for(self, start: date, end: date) -> list[dict]:
@@ -365,6 +439,7 @@ class RealtimeTaskManager:
                 if task["desired_state"] != "running":
                     self._finish_stopped(task_id, state)
                     continue
+                task = self._refresh_followed_run(task, state)
                 next_item = self._next_event(state["strategy"], current)
                 if next_item is None:
                     continue

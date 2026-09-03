@@ -1,19 +1,40 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import database.db as main_db
 from database import realtime_repository
 import services.realtime_scheduler as scheduler_module
+from services.backtest.code_strategies import (
+    STRATEGY_REGISTRY,
+    RapidDropAtrRotationStrategy,
+)
 from services.backtest.errors import BacktestValidationError
-from services.backtest.service import create_default_strategy
-from services.realtime_mail import render_message, validate_message_template
-from services.realtime_scheduler import RealtimeTaskManager
+from services.backtest.portfolio import Portfolio
+from services.backtest.service import create_default_strategy, update_strategy
+from services.realtime_decision_service import (
+    RealtimeDecisionEvaluator,
+    _restore_portfolio,
+    _restore_strategy_state,
+    _strategy_state,
+)
+from services.realtime_mail import (
+    _plain_text_email_html,
+    render_message,
+    send_smtp,
+    validate_message_template,
+)
+from services.realtime_scheduler import (
+    RealtimeTaskManager,
+    _events_for_strategy,
+    _rebase_followed_settings,
+)
 from services.realtime_market_data import IEXMarketDataHub
 
 
@@ -32,6 +53,163 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
         self.data_patcher.stop()
         self.db_patcher.stop()
         self.temp_dir.cleanup()
+
+    def test_legacy_dynamic_leverage_state_does_not_infer_sub_one_strategy_layer(self) -> None:
+        portfolio = Portfolio(
+            100_000,
+            symbol_leverage_multipliers={"GLD": 3, "SPY": 3},
+        )
+        legacy_state = {
+            "cash": 100_000,
+            "positions": {},
+            "symbol_leverage_multipliers": {"GLD": 2, "SPY": 3},
+        }
+
+        _restore_portfolio(portfolio, legacy_state)
+
+        self.assertEqual(float(portfolio.configured_symbol_leverage_multipliers["GLD"]), 2)
+        self.assertEqual(float(portfolio.symbol_leverage_multipliers["GLD"]), 2)
+        portfolio.set_configured_symbol_leverage_multiplier("GLD", 1)
+        self.assertEqual(float(portfolio.symbol_leverage_multipliers["GLD"]), 1)
+
+    def test_current_dynamic_leverage_state_preserves_strategy_layer(self) -> None:
+        portfolio = Portfolio(
+            100_000,
+            symbol_leverage_multipliers={"GLD": 3},
+        )
+        current_state = {
+            "cash": 100_000,
+            "positions": {},
+            "configured_symbol_leverage_multipliers": {"GLD": 2},
+            "symbol_leverage_multipliers": {"GLD": 6},
+        }
+
+        _restore_portfolio(portfolio, current_state)
+        portfolio.set_configured_symbol_leverage_multiplier("GLD", 1)
+
+        self.assertEqual(float(portfolio.configured_symbol_leverage_multipliers["GLD"]), 1)
+        self.assertEqual(float(portfolio.symbol_leverage_multipliers["GLD"]), 3)
+
+    def test_runtime_state_never_overwrites_current_code_strategy_parameters(self) -> None:
+        for key, strategy_type in STRATEGY_REGISTRY.items():
+            with self.subTest(code_key=key):
+                instance = strategy_type({})
+                current_params = dict(instance.params)
+                state = _strategy_state(instance)
+                self.assertNotIn("params", state)
+                _restore_strategy_state(
+                    instance,
+                    {**state, "params": {"obsolete": True}, "removed_field": 123},
+                )
+                self.assertEqual(instance.params, current_params)
+                self.assertFalse(hasattr(instance, "removed_field"))
+
+    def test_followed_settings_take_new_defaults_and_keep_explicit_overrides(self) -> None:
+        rebased = _rebase_followed_settings(
+            {
+                "initial_capital": 100_000,
+                "leverage_multiplier": 2,
+                "dynamic_leverage": {"volatility_period": 30, "stress_days": 13},
+            },
+            {
+                "initial_capital": 100_000,
+                "leverage_multiplier": 1,
+                "dynamic_leverage": {"volatility_period": 30, "stress_days": 10},
+            },
+            {
+                "initial_capital": 200_000,
+                "leverage_multiplier": 1,
+                "dynamic_leverage": {"volatility_period": 60, "stress_days": 10},
+            },
+        )
+
+        self.assertEqual(rebased["initial_capital"], 200_000)
+        self.assertEqual(rebased["leverage_multiplier"], 2)
+        self.assertEqual(rebased["dynamic_leverage"]["volatility_period"], 60)
+        self.assertEqual(rebased["dynamic_leverage"]["stress_days"], 13)
+
+    def test_close_strategy_schedules_next_open_fill_boundary(self) -> None:
+        strategy = create_default_strategy(
+            name="收盘信号策略", design_mode="visual", selection_mode="single"
+        )
+        strategy["definition"]["rules"][0]["when"] = "CLOSE"
+        self.assertEqual(_events_for_strategy(strategy), ["OPEN", "CLOSE"])
+
+    def test_realtime_close_signal_is_filled_at_next_open(self) -> None:
+        strategy = create_default_strategy(
+            name="实时收盘成交一致性", design_mode="visual", selection_mode="single"
+        )
+        strategy["definition"]["rules"] = [{
+            "id": "close-buy", "name": "收盘买入", "enabled": True,
+            "priority": 1, "action": "BUY", "sizing_mode": "TARGET",
+            "value": 100, "condition": "true", "when": "CLOSE",
+        }]
+        task = realtime_repository.create_task(
+            name="实时收盘成交一致性任务", strategy=strategy,
+            follow_strategy=False, settings=strategy["default_settings"],
+            notification_settings={}, portfolio_state={},
+        )
+        run = realtime_repository.create_run(task)
+        history = [{
+            "date": "2026-08-10", "open": 99, "high": 101, "low": 98,
+            "close": 100, "volume": 1000, "is_complete": 1,
+        }]
+        session = {
+            "trading_date": "2026-08-11", "open_minute_utc": 1,
+            "close_minute_utc": 391, "is_early_close": False,
+        }
+        hub = Mock()
+        hub.event_snapshot.side_effect = [
+            {
+                "symbols": {"SPY": {
+                    "signal_price": 105, "fill_price": None,
+                    "signal_time": "2026-08-11 CLOSE", "fill_time": None,
+                    "daily": {**history[0], "date": "2026-08-11", "close": 105},
+                    "daily_is_complete": True,
+                }},
+                "source": "test", "feed": "test", "missing": [],
+                "requested_at": "2026-08-11T20:00:00Z",
+            },
+            {
+                "symbols": {"SPY": {
+                    "signal_price": 105, "fill_price": 110,
+                    "signal_time": "2026-08-12 OPEN", "fill_time": "2026-08-12 09:30",
+                    "daily": {**history[0], "date": "2026-08-12", "open": 110},
+                    "daily_is_complete": False,
+                }},
+                "source": "test", "feed": "test", "missing": [],
+                "requested_at": "2026-08-12T13:30:00Z",
+            },
+        ]
+        evaluator = RealtimeDecisionEvaluator(hub)
+
+        def history_snapshot(_strategy, *, trading_date, **_kwargs):
+            return {
+                "required_sessions": 2, "expected_dates": [history[0]["date"]],
+                "symbols": {"SPY": {"snapshot_id": f"SPY:{trading_date}"}},
+                "daily": {"SPY": history}, "snapshot_id": f"history:{trading_date}",
+                "market": strategy["market"],
+            }
+
+        with (
+            patch("services.realtime_decision_service.prepare_strategy_history", side_effect=history_snapshot),
+            patch("services.realtime_decision_service.market_sessions", return_value=[session]),
+        ):
+            close_result = evaluator.evaluate(
+                task, run, trading_date="2026-08-11", event="CLOSE"
+            )
+            self.assertEqual(close_result["decision"]["trades"], [])
+            self.assertEqual(
+                close_result["state"]["pending_close_orders"][0]["symbol"], "SPY"
+            )
+            continued_run = {**run, "state": close_result["state"]}
+            open_result = evaluator.evaluate(
+                task, continued_run, trading_date="2026-08-12", event="OPEN"
+            )
+
+        self.assertEqual(open_result["state"]["pending_close_orders"], [])
+        self.assertEqual(len(open_result["decision"]["trades"]), 1)
+        self.assertEqual(open_result["decision"]["trades"][0]["reference_price"], 110)
 
     def test_normal_notification_slot_is_atomic_and_exactly_one_minute(self) -> None:
         strategy = create_default_strategy(name="限频依赖策略", design_mode="visual", selection_mode="single")
@@ -75,38 +253,46 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
         self.assertEqual(row["fill_price"], 103.5)
         self.assertEqual(row["daily"]["close"], 103)
 
-    def test_us10y_uses_yahoo_current_price_without_alpaca_minutes(self) -> None:
-        hub = IEXMarketDataHub()
-        with (
-            patch(
-                "services.realtime_market_data.repository.resolve_symbol_alias",
-                return_value={"yahoo_symbol": "^TNX"},
-            ),
-            patch(
-                "services.realtime_market_data.fetch_latest_chart_prices_batch",
-                return_value={
-                    "^TNX": {
-                        "price": 4.321,
-                        "market_time": 1788271200,
-                    }
-                },
-            ),
-            patch(
-                "services.realtime_market_data.fetch_stock_bars",
-                side_effect=AssertionError("US10Y must not be sent to Alpaca"),
-            ),
+    def test_non_alpaca_cash_series_use_yahoo_current_price(self) -> None:
+        for symbol, yahoo_symbol, current_price in (
+            ("USDINDEX", "DX-Y.NYB", 97.65),
+            ("US10Y", "^TNX", 4.321),
         ):
-            snapshot = hub.event_snapshot(
-                ["US10Y"],
-                trading_date="2026-09-01",
-                event="10:00",
-            )
+            with self.subTest(symbol=symbol):
+                hub = IEXMarketDataHub()
+                with (
+                    patch(
+                        "services.realtime_market_data.repository.resolve_symbol_alias",
+                        return_value={"yahoo_symbol": yahoo_symbol},
+                    ),
+                    patch(
+                        "services.realtime_market_data.fetch_latest_chart_prices_batch",
+                        return_value={
+                            yahoo_symbol: {
+                                "price": current_price,
+                                "market_time": 1788271200,
+                            }
+                        },
+                    ),
+                    patch(
+                        "services.realtime_market_data.fetch_stock_bars",
+                        side_effect=AssertionError(f"{symbol} must not be sent to Alpaca"),
+                    ),
+                ):
+                    snapshot = hub.event_snapshot(
+                        [symbol],
+                        trading_date="2026-09-01",
+                        event="10:00",
+                    )
 
-        row = snapshot["symbols"]["US10Y"]
-        self.assertEqual(row["signal_price"], 4.321)
-        self.assertEqual(row["fill_price"], 4.321)
-        self.assertEqual(row["source"], "yahoo_current_price")
-        self.assertEqual(row["price_fallback"], "current_price_without_alpaca_minutes")
+                row = snapshot["symbols"][symbol]
+                self.assertEqual(row["signal_price"], current_price)
+                self.assertEqual(row["fill_price"], current_price)
+                self.assertEqual(row["source"], "yahoo_current_price")
+                self.assertEqual(
+                    row["price_fallback"],
+                    "current_price_without_alpaca_minutes",
+                )
 
     def test_close_does_not_substitute_last_minute_for_daily_close(self) -> None:
         hub = IEXMarketDataHub()
@@ -440,6 +626,7 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
                     "symbol": "GLD",
                     "target_weight_percent": 100,
                     "effective_leverage": 2,
+                    "holding_percent": 200,
                     "reason": "WTME 买入条件通过",
                 }],
             },
@@ -452,6 +639,7 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
                     "context": {
                         "score": 12.34567,
                         "rank": 1,
+                        "holding_percent": 200,
                         "score_formula": "100 × Rw ÷ Aw",
                     },
                 },
@@ -462,6 +650,7 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
                     "context": {
                         "score": 8.2,
                         "rank": 2,
+                        "holding_percent": 0,
                         "score_formula": "100 × Rw ÷ Aw",
                     },
                 },
@@ -470,12 +659,51 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
 
         _subject, selection_body = render_message(task, selection_result)
 
-        self.assertIn("| 标的 | WTME评分 | 急跌过滤后排名 |", selection_body)
-        self.assertIn("| GLD | 12.346 | 1 |", selection_body)
-        self.assertIn("| SPY | 8.2 | 2 |", selection_body)
+        self.assertIn("| 标的 | 持仓比例 | WTME评分 | 急跌过滤后排名 |", selection_body)
+        self.assertIn("| GLD | 200% | 12.346 | 1 |", selection_body)
+        self.assertIn("| SPY | 0% | 8.2 | 2 |", selection_body)
         self.assertNotIn("100 × Rw", selection_body)
         self.assertNotIn("轮动与调仓建议", selection_body)
         self.assertNotIn("BUY GLD", selection_body)
+
+        html = _plain_text_email_html(selection_body.replace("GLD", "BTC/USD"))
+        self.assertIn("<table", html)
+        self.assertIn("table-layout:fixed", html)
+        self.assertIn("overflow-wrap:anywhere", html)
+        self.assertIn("BTC/USD", html)
+
+    def test_smtp_sends_plain_text_and_html_alternatives(self) -> None:
+        smtp = Mock()
+        smtp_context = MagicMock()
+        smtp_context.__enter__.return_value = smtp
+        channel = {
+            "sender_email": "sender@example.com",
+            "security_mode": "ssl",
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 465,
+            "username": "sender@example.com",
+        }
+        with (
+            patch("services.realtime_mail._channel_secret", return_value=(channel, "secret")),
+            patch("services.realtime_mail.smtplib.SMTP_SSL", return_value=smtp_context),
+        ):
+            send_smtp(
+                1,
+                recipient="target@example.com",
+                subject="动态持仓",
+                body="| 标的 | 持仓比例 |\n| --- | ---: |\n| BTC/USD | 130% |",
+            )
+
+        message = smtp.send_message.call_args.args[0]
+        self.assertTrue(message.is_multipart())
+        self.assertEqual(
+            [part.get_content_type() for part in message.iter_parts()],
+            ["text/plain", "text/html"],
+        )
+        self.assertIn(
+            "table-layout:fixed",
+            message.get_body(preferencelist=("html",)).get_content(),
+        )
 
     def test_event_calculation_aliases_are_persisted_for_audit(self) -> None:
         strategy = create_default_strategy(name="事件审计策略", design_mode="visual", selection_mode="single")
@@ -663,6 +891,87 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
         finally:
             for task in tasks:
                 manager.stop(task["id"])
+            manager._executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_running_followed_task_rolls_to_new_strategy_and_rebases_defaults(self) -> None:
+        strategy = create_default_strategy(
+            name="运行中跟随更新策略", design_mode="visual", selection_mode="single"
+        )
+        task_settings = {
+            **strategy["default_settings"],
+            "leverage_multiplier": 2,
+        }
+        task = realtime_repository.create_task(
+            name="运行中跟随更新任务", strategy=strategy, follow_strategy=True,
+            settings=task_settings, notification_settings={}, portfolio_state={"cash": 100_000},
+        )
+        old_run = realtime_repository.create_run(task)
+        realtime_repository.update_run(
+            old_run["id"], status="running",
+            state={
+                "portfolio": {"cash": 99_000, "positions": {}},
+                "strategy_state": {"competition_eligible_by_date": {}},
+            },
+        )
+        new_defaults = deepcopy(strategy["default_settings"])
+        new_defaults["initial_capital"] = 200_000
+        updated_strategy = update_strategy(
+            strategy["id"],
+            {"revision": strategy["revision"], "default_settings": new_defaults},
+        )
+        manager = RealtimeTaskManager(max_workers=1)
+        state = {
+            "run_id": old_run["id"], "strategy": strategy,
+            "events": _events_for_strategy(strategy), "processed": set(),
+            "event_in_flight": False, "event_started": False,
+            "event_key": None, "future": None, "stop_requested": False,
+        }
+        try:
+            refreshed = manager._refresh_followed_run(task, state)
+            new_run = realtime_repository.get_run(state["run_id"])
+
+            self.assertNotEqual(new_run["id"], old_run["id"])
+            self.assertEqual(new_run["strategy_snapshot"]["revision"], updated_strategy["revision"])
+            self.assertEqual(new_run["settings"]["initial_capital"], 200_000)
+            self.assertEqual(new_run["settings"]["leverage_multiplier"], 2)
+            self.assertEqual(new_run["state"]["portfolio"]["cash"], 99_000)
+            self.assertEqual(realtime_repository.get_run(old_run["id"])["status"], "stopped")
+            self.assertEqual(refreshed["source_strategy_revision"], updated_strategy["revision"])
+        finally:
+            manager._executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_followed_code_strategy_uses_current_version_and_new_parameter_defaults(self) -> None:
+        strategy = create_default_strategy(
+            name="代码实现升级跟随",
+            design_mode="code",
+            selection_mode="competition",
+            code_key="rapid_drop_atr_rotation",
+        )
+        task = realtime_repository.create_task(
+            name="代码实现升级跟随任务", strategy=strategy, follow_strategy=True,
+            settings=strategy["default_settings"], notification_settings={},
+            portfolio_state={},
+        )
+        upgraded_schema = {
+            **RapidDropAtrRotationStrategy.parameter_schema,
+            "future_logic_enabled": {
+                "label": "未来逻辑开关", "type": "boolean", "default": True,
+            },
+        }
+        manager = RealtimeTaskManager(max_workers=1)
+        try:
+            with (
+                patch.object(RapidDropAtrRotationStrategy, "version", "99.0.0"),
+                patch.object(RapidDropAtrRotationStrategy, "parameter_schema", upgraded_schema),
+            ):
+                synced = manager._sync_followed_strategy(task)
+
+            self.assertEqual(synced["strategy_snapshot"]["code_version"], "99.0.0")
+            self.assertTrue(
+                synced["strategy_snapshot"]["definition"]["params"]["future_logic_enabled"]
+            )
+            self.assertEqual(synced["source_strategy_revision"], strategy["revision"])
+        finally:
             manager._executor.shutdown(wait=False, cancel_futures=True)
 
     def test_start_rejects_stale_code_version_before_history_or_run_creation(self) -> None:

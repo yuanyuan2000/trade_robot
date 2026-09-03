@@ -301,6 +301,34 @@ class BacktestRepositoryTests(unittest.TestCase):
         for retired in RapidDropWtmeRotationStrategy.retired_parameters:
             self.assertNotIn(retired, upgraded["definition"]["params"])
 
+    def test_seeded_wtme_upgrade_defaults_buy_operator_to_or(self) -> None:
+        _, shipped = next(
+            item
+            for item in shipped_strategy_presets()
+            if item[0] == "builtin-rapid-drop-wtme-rotation-v1"
+        )
+        legacy = deepcopy(shipped)
+        legacy["name"] = "WTME 条件关系迁移测试"
+        legacy["code_version"] = "1.9.0"
+        legacy["definition"]["params"].pop("buy_condition_operator")
+        seed_key = "test-wtme-buy-condition-operator"
+        backtest_repository.seed_strategy_once(seed_key, legacy)
+
+        upgraded = backtest_repository.upgrade_seeded_strategy_code_version_once(
+            seed_key,
+            "test-wtme-buy-condition-operator-v2.0.0",
+            code_key="rapid_drop_wtme_rotation",
+            from_versions=("1.9.0",),
+            to_version="2.0.0",
+            parameter_defaults={"buy_condition_operator": "or"},
+        )
+
+        self.assertEqual(upgraded["code_version"], "2.0.0")
+        self.assertEqual(
+            upgraded["definition"]["params"]["buy_condition_operator"],
+            "or",
+        )
+
     def test_seeded_wtme_upgrade_adds_disabled_upside_protection(self) -> None:
         _, shipped = next(
             item

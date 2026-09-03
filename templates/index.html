@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ app_name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260901-01') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260903-01') }}">
   </head>
   <body class="theme-dark">
     <aside class="sidebar">
@@ -246,6 +246,7 @@
                 <option value="MA">MA</option>
                 <option value="EMA">EMA</option>
                 <option value="ATR">绝对 ATR（Wilder）</option>
+                <option value="VOLAT">历史波动率 VOLAT</option>
                 <option value="RATR">相对 ATR 动量评分</option>
                 <option value="LINEAR_FIT">R²</option>
                 <option value="WTME">加权真实波幅动量效率（WTME）</option>
@@ -346,6 +347,10 @@
               <label class="backtest-field"><span>策略定义 JSON（取消跟随后可编辑）</span><textarea id="realtime-definition-json" rows="12"></textarea></label>
               <label class="backtest-field"><span>模拟初始资金</span><input id="realtime-capital" type="number" min="0.01" step="0.01"></label>
               <label class="backtest-field"><span>整体杠杆</span><input id="realtime-leverage" type="number" min="1" max="10" step="0.1"></label>
+              <label id="realtime-dynamic-rebalance-field" class="realtime-follow-field" title="仅控制动态杠杆变化额外触发的调仓，不会阻止策略自身的交易信号">
+                <input id="realtime-dynamic-rebalance-on-change" type="checkbox">
+                <span>动态杠杆变化时自动再平衡</span>
+              </label>
               <div id="realtime-panel-script-fields" hidden>
                 <label class="backtest-field"><span>实时面板列脚本（受限 JSON，仅影响展示）</span><textarea id="realtime-panel-script" rows="14" spellcheck="false"></textarea></label>
                 <div class="realtime-inline-actions"><button id="realtime-panel-validate" type="button">校验脚本</button><button id="realtime-panel-regenerate" type="button">恢复自动生成</button><button id="realtime-panel-save" class="primary-action" type="button">保存面板脚本</button><span id="realtime-panel-revision"></span></div>
@@ -490,12 +495,16 @@
                   <div class="backtest-section-title">
                     <h4>标的与仓位上限</h4>
                     <div class="backtest-section-actions">
+                      <label class="backtest-check-field backtest-dynamic-leverage-toggle" title="启用后，单标的杠杆由 VOLAT 动态计算">
+                        <input id="backtest-dynamic-leverage-enabled" type="checkbox">
+                        <span>动态杠杆率</span>
+                      </label>
                       <button id="backtest-reset-symbols" type="button">恢复当前预置池</button>
                       <button id="backtest-add-symbol" type="button">添加标的</button>
                     </div>
                   </div>
                   <p id="backtest-selection-help" class="backtest-help"></p>
-                  <p class="backtest-help">每行依次设置：标的代码、最大仓位%、单标的杠杆。最终有效杠杆 = 整体杠杆 × 单标的杠杆。</p>
+                  <p class="backtest-help">每行依次设置：标的代码、最大仓位%、单标的杠杆。开启动态杠杆率后，手工单标的杠杆暂时失效但会保留。</p>
                   <div id="backtest-symbols" class="backtest-stack"></div>
                 </section>
 
@@ -774,8 +783,28 @@
             <input id="backtest-initial-capital" type="number" min="0.01" step="0.01" required>
           </label>
           <label class="backtest-field">
-            <span>杠杆倍率</span>
+            <span>整体杠杆倍率</span>
             <input id="backtest-leverage" type="number" min="1" max="10" step="0.1" required>
+          </label>
+          <label class="backtest-field backtest-dynamic-leverage-setting">
+            <span>历史波动率观察期 T</span>
+            <input id="backtest-dynamic-volatility-period" type="number" min="2" max="500" step="1" required>
+          </label>
+          <label class="backtest-field backtest-dynamic-leverage-setting">
+            <span>3σ 压力持续交易日 n</span>
+            <input id="backtest-dynamic-stress-days" type="number" min="1" max="252" step="1" required>
+          </label>
+          <label class="backtest-field backtest-dynamic-leverage-setting">
+            <span>允许最大跌幅 x%</span>
+            <input id="backtest-dynamic-max-loss" type="number" min="0.1" max="100" step="0.1" required>
+          </label>
+          <label class="backtest-field backtest-dynamic-leverage-setting">
+            <span>动态单标的杠杆上限 max_l</span>
+            <input id="backtest-dynamic-max-leverage" type="number" min="1" max="10" step="0.1" required>
+          </label>
+          <label class="backtest-check-field backtest-dynamic-leverage-setting" title="仅控制因动态杠杆数值变化而额外产生的调仓，不会阻止策略自身的交易信号">
+            <input id="backtest-dynamic-rebalance-on-change" type="checkbox">
+            <span>动态杠杆变化时自动再平衡</span>
           </label>
           <label class="backtest-field">
             <span>每股手续费</span>
@@ -811,7 +840,8 @@
             <span>生成详细日志（关闭可进一步提升长回测速度）</span>
           </label>
         </div>
-        <p class="backtest-help">整体杠杆会与每个标的在策略中的单独杠杆相乘，并按策略目标仓位放大实际敞口；暂不计融资利息。账户权益不大于 0 时按分钟行情强制平仓并标记爆仓。手续费按每笔 max(股数×每股手续费, 最低手续费) 计算；买卖双边收取。关闭详细日志后不会生成、实时传输或持久化策略审计日志，但权益曲线、成交和指标不受影响。</p>
+        <p id="backtest-dynamic-leverage-help" class="backtest-help">VOLAT(T) × 3 × √(n/252) 估算无杠杆压力跌幅；动态单标的杠杆向下保留 1 位小数，并限制在 1.0 至 max_l。自动再平衡仅控制杠杆变化额外触发的调仓；关闭后新杠杆仍用于策略下一次主动下单。x 与 max_l 只是计算参数，不构成爆仓保证。</p>
+        <p class="backtest-help">实际敞口 = 策略目标仓位 × 整体杠杆 × 单标的杠杆 × 策略特殊杠杆；暂不计融资利息。账户权益不大于 0 时按分钟行情强制平仓并标记爆仓。手续费按每笔 max(股数×每股手续费, 最低手续费) 计算；买卖双边收取。关闭详细日志后不会生成、实时传输或持久化策略审计日志，但权益曲线、成交和指标不受影响。</p>
         <div class="backtest-dialog-actions">
           <button type="button" data-close-dialog="backtest-settings-dialog">取消</button>
           <button id="backtest-settings-submit" class="primary-action" type="submit">保存设置</button>
@@ -860,7 +890,7 @@
         <div class="backtest-syntax-help-content">
           <section><h4>变量与布尔值</h4><p><code>price</code> 是当前决策价；<code>position</code> 是当前仓位比例（0 到 1）；布尔值使用 <code>true</code>、<code>false</code>。</p></section>
           <section><h4>历史行情</h4><p><code>open(n)</code>、<code>high(n)</code>、<code>low(n)</code>、<code>close(n)</code>、<code>volume(n)</code>。参数 n 表示向前第 n 根已完成日线，例如 <code>close(1)</code>。</p></section>
-          <section><h4>单值指标</h4><p><code>ma(n)</code>、<code>ema(n)</code>、<code>atr(n)</code>、<code>ratr(n)</code>、<code>rsi(n)</code>。<code>r_square(n)</code> 返回前 n 根完整 K 线加当前价格（共 n+1 点）的加权对数价格趋势 R²，默认窗口为 25。</p></section>
+          <section><h4>单值指标</h4><p><code>ma(n)</code>、<code>ema(n)</code>、<code>atr(n)</code>、<code>volat(n)</code>、<code>ratr(n)</code>、<code>rsi(n)</code>。<code>volat(n)</code> 返回 n 期对数收益率按 252 个交易日年化的历史波动率（%）；<code>r_square(n)</code> 返回前 n 根完整 K 线加当前价格（共 n+1 点）的加权对数价格趋势 R²，默认窗口为 25。</p></section>
           <section><h4>WTME 与急跌过滤</h4><p><code>wtme(n, h)</code> 或 <code>wtme(n, h, epsilon)</code>；默认示例 <code>wtme(40, 15, 0.00000001)</code>。<code>rapid_drop(n, threshold_percent)</code> 命中急跌返回 1，否则返回 0。</p></section>
           <section><h4>MACD</h4><p><code>macd_line(fast, slow)</code> 返回 DIF；<code>macd_signal(fast, slow, signal)</code> 返回 DEA；<code>macd_hist(fast, slow, signal)</code> 返回未加倍柱状值 DIF − DEA。默认参数为 12、26、9。</p></section>
           <section><h4>运算与执行时间</h4><p>支持 <code>+ - * /</code>、<code>&gt; &gt;= &lt; &lt;= = !=</code>、<code>AND OR NOT</code> 和括号。执行时间可填 <code>OPEN</code>、<code>CLOSE</code> 或美东时间 <code>HH:MM</code>。</p></section>
@@ -875,7 +905,7 @@ price &lt; close(1) - 2 * atr(14)</pre></section>
 
     <script src="{{ url_for('static', filename='js/chart.js', v='20260829-02') }}"></script>
     <script src="{{ url_for('static', filename='js/database_browser.js', v='20260730-02') }}"></script>
-    <script src="{{ url_for('static', filename='js/backtest.js', v='20260901-02') }}"></script>
+    <script src="{{ url_for('static', filename='js/backtest.js', v='20260903-01') }}"></script>
     <script src="{{ url_for('static', filename='js/backtest_analysis.js', v='20260902-01') }}"></script>
     <script src="{{ url_for('static', filename='js/realtime.js', v='20260831-01') }}"></script>
     <script src="{{ url_for('static', filename='js/app.js', v='20260829-02') }}"></script>

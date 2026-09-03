@@ -96,6 +96,7 @@ class CodeStrategy:
             "description": cls.description,
             "selection_modes": list(cls.selection_modes),
             "parameter_schema": cls.parameter_schema,
+            "parameter_order": list(cls.parameter_schema),
             "default_symbols": cls.default_symbols,
             "required_events": list(cls.required_events({})),
             "minimum_lookback": cls.minimum_lookback({}),
@@ -147,6 +148,30 @@ class CodeStrategy:
 
     def observation_target_count(self) -> int:
         return 1
+
+    def observation_target_weight(
+        self,
+        *,
+        selected_count: int,
+        target_index: int = 0,
+    ) -> float:
+        """Return a hypothetical buy's normalized target weight in percent.
+
+        The realtime dashboard uses this observation-only contract for every
+        overview symbol.  Selected rows pass their actual index; other rows
+        pass the slot they would occupy if they entered the current basket.
+        """
+        del target_index
+        return 100.0 / max(1, int(selected_count))
+
+    def observation_strategy_leverage_multiplier(self, *, selected_count: int) -> float:
+        """Return strategy-owned leverage layered above account/symbol leverage."""
+        del selected_count
+        return 1.0
+
+    def observation_buy_event(self) -> str:
+        """Return the event whose current price should size a hypothetical buy."""
+        return "OPEN"
 
     @classmethod
     def overview_max_buy_count(cls, strategy_snapshot: dict) -> int | None:
@@ -424,6 +449,18 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
 
     def observation_target_count(self) -> int:
         return int(self.params["holdings_num"])
+
+    def observation_target_weight(
+        self,
+        *,
+        selected_count: int,
+        target_index: int = 0,
+    ) -> float:
+        del selected_count, target_index
+        return float(self.params["target_weight"]) / int(self.params["holdings_num"])
+
+    def observation_buy_event(self) -> str:
+        return str(self.params["selection_time"])
 
     @classmethod
     def overview_max_buy_count(cls, strategy_snapshot: dict) -> int | None:
@@ -719,11 +756,11 @@ class RapidDropAtrRotationStrategy(CodeStrategy):
 
 class RapidDropWtmeRotationStrategy(CodeStrategy):
     key = "rapid_drop_wtme_rotation"
-    version = "1.9.0"
+    version = "2.0.0"
     name = "急跌回避与 WTME 动量轮动"
     description = (
         "先按百分比单日急跌规则过滤标的，再以指定时点价格构造"
-        "不含未来数据的当前观测；评分排名前 n 或评分严格大于 x 即可入选，"
+        "不含未来数据的当前观测；评分排名前 n 与评分严格大于 x 可按且/或组合入选，"
         "并支持等权、线性排名及二者各自的动态杠杆配置。"
     )
     selection_modes = ("competition",)
@@ -743,59 +780,20 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
     linear_allocation_modes = {"linear_rank", "leveraged_linear_rank"}
     leveraged_allocation_modes = {"leveraged_equal", "leveraged_linear_rank"}
     parameter_schema = {
-        "allocation_mode": {
-            "label": "入选标的仓位分配",
-            "type": "choice",
-            "default": "equal",
-            "options": [
-                {"value": "equal", "label": "平均买入"},
-                {"value": "linear_rank", "label": "按线性排名权重买入"},
-                {"value": "leveraged_equal", "label": "平均仓位并动态加杠杆"},
-                {
-                    "value": "leveraged_linear_rank",
-                    "label": "按线性排名权重买入并动态加杠杆",
-                },
-            ],
-            "value_aliases": {"score_weighted": "linear_rank"},
-            "help": (
-                "平均买入按实际入选数等分 100% 组合仓位；线性排名模式按实际入选数 k，"
-                "从第一名到第 k 名使用 k:(k-1):…:1 分配；"
-                "两种动态杠杆模式都会在完成平均或线性仓位分配后额外乘以 k；"
-                "最终杠杆 = k × 整体杠杆 × 单标的设定杠杆。"
-            ),
-        },
-        "buy_top_n": {
-            "label": "买入条件 1：评分位于前 n 名",
-            "type": "integer",
-            "default": 1,
-            "minimum": 1,
-            "maximum": 100,
-            "step": 1,
-            "unit": "只",
-            "help": "急跌过滤后排名不超过 n 即通过条件 1；默认 1 表示评分第 1 名通过。",
-        },
-        "buy_score_threshold": {
-            "label": "买入条件 2：评分大于 x",
-            "type": "number",
-            "default": 9999.0,
-            "minimum": -100000.0,
-            "maximum": 100000.0,
-            "step": 0.1,
-            "help": "评分严格大于 x 即通过条件 2；默认 9999，使正常 WTME 评分无法仅靠条件 2 入选。",
-        },
-        "max_simultaneous_holdings": {
-            "label": "最多同时持仓个数",
-            "type": "integer",
-            "default": 1,
-            "minimum": 1,
-            "maximum": 100,
-            "step": 1,
-            "unit": "只",
-            "help": (
-                "在满足排名或评分买入条件的标的中按 WTME 排名取前若干只，"
-                "并将上涨保护保留的旧持仓计入上限。"
-            ),
-        },
+        # Keep this order aligned with the strategy's execution flow. The
+        # catalog preserves insertion order and the backtest editor renders it.
+        "enable_percent_drop_filter": RapidDropAtrRotationStrategy.parameter_schema[
+            "enable_percent_drop_filter"
+        ],
+        "drop_threshold_percent": RapidDropAtrRotationStrategy.parameter_schema[
+            "drop_threshold_percent"
+        ],
+        "drop_lookback_sessions": RapidDropAtrRotationStrategy.parameter_schema[
+            "drop_lookback_sessions"
+        ],
+        "risk_check_time": RapidDropAtrRotationStrategy.parameter_schema[
+            "risk_check_time"
+        ],
         "wtme_period": {
             "label": "WTME 窗口 N",
             "type": "integer",
@@ -825,6 +823,74 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             "step": 1e-12,
             "help": "加入加权标准化真实波幅分母，防止零波动时除零。",
         },
+        "selection_time": RapidDropAtrRotationStrategy.parameter_schema[
+            "selection_time"
+        ],
+        "buy_top_n": {
+            "label": "买入条件 1：评分位于前 n 名",
+            "type": "integer",
+            "default": 1,
+            "minimum": 1,
+            "maximum": 100,
+            "step": 1,
+            "unit": "只",
+            "help": "急跌过滤后排名不超过 n 即通过条件 1；默认 1 表示评分第 1 名通过。",
+        },
+        "buy_condition_operator": {
+            "label": "买入条件组合关系",
+            "type": "choice",
+            "default": "or",
+            "options": [
+                {"value": "and", "label": "且"},
+                {"value": "or", "label": "或"},
+            ],
+            "render": "inline_prefix",
+            "help": "决定买入条件 1 与买入条件 2 需同时满足，还是满足任意一项即可。",
+        },
+        "buy_score_threshold": {
+            "label": "买入条件 2：评分大于 x",
+            "type": "number",
+            "default": 9999.0,
+            "minimum": -100000.0,
+            "maximum": 100000.0,
+            "step": 0.1,
+            "inline_prefix_parameter": "buy_condition_operator",
+            "help": "评分严格大于 x 即通过条件 2；条件 1 与条件 2 按左侧选择的“且/或”关系组合。",
+        },
+        "max_simultaneous_holdings": {
+            "label": "最多同时持仓个数",
+            "type": "integer",
+            "default": 1,
+            "minimum": 1,
+            "maximum": 100,
+            "step": 1,
+            "unit": "只",
+            "help": (
+                "在满足所选买入条件组合的标的中按 WTME 排名取前若干只，"
+                "并将上涨保护保留的旧持仓计入上限。"
+            ),
+        },
+        "allocation_mode": {
+            "label": "入选标的仓位分配",
+            "type": "choice",
+            "default": "equal",
+            "options": [
+                {"value": "equal", "label": "平均买入"},
+                {"value": "linear_rank", "label": "按线性排名权重买入"},
+                {"value": "leveraged_equal", "label": "平均仓位并动态加杠杆"},
+                {
+                    "value": "leveraged_linear_rank",
+                    "label": "按线性排名权重买入并动态加杠杆",
+                },
+            ],
+            "value_aliases": {"score_weighted": "linear_rank"},
+            "help": (
+                "平均买入按实际入选数等分 100% 组合仓位；线性排名模式按实际入选数 k，"
+                "从第一名到第 k 名使用 k:(k-1):…:1 分配；"
+                "两种动态杠杆模式都会在完成平均或线性仓位分配后额外乘以 k；"
+                "最终杠杆 = k × 整体杠杆 × 单标的设定杠杆。"
+            ),
+        },
         "enable_upside_sell_protection": {
             "label": "启用上涨保护",
             "type": "boolean",
@@ -834,21 +900,6 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
                 "则保留该标的；不影响更早执行的急跌风控卖出。"
             ),
         },
-        "enable_percent_drop_filter": RapidDropAtrRotationStrategy.parameter_schema[
-            "enable_percent_drop_filter"
-        ],
-        "drop_threshold_percent": RapidDropAtrRotationStrategy.parameter_schema[
-            "drop_threshold_percent"
-        ],
-        "drop_lookback_sessions": RapidDropAtrRotationStrategy.parameter_schema[
-            "drop_lookback_sessions"
-        ],
-        "risk_check_time": RapidDropAtrRotationStrategy.parameter_schema[
-            "risk_check_time"
-        ],
-        "selection_time": RapidDropAtrRotationStrategy.parameter_schema[
-            "selection_time"
-        ],
     }
 
     @classmethod
@@ -917,11 +968,15 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             f"{self.params['selection_time']}按 WTME("
             f"N={self.params['wtme_period']}, h={self.params['wtme_half_life']:g}, "
             f"epsilon={self.params['wtme_epsilon']:g})；排名前"
-            f"{self.params['buy_top_n']}名或评分>{self.params['buy_score_threshold']:g}即入选，"
+            f"{self.params['buy_top_n']}名{self._buy_condition_operator_label()}"
+            f"评分>{self.params['buy_score_threshold']:g}即入选，"
             f"最多同时持有{self.params['max_simultaneous_holdings']}只，"
             f"{self._allocation_mode_label()}，组合总目标仓位固定为100%；"
             f"上涨保护{'开启' if self.params['enable_upside_sell_protection'] else '关闭'}"
         )
+
+    def _buy_condition_operator_label(self) -> str:
+        return "且" if self.params["buy_condition_operator"] == "and" else "或"
 
     def _allocation_mode_label(self) -> str:
         return {
@@ -1007,7 +1062,8 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
                 "key": "score", "label": "策略 WTME 评分", "format": "number",
                 "help": (
                     f"本策略 WTME = 100 × Rw ÷ (Aw + {epsilon:g})；{filter_text}，"
-                    f"急跌过滤后排名前 {int(self.params['buy_top_n'])} 名或评分严格大于 "
+                    f"急跌过滤后排名前 {int(self.params['buy_top_n'])} 名"
+                    f"{self._buy_condition_operator_label()}评分严格大于 "
                     f"{float(self.params['buy_score_threshold']):g} 即入选，"
                     f"采用{self._allocation_mode_label()}。策略对当前观测的构造可能与行情页标准指标不同。"
                 ),
@@ -1022,11 +1078,24 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
     ) -> tuple[list[str], list[str]]:
         passes_rank = rank <= int(self.params["buy_top_n"])
         passes_score = score > float(self.params["buy_score_threshold"])
-        if passes_rank or passes_score:
+        use_and = self.params["buy_condition_operator"] == "and"
+        condition_passed = (
+            (passes_rank and passes_score)
+            if use_and
+            else (passes_rank or passes_score)
+        )
+        if condition_passed:
             return [], []
+        failed_conditions = []
+        if not passes_rank:
+            failed_conditions.append(f"排名未进入前 {self.params['buy_top_n']} 名")
+        if not passes_score:
+            failed_conditions.append(
+                f"评分未严格大于 {self.params['buy_score_threshold']:g}"
+            )
+        operator = "且" if use_and else "或"
         return ["buy_conditions"], [
-            f"排名未进入前 {self.params['buy_top_n']} 名，且评分未严格大于 "
-            f"{self.params['buy_score_threshold']:g}"
+            f"买入条件采用“{operator}”：{'；'.join(failed_conditions)}"
         ]
 
     def _target_weights(
@@ -1045,6 +1114,27 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             }
         per_symbol = target_weight / len(selected)
         return {symbol: per_symbol for _score, symbol in selected}
+
+    def observation_target_weight(
+        self,
+        *,
+        selected_count: int,
+        target_index: int = 0,
+    ) -> float:
+        count = max(1, int(selected_count))
+        index = min(max(0, int(target_index)), count - 1)
+        if self.params["allocation_mode"] in self.linear_allocation_modes:
+            denominator = count * (count + 1) / 2
+            return 100.0 * (count - index) / denominator
+        return 100.0 / count
+
+    def observation_strategy_leverage_multiplier(self, *, selected_count: int) -> float:
+        if self.params["allocation_mode"] in self.leveraged_allocation_modes:
+            return float(max(1, int(selected_count)))
+        return 1.0
+
+    def observation_buy_event(self) -> str:
+        return str(self.params["selection_time"])
 
     def observe_latest(
         self,
@@ -1240,12 +1330,13 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             item["passes_score_condition"] = (
                 score > float(self.params["buy_score_threshold"])
             )
+            item["buy_condition_operator"] = self.params["buy_condition_operator"]
             item["buy_condition_passed"] = not condition_codes
             item["buy_condition_codes"] = condition_codes
             item["buy_condition_reasons"] = condition_reasons
             # Candidate eligibility and target selection are intentionally
-            # separate.  Failing both OR buy conditions does not filter a
-            # symbol out of the candidate list.
+            # separate. Failing the configured buy-condition combination does
+            # not filter a symbol out of the candidate list.
             item["eligible"] = not item["filter_codes"]
             if not condition_codes:
                 selected_scores.append((score, symbol))
@@ -1273,6 +1364,9 @@ class RapidDropWtmeRotationStrategy(CodeStrategy):
             item["held_at_selection"] = context.portfolio.quantity(item["symbol"]) > 0
             item.setdefault("passes_rank_condition", False)
             item.setdefault("passes_score_condition", False)
+            item.setdefault(
+                "buy_condition_operator", self.params["buy_condition_operator"]
+            )
             item.setdefault("buy_condition_passed", False)
             item.setdefault("buy_condition_codes", [])
             item.setdefault("buy_condition_reasons", [])
@@ -1780,6 +1874,9 @@ class SevenStarEtfRotationStrategy(CodeStrategy):
 
     def observation_target_count(self) -> int:
         return int(self.params["holdings_num"])
+
+    def observation_buy_event(self) -> str:
+        return str(self.params["buy_time"])
 
     @classmethod
     def overview_max_buy_count(cls, strategy_snapshot: dict) -> int | None:

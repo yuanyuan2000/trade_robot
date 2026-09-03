@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
+import statistics
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,6 +16,7 @@ from services.indicator_service import (
     attach_overview_indicator_values,
     build_indicator_series,
     calculate_indicator_values,
+    calculate_historical_volatility,
     calculate_r_square,
     calculate_macd_components,
     calculate_wilder_rsi,
@@ -92,6 +95,7 @@ class IndicatorCalculationTests(unittest.TestCase):
 
     def test_indicator_catalog_accepts_configurable_atr_periods(self) -> None:
         self.assertEqual(repository.validate_indicator("ATR", {"period": 14}), ("ATR", {"period": 14}))
+        self.assertEqual(repository.validate_indicator("volat", {"period": "30"}), ("VOLAT", {"period": 30}))
         self.assertEqual(repository.validate_indicator("ratr", {"period": "21"}), ("RATR", {"period": 21}))
         self.assertEqual(
             repository.validate_indicator("LINEAR_FIT", {"period": "25"}),
@@ -180,6 +184,34 @@ class IndicatorCalculationTests(unittest.TestCase):
         self.assertAlmostEqual(values[3], 2.0)
         self.assertAlmostEqual(values[4], 8 / 3)
 
+    def test_historical_volatility_uses_rolling_annualized_log_returns(self) -> None:
+        closes = [100, 102, 101, 105, 103]
+        rows = simple_rows(closes)
+        returns = [
+            math.log(current / previous)
+            for previous, current in zip(closes[1:], closes[2:])
+        ]
+
+        values = calculate_historical_volatility(rows, 3)
+
+        self.assertEqual(values[:3], [None, None, None])
+        self.assertAlmostEqual(
+            values[-1],
+            statistics.stdev(returns) * math.sqrt(252) * 100,
+            places=12,
+        )
+
+    def test_historical_volatility_is_scale_invariant_and_causal(self) -> None:
+        closes = [100, 102, 101, 105, 103, 104]
+        original = calculate_historical_volatility(simple_rows(closes), 3)
+        scaled = calculate_historical_volatility(simple_rows(closes, scale=37), 3)
+        extended = calculate_historical_volatility(simple_rows([*closes, 1_000_000]), 3)
+
+        for actual, expected in zip(scaled, original):
+            if expected is not None:
+                self.assertAlmostEqual(actual, expected, places=12)
+        self.assertEqual(extended[:len(original)], original)
+
     def test_relative_atr_uses_prior_completed_atr_without_lookahead(self) -> None:
         values = calculate_indicator_values(sample_rows(), "RATR", 3)
 
@@ -232,6 +264,7 @@ class IndicatorCalculationTests(unittest.TestCase):
             ("ma", (3,), "MA", {"period": 3}),
             ("ema", (3,), "EMA", {"period": 3}),
             ("atr", (3,), "ATR", {"period": 3}),
+            ("volat", (3,), "VOLAT", {"period": 3}),
             ("ratr", (3,), "RATR", {"period": 3}),
             ("r_square", (3,), "LINEAR_FIT", {"period": 3}),
             ("rsi", (3,), "RSI", {"period": 3}),
@@ -413,6 +446,16 @@ class IndicatorSeedTests(unittest.TestCase):
             {"period": 5, "threshold_percent": 5.0},
         )
 
+    def test_default_historical_volatility_is_30_periods(self) -> None:
+        indicator = next(
+            item for item in repository.list_indicators()
+            if item["code"] == "VOLAT30"
+        )
+
+        self.assertTrue(indicator["is_favorite"])
+        self.assertEqual(indicator["name"], "VOLAT(30)")
+        self.assertEqual(indicator["params"], {"period": 30})
+
     def test_default_r_square_indicator_uses_25_intervals(self) -> None:
         indicator = next(
             item for item in repository.list_indicators()
@@ -558,6 +601,7 @@ class MarketOverviewIndicatorRouteTests(unittest.TestCase):
 
         self.assertNotIn('id="overview-indicator-controls"', html)
         self.assertIn('<option value="ATR">', html)
+        self.assertIn('<option value="VOLAT">', html)
         self.assertIn('<option value="RATR">', html)
         self.assertIn('<option value="LINEAR_FIT">', html)
         self.assertIn('<option value="WTME">', html)

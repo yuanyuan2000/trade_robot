@@ -80,13 +80,22 @@ def _benchmark_leverage_assumptions(snapshot: dict) -> dict:
     strategy = run.get("strategy_snapshot", {})
     definition = strategy.get("definition", {})
     overall = _positive_leverage(run.get("settings", {}).get("leverage_multiplier"))
-    symbol_multipliers = {
+    dynamic_symbol = bool(definition.get("dynamic_leverage_enabled", False))
+    configured_symbol_multipliers = {
         str(item.get("symbol") or "").strip().upper(): _positive_leverage(
             item.get("leverage_multiplier")
         )
         for item in definition.get("symbols", [])
         if str(item.get("symbol") or "").strip()
     }
+    # The comparison curve is a hypothetical fixed-multiplier buy-and-hold
+    # series. A point-in-time dynamic multiplier is not fixed over the chosen
+    # interval, so never substitute the disabled manual input here.
+    symbol_multipliers = (
+        {symbol: 1.0 for symbol in configured_symbol_multipliers}
+        if dynamic_symbol
+        else configured_symbol_multipliers
+    )
     params = definition.get("params") or {}
     dynamic_special = (
         strategy.get("design_mode") == "code"
@@ -101,6 +110,7 @@ def _benchmark_leverage_assumptions(snapshot: dict) -> dict:
         "overall_multiplier": overall,
         "symbol_multipliers": symbol_multipliers,
         "special_multiplier": special,
+        "dynamic_symbol_assumed_one": dynamic_symbol,
         "dynamic_special_assumed_one": dynamic_special,
         "final_multipliers": {
             symbol: overall * multiplier * special
@@ -468,6 +478,7 @@ def build_decision(snapshot: dict, trading_date: str) -> dict:
                 "symbol": context.get("symbol") or context.get("etf") or log.get("symbol"),
                 "filtered": not bool(context.get("eligible", not reasons)),
                 "filter_reasons": reasons,
+                "holding_percent": context.get("holding_percent", 0.0),
                 "score": context.get("score"),
                 "formula": formula,
                 "rank": context.get("rank"),
@@ -485,11 +496,14 @@ def build_decision(snapshot: dict, trading_date: str) -> dict:
                 "symbol": symbol,
                 "filtered": False,
                 "filter_reasons": [],
+                "holding_percent": 0.0,
                 "score": None,
                 "formula": "—",
                 "rank": None,
             })
             context = log.get("context") or {}
+            if context.get("holding_percent") is not None:
+                row["holding_percent"] = context.get("holding_percent")
             if log.get("event_type") == "COMPETITION_ELIGIBILITY":
                 if not context.get("matched"):
                     row["filtered"] = True

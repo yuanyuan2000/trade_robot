@@ -15,6 +15,7 @@ from services.backtest.data import (
     load_historical_dataset,
 )
 from services.backtest.dsl import compile_expression
+from services.backtest.dynamic_leverage import calculate_dynamic_symbol_leverage
 from services.backtest.engine import BacktestEngine
 from services.backtest.errors import BacktestValidationError
 from services.backtest.metrics import calculate_metrics
@@ -126,13 +127,14 @@ class DslSafetyTests(unittest.TestCase):
 
     def test_expression_supports_all_shared_indicator_functions(self) -> None:
         expression = compile_expression(
-            "ratr(14) > 0 AND wtme(40, 15, 0.00000001) >= 0 "
+            "volat(30) > 0 AND ratr(14) > 0 AND wtme(40, 15, 0.00000001) >= 0 "
             "AND rapid_drop(5, 5) = 0 AND r_square(25) >= 0"
         )
         context = SimpleNamespace(
             price=100.0,
             position=0.0,
             resolve_function=lambda name, *arguments: {
+                ("volat", 30): 11.85,
                 ("ratr", 14): 1.25,
                 ("wtme", 40, 15, 1e-8): 22.5,
                 ("rapid_drop", 5, 5): 0.0,
@@ -145,6 +147,7 @@ class DslSafetyTests(unittest.TestCase):
         self.assertEqual(
             expression.resolve_inputs(context),
             {
+                "volat(30)": 11.85,
                 "ratr(14)": 1.25,
                 "wtme(40,15,1e-08)": 22.5,
                 "rapid_drop(5,5)": 0.0,
@@ -160,6 +163,7 @@ class DslSafetyTests(unittest.TestCase):
             "rapid_drop(5)",
             "rapid_drop(5, 0)",
             "r_square(1)",
+            "volat(1)",
             "linear_fit(25)",
         ):
             with self.subTest(expression=expression):
@@ -210,6 +214,57 @@ class DslSafetyTests(unittest.TestCase):
         with self.assertRaises(BacktestValidationError):
             validate_settings({"leverage_multiplier": 10.01})
 
+    def test_dynamic_leverage_settings_defaults_and_bounds(self) -> None:
+        self.assertEqual(
+            validate_settings({})["dynamic_leverage"],
+            {
+                "volatility_period": 30,
+                "stress_days": 13,
+                "max_loss_percent": 25.0,
+                "max_leverage": 3.0,
+                "rebalance_on_change": True,
+            },
+        )
+        configured = validate_settings({
+            "dynamic_leverage": {
+                "volatility_period": 20,
+                "stress_days": 10,
+                "max_loss_percent": 30,
+                "max_leverage": 4,
+                "rebalance_on_change": False,
+            }
+        })["dynamic_leverage"]
+        self.assertEqual(configured["volatility_period"], 20)
+        self.assertFalse(configured["rebalance_on_change"])
+        for payload in (
+            {"volatility_period": 1},
+            {"stress_days": 0},
+            {"max_loss_percent": 0},
+            {"max_leverage": 10.1},
+            {"rebalance_on_change": 1},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(BacktestValidationError):
+                    validate_settings({"dynamic_leverage": payload})
+
+    def test_dynamic_symbol_leverage_formula_floors_to_one_decimal(self) -> None:
+        spy = calculate_dynamic_symbol_leverage(
+            11.85, stress_days=13, max_loss_percent=25, max_leverage=10
+        )
+        gld = calculate_dynamic_symbol_leverage(
+            26.25, stress_days=13, max_loss_percent=25, max_leverage=10
+        )
+
+        self.assertAlmostEqual(spy["stress_factor"], 3 * math.sqrt(13 / 252))
+        self.assertEqual(spy["leverage"], 3.0)
+        self.assertEqual(gld["leverage"], 1.3)
+        self.assertEqual(
+            calculate_dynamic_symbol_leverage(
+                0, stress_days=13, max_loss_percent=25, max_leverage=2.5
+            )["leverage"],
+            2.5,
+        )
+
     def test_generate_logs_setting_defaults_and_requires_boolean(self) -> None:
         self.assertTrue(validate_settings({})["generate_logs"])
         self.assertFalse(validate_settings({"generate_logs": False})["generate_logs"])
@@ -218,6 +273,29 @@ class DslSafetyTests(unittest.TestCase):
 
 
 class BacktestValidationAndPerformanceTests(unittest.TestCase):
+    def test_point_in_time_volatility_uses_cached_prefix_statistics(self) -> None:
+        dates = business_dates("2024-01-02", 80)
+        closes = [100 + index * 0.1 + (index % 7) * 0.35 for index in range(80)]
+        rows = daily_rows(dates, closes)
+        dataset = HistoricalDataSet(daily={"SPY": rows}, sessions=dates[-10:])
+        expected_close = calculate_indicator_values(rows, "VOLAT", 30)[-1]
+        expected_open_rows = [
+            *rows[-31:-1],
+            {**rows[-1], "close": rows[-1]["open"]},
+        ]
+        expected_open = calculate_indicator_values(expected_open_rows, "VOLAT", 30)[-1]
+
+        close_value = dataset.historical_volatility_value(
+            "SPY", dates[-1], "CLOSE", rows[-1]["close"], 30
+        )
+        open_value = dataset.historical_volatility_value(
+            "SPY", dates[-1], "OPEN", rows[-1]["open"], 30
+        )
+        self.assertAlmostEqual(close_value, expected_close, places=10)
+        self.assertAlmostEqual(open_value, expected_open, places=10)
+        self.assertIn("SPY", dataset._volatility_prefix_cache)
+        self.assertEqual(dataset._volatility_date_index_cache["SPY"][dates[-1]], 79)
+
     def test_intraday_finite_indicators_only_read_the_required_tail(self) -> None:
         dates = business_dates("2015-01-02", 2100)
         rows = daily_rows(
@@ -296,6 +374,25 @@ class BacktestValidationAndPerformanceTests(unittest.TestCase):
         strategy["definition"]["symbols"][0]["leverage_multiplier"] = 10.01
         with self.assertRaisesRegex(BacktestValidationError, "单标的杠杆"):
             validate_strategy_payload(strategy)
+
+    def test_dynamic_leverage_switch_is_available_to_every_strategy_mode(self) -> None:
+        for design_mode, selection_mode in (
+            ("visual", "single"),
+            ("visual", "distribution"),
+            ("visual", "competition"),
+            ("code", "competition"),
+        ):
+            with self.subTest(design_mode=design_mode, selection_mode=selection_mode):
+                strategy = default_strategy_payload(
+                    name="动态杠杆测试",
+                    design_mode=design_mode,
+                    selection_mode=selection_mode,
+                    code_key=("sevenstar_etf_rotation" if design_mode == "code" else None),
+                )
+                strategy["definition"]["dynamic_leverage_enabled"] = True
+                self.assertTrue(
+                    validate_strategy_payload(strategy)["definition"]["dynamic_leverage_enabled"]
+                )
 
     def test_code_strategy_times_must_be_valid_and_ordered(self) -> None:
         with self.assertRaises(BacktestValidationError):
@@ -732,6 +829,188 @@ class EngineTimingTests(unittest.TestCase):
         self.assertAlmostEqual(
             result.equity_points[0]["positions"]["SPY"]["strategy_weight"],
             1,
+        )
+
+    def test_dynamic_leverage_replaces_manual_symbol_layer_and_keeps_overall(self) -> None:
+        dates = business_dates("2023-09-01", 40)
+        trading_date = dates[-1]
+        dataset = HistoricalDataSet(
+            daily={"SPY": daily_rows(dates, [100.0] * len(dates))},
+            sessions=[trading_date],
+        )
+        strategy = visual_strategy(
+            rule={"condition": "true", "when": "OPEN"},
+            symbols=[{
+                "symbol": "SPY",
+                "max_weight": 100,
+                "leverage_multiplier": 1.5,
+            }],
+        )
+        strategy["definition"]["dynamic_leverage_enabled"] = True
+
+        result = BacktestEngine(
+            strategy,
+            settings(
+                trading_date,
+                trading_date,
+                leverage_multiplier=2,
+                dynamic_leverage={
+                    "volatility_period": 30,
+                    "stress_days": 13,
+                    "max_loss_percent": 25,
+                    "max_leverage": 3,
+                },
+            ),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual(result.trades[0]["position_weight_after"], 6.0)
+        dynamic_log = next(log for log in result.logs if log["event_type"] == "DYNAMIC_LEVERAGE")
+        self.assertEqual(dynamic_log["message"], "SPY VOLAT(30)=0.00，最终动态杠杆=3.0x")
+
+    def test_dynamic_leverage_drop_rebalances_an_existing_target_position(self) -> None:
+        dates = business_dates("2024-01-02", 8)
+        first, second = dates[-2:]
+        closes = [100.0] * len(dates)
+        closes[-1] = 200.0
+        minute: dict[str, dict[int, dict]] = {"SPY": {}}
+        for trading_date, price in ((first, 100.0), (second, 200.0)):
+            current = _epoch_minute(trading_date, "10:00")
+            for minute_key in (current - 1, current):
+                minute["SPY"][minute_key] = {
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                }
+        dataset = HistoricalDataSet(
+            daily={"SPY": daily_rows(dates, closes)},
+            sessions=[first, second],
+            minute=minute,
+            required_intraday_events=["10:00"],
+        )
+        strategy = visual_strategy(rule={"condition": "true", "when": "10:00"})
+        strategy["definition"]["dynamic_leverage_enabled"] = True
+
+        result = BacktestEngine(
+            strategy,
+            settings(
+                first,
+                second,
+                allow_fractional_shares=True,
+                dynamic_leverage={
+                    "volatility_period": 2,
+                    "stress_days": 13,
+                    "max_loss_percent": 25,
+                    "max_leverage": 3,
+                },
+            ),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual([trade["side"] for trade in result.trades], ["BUY", "SELL"])
+        self.assertAlmostEqual(result.trades[-1]["position_weight_after"], 1.0)
+        self.assertIn("动态单标的杠杆率下降", result.trades[-1]["reason"])
+
+    def test_dynamic_rebalance_uses_saved_target_not_drifted_weight_above_one(self) -> None:
+        dates = business_dates("2024-01-02", 8)
+        first, second = dates[-2:]
+        closes = [100.0] * len(dates)
+        closes[-1] = 90.0
+        minute: dict[str, dict[int, dict]] = {"SPY": {}}
+        for trading_date, price in ((first, 100.0), (second, 90.0)):
+            current = _epoch_minute(trading_date, "10:00")
+            for minute_key in (current - 1, current):
+                minute["SPY"][minute_key] = {
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                }
+        dataset = HistoricalDataSet(
+            daily={"SPY": daily_rows(dates, closes)},
+            sessions=[first, second],
+            minute=minute,
+            required_intraday_events=["10:00"],
+        )
+        strategy = visual_strategy(
+            rule={"condition": "price >= 100", "when": "10:00"}
+        )
+        strategy["definition"]["dynamic_leverage_enabled"] = True
+
+        result = BacktestEngine(
+            strategy,
+            settings(
+                first,
+                second,
+                allow_fractional_shares=True,
+                dynamic_leverage={
+                    "volatility_period": 2,
+                    "stress_days": 10,
+                    "max_loss_percent": 25,
+                    "max_leverage": 5,
+                },
+            ),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual([trade["side"] for trade in result.trades], ["BUY", "SELL"])
+        self.assertAlmostEqual(result.trades[-1]["position_weight_after"], 1.0)
+        rejected = [log for log in result.logs if log["event_type"] == "ORDER_REJECTED"]
+        self.assertEqual(rejected, [])
+
+    def test_dynamic_leverage_change_does_not_rebalance_when_disabled(self) -> None:
+        dates = business_dates("2024-01-02", 8)
+        first, second = dates[-2:]
+        closes = [100.0] * len(dates)
+        closes[-1] = 90.0
+        minute: dict[str, dict[int, dict]] = {"SPY": {}}
+        for trading_date, price in ((first, 100.0), (second, 90.0)):
+            current = _epoch_minute(trading_date, "10:00")
+            for minute_key in (current - 1, current):
+                minute["SPY"][minute_key] = {
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                }
+        dataset = HistoricalDataSet(
+            daily={"SPY": daily_rows(dates, closes)},
+            sessions=[first, second],
+            minute=minute,
+            required_intraday_events=["10:00"],
+        )
+        strategy = visual_strategy(
+            rule={"condition": "price >= 100", "when": "10:00"}
+        )
+        strategy["definition"]["dynamic_leverage_enabled"] = True
+
+        result = BacktestEngine(
+            strategy,
+            settings(
+                first,
+                second,
+                allow_fractional_shares=True,
+                dynamic_leverage={
+                    "volatility_period": 2,
+                    "stress_days": 10,
+                    "max_loss_percent": 25,
+                    "max_leverage": 5,
+                    "rebalance_on_change": False,
+                },
+            ),
+            dataset=dataset,
+        ).run()
+
+        self.assertEqual([trade["side"] for trade in result.trades], ["BUY"])
+        dynamic_logs = [
+            log for log in result.logs if log["event_type"] == "DYNAMIC_LEVERAGE"
+        ]
+        self.assertGreaterEqual(len(dynamic_logs), 2)
+        self.assertFalse(dynamic_logs[-1]["context"]["rebalance_on_change"])
+        self.assertNotEqual(
+            dynamic_logs[0]["context"]["leverage"],
+            dynamic_logs[-1]["context"]["leverage"],
         )
 
     def test_close_signal_never_fills_same_close(self) -> None:

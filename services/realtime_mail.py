@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from email.message import EmailMessage
 from email.utils import format_datetime
+from html import escape
 from datetime import datetime, timedelta, timezone
 import hashlib
 import os
@@ -165,6 +166,7 @@ def send_smtp(channel_id: int, *, recipient: str, subject: str, body: str, timeo
     message["X-Mailer"] = "Trade Robot realtime decision"
     message["Message-ID"] = f"<{hashlib.sha256((str(channel_id) + recipient + subject + body).encode()).hexdigest()}@trade-robot.local>"
     message.set_content(body)
+    message.add_alternative(_plain_text_email_html(body), subtype="html")
     try:
         if channel["security_mode"] == "ssl":
             with smtplib.SMTP_SSL(channel["smtp_host"], int(channel["smtp_port"]), timeout=timeout) as smtp:
@@ -195,6 +197,59 @@ def _format_number(value) -> str:
     return f"{number:.3f}".rstrip("0").rstrip(".")
 
 
+def _plain_text_email_html(body: str) -> str:
+    """Render plain decision mail as responsive HTML with real tables."""
+    lines = str(body).splitlines()
+    output = [
+        '<div style="font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;color:#172033;max-width:760px">'
+    ]
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        is_table = (
+            line.strip().startswith("|")
+            and index + 1 < len(lines)
+            and lines[index + 1].strip().startswith("| ---")
+        )
+        if not is_table:
+            output.append(f'<div style="min-height:1.6em;white-space:pre-wrap">{escape(line)}</div>')
+            index += 1
+            continue
+        headers = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        index += 2
+        rows = []
+        while index < len(lines) and lines[index].strip().startswith("|"):
+            rows.append([
+                cell.strip()
+                for cell in lines[index].strip().strip("|").split("|")
+            ])
+            index += 1
+        output.append(
+            '<div style="max-width:100%;overflow-x:auto;margin:6px 0 12px">'
+            '<table style="width:100%;table-layout:fixed;border-collapse:collapse">'
+        )
+        output.append("<thead><tr>")
+        for cell_index, cell in enumerate(headers):
+            width = "28%" if cell_index == 0 else f"{72 / max(1, len(headers) - 1):g}%"
+            output.append(
+                f'<th style="width:{width};padding:6px 8px;border:1px solid #d7dce5;'
+                f'text-align:{"left" if cell_index == 0 else "right"};overflow-wrap:anywhere">{escape(cell)}</th>'
+            )
+        output.append("</tr></thead><tbody>")
+        for row in rows:
+            output.append("<tr>")
+            for cell_index in range(len(headers)):
+                cell = row[cell_index] if cell_index < len(row) else ""
+                output.append(
+                    f'<td style="padding:6px 8px;border:1px solid #d7dce5;'
+                    f'text-align:{"left" if cell_index == 0 else "right"};overflow-wrap:anywhere">{escape(cell)}</td>'
+                )
+            output.append("</tr>")
+        output.append("</tbody></table></div>")
+    output.append("</div>")
+    return "".join(output)
+
+
 def _limit_decimal_places(value: str) -> str:
     """Limit standalone decimal numbers in rendered mail to three places."""
     return _LONG_DECIMAL_PATTERN.sub(
@@ -205,8 +260,8 @@ def _limit_decimal_places(value: str) -> str:
 
 def _wtme_score_table(score_logs: list[dict]) -> list[str]:
     lines = [
-        "| 标的 | WTME评分 | 急跌过滤后排名 |",
-        "| --- | ---: | ---: |",
+        "| 标的 | 持仓比例 | WTME评分 | 急跌过滤后排名 |",
+        "| --- | ---: | ---: | ---: |",
     ]
     for log in score_logs[:12]:
         context = log.get("context") or {}
@@ -214,6 +269,7 @@ def _wtme_score_table(score_logs: list[dict]) -> list[str]:
         rank = context.get("rank")
         lines.append(
             f"| {log.get('symbol') or context.get('symbol') or '—'} "
+            f"| {_format_number(context.get('holding_percent', 0))}% "
             f"| {_format_number(score) if score is not None else '—'} "
             f"| {int(rank) if rank is not None else '—'} |"
         )
@@ -246,7 +302,8 @@ def _decision_template_text(recommendations: list[dict]) -> str:
         return "无新调仓决策"
     return "\n".join(
         f"{item['action']} {item['symbol']} "
-        f"{_format_number(item.get('target_weight_percent', 0))}%"
+        f"{_format_number(item.get('target_weight_percent', 0))}%，"
+        f"持仓比例 {_format_number(item.get('holding_percent', 0))}%"
         for item in recommendations
     )
 
@@ -345,7 +402,8 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
         if recommendations:
             for item in recommendations[:12]:
                 lines.append(
-                    f"- {item['action']} {item['symbol']}，目标仓位 {item['target_weight_percent']:.2f}%；{item['reason']}"
+                    f"- {item['action']} {item['symbol']}，目标仓位 {item['target_weight_percent']:.2f}%，"
+                    f"持仓比例 {item.get('holding_percent', 0):.2f}%；{item['reason']}"
                 )
         else:
             lines.append("- 没有已持仓标的触发风险卖出。")
@@ -375,6 +433,7 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
             for item in recommendations[:12]:
                 lines.append(
                     f"- {item['action']} {item['symbol']}，目标仓位 {item['target_weight_percent']:.2f}%，"
+                    f"持仓比例 {item.get('holding_percent', 0):.2f}%，"
                     f"有效杠杆 {item['effective_leverage']:.2f}×；{item['reason']}"
                 )
         else:
@@ -385,6 +444,7 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
             for item in recommendations[:12]:
                 lines.append(
                     f"- {item['action']} {item['symbol']}，目标仓位 {item['target_weight_percent']:.2f}%，"
+                    f"持仓比例 {item.get('holding_percent', 0):.2f}%，"
                     f"有效杠杆 {item['effective_leverage']:.2f}×；{item['reason']}"
                 )
         else:

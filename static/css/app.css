@@ -2341,6 +2341,24 @@ td {
   gap: 5px;
 }
 
+.backtest-dynamic-leverage-toggle {
+  min-height: 32px;
+  margin-right: 5px;
+  border-right: 1px solid var(--border);
+  padding-right: 10px;
+  color: var(--text);
+}
+
+.backtest-symbol-row .bt-symbol-leverage:disabled {
+  border-style: dashed;
+  color: var(--muted);
+}
+
+.backtest-dynamic-leverage-setting.is-disabled,
+#backtest-dynamic-leverage-help.is-disabled {
+  opacity: 0.55;
+}
+
 .backtest-symbol-order button {
   width: 26px;
   border: 1px solid var(--border);
@@ -2477,6 +2495,17 @@ td {
 
 .backtest-code-param-boolean input {
   width: auto;
+}
+
+.backtest-code-param-inline-value {
+  display: grid;
+  grid-template-columns: minmax(52px, 0.32fr) minmax(100px, 1fr);
+  gap: 8px;
+  min-width: 0;
+}
+
+.backtest-code-param-inline-value .bt-code-param-inline-prefix {
+  width: 100%;
 }
 
 .backtest-run-history {
@@ -3124,7 +3153,7 @@ td {
 
 .backtest-analysis-table-row {
   display: grid;
-  grid-template-columns: minmax(65px, .8fr) minmax(100px, 1.2fr) minmax(54px, .6fr) minmax(150px, 1.8fr);
+  grid-template-columns: minmax(65px, .8fr) minmax(100px, 1.2fr) minmax(58px, .65fr) minmax(54px, .6fr) minmax(150px, 1.8fr);
   align-items: center;
   min-height: 30px;
   gap: 8px;

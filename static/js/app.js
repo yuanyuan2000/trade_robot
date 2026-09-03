@@ -804,6 +804,8 @@ function renderMarketOverviewTable(items) {
       const provisional = Boolean(reading.is_provisional);
       const formula = indicator.indicator_type === "RATR"
         ? `（收盘价 - ${indicator.params.period} 个交易日前收盘价）/ 前一日 Wilder ATR(${indicator.params.period})`
+        : indicator.indicator_type === "VOLAT"
+          ? `最近 ${indicator.params.period} 个对数收益率的样本标准差 × √252 × 100%`
         : indicator.indicator_type === "LINEAR_FIT"
           ? `前 ${indicator.params.period} 根完整 K 线加当前价格，共 ${indicator.params.period + 1} 点的加权对数价格趋势 R²（包含最新未结束 K 线）`
         : indicator.indicator_type === "WTME"
@@ -1340,6 +1342,9 @@ function formatOverviewIndicator(value, indicator) {
   }
   if (indicator.indicator_type === "LINEAR_FIT") {
     return number.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+  }
+  if (indicator.indicator_type === "VOLAT") {
+    return `${number.toFixed(2)}%`;
   }
   if (["RATR", "WTME", "MACD"].includes(indicator.indicator_type)) {
     return `${number >= 0 ? "+" : ""}${number.toFixed(2)}`;
@@ -2185,6 +2190,8 @@ async function createAndAddIndicator(event) {
   }
   const displayName = indicatorType === "RATR"
     ? `相对ATR${period}`
+    : indicatorType === "VOLAT"
+      ? `VOLAT(${period})`
     : indicatorType === "LINEAR_FIT"
       ? (period === 25 ? "R²" : `R²${period}`)
     : indicatorType === "WTME"
@@ -2233,7 +2240,7 @@ function updateCustomIndicatorFields() {
     "aria-label",
     isRapidDrop ? "急跌观察变化段数" : "指标周期",
   );
-  const defaults = { ATR: 14, RATR: 14, LINEAR_FIT: 25, RSI: 14, WTME: 40, RAPID_DROP: 5 };
+  const defaults = { ATR: 14, VOLAT: 30, RATR: 14, LINEAR_FIT: 25, RSI: 14, WTME: 40, RAPID_DROP: 5 };
   if (defaults[customIndicatorType.value] != null) {
     customIndicatorPeriod.value = String(defaults[customIndicatorType.value]);
   }

@@ -12,9 +12,10 @@ from database import backtest_repository, realtime_repository, repository
 from services.backtest.code_strategies import get_code_strategy
 from services.backtest.data import EventPrice, HistoricalDataSet
 from services.backtest.dsl import compile_expression
+from services.backtest.dynamic_leverage import calculate_dynamic_symbol_leverage
 from services.backtest.engine import CodeEventContext
 from services.backtest.portfolio import Portfolio
-from services.backtest.validation import validate_strategy_payload
+from services.backtest.validation import validate_settings, validate_strategy_payload
 from services.realtime_panel_script import validate_panel_script
 from services.market_context import (
     filter_rows_for_market,
@@ -39,12 +40,20 @@ def _finite(value: Any) -> float | bool | str | None:
     return number if math.isfinite(number) else None
 
 
-def _effective_strategy(task: dict) -> tuple[dict, str]:
+def _effective_strategy(task: dict) -> tuple[dict, dict, str]:
     if task.get("runtime_state") in {"starting", "running", "degraded", "stopping"}:
         runs = realtime_repository.list_runs(task["id"], limit=1)
         if runs:
-            return deepcopy(runs[0]["strategy_snapshot"]), "run_snapshot"
-    return deepcopy(task["strategy_snapshot"]), "task_snapshot"
+            return (
+                deepcopy(runs[0]["strategy_snapshot"]),
+                deepcopy(runs[0].get("settings") or {}),
+                "run_snapshot",
+            )
+    return (
+        deepcopy(task["strategy_snapshot"]),
+        deepcopy(task.get("settings") or {}),
+        "task_snapshot",
+    )
 
 
 def _cache_signature(
@@ -226,6 +235,137 @@ def _visual_columns(task: dict) -> tuple[list[dict], dict]:
     return parsed["columns"], parsed["default_sort"]
 
 
+def _compact_dashboard_columns(columns: list[dict]) -> list[dict]:
+    """Remove the redundant leading “策略” from dashboard-only labels."""
+    compacted = []
+    for column in columns:
+        item = dict(column)
+        label = str(item.get("label") or item.get("key") or "")
+        if label.startswith("策略"):
+            label = label[2:].lstrip()
+        item["label"] = label
+        compacted.append(item)
+    return compacted
+
+
+def _visual_buy_profile(strategy: dict, row: dict) -> tuple[float, str]:
+    rules = sorted(
+        (
+            rule for rule in strategy["definition"].get("rules", [])
+            if rule.get("enabled", True) and rule.get("action") == "BUY"
+        ),
+        key=lambda rule: (int(rule.get("priority", 0)), str(rule.get("id") or "")),
+    )
+    detail_rules = list((row.get("details") or {}).get("rules") or [])
+    matched_ids = {
+        str(item.get("id")) for item in detail_rules
+        if item.get("matched") and item.get("action") == "BUY"
+    }
+    rule = next(
+        (item for item in rules if str(item.get("id")) in matched_ids),
+        rules[0] if rules else None,
+    )
+    if rule is None:
+        return 0.0, "OPEN"
+    return float(rule.get("value", 0)), str(rule.get("when") or "OPEN")
+
+
+def _attach_hypothetical_holdings(
+    *,
+    rows: list[dict],
+    target_rows: list[dict],
+    strategy: dict,
+    settings: dict,
+    code_observer: Any,
+    dataset: HistoricalDataSet,
+    event_prices: dict[str, EventPrice],
+    trading_date: str,
+) -> None:
+    """Attach the exposure each row would have if bought right now."""
+    definition = strategy["definition"]
+    dynamic_enabled = bool(definition.get("dynamic_leverage_enabled"))
+    dynamic = settings["dynamic_leverage"]
+    overall_leverage = float(settings["leverage_multiplier"])
+    configured_leverages = {
+        str(item["symbol"]).upper(): float(item.get("leverage_multiplier", 1))
+        for item in definition.get("symbols", [])
+    }
+    selected_count = max(1, len(target_rows))
+    selected_indexes = {
+        row["symbol"]: index for index, row in enumerate(target_rows)
+    }
+    for row in rows:
+        symbol = row["symbol"]
+        if code_observer is not None:
+            event = code_observer.observation_buy_event()
+            rank_index = max(0, int(row.get("rank") or selected_count) - 1)
+            target_index = selected_indexes.get(
+                symbol,
+                min(rank_index, selected_count - 1),
+            )
+            target_weight = code_observer.observation_target_weight(
+                selected_count=selected_count,
+                target_index=target_index,
+            )
+            strategy_leverage = code_observer.observation_strategy_leverage_multiplier(
+                selected_count=selected_count,
+            )
+        elif strategy["selection_mode"] == "competition":
+            competition = definition["competition"]
+            event = str(competition.get("when") or "OPEN")
+            target_weight = float(competition.get("target_weight", 0))
+            strategy_leverage = 1.0
+        else:
+            target_weight, event = _visual_buy_profile(strategy, row)
+            strategy_leverage = 1.0
+
+        volatility = None
+        dynamic_calculation = None
+        symbol_leverage = configured_leverages.get(symbol, 1.0)
+        if dynamic_enabled:
+            price = event_prices.get(symbol)
+            volatility = (
+                dataset.historical_volatility_value(
+                    symbol,
+                    trading_date,
+                    event,
+                    float(price.signal_price),
+                    int(dynamic["volatility_period"]),
+                )
+                if price is not None else None
+            )
+            if volatility is None:
+                row["holding_percent"] = None
+                row["details"].setdefault("holding", {
+                    "available": False,
+                    "reason": f"数据不足，无法计算 VOLAT({int(dynamic['volatility_period'])})",
+                })
+                continue
+            dynamic_calculation = calculate_dynamic_symbol_leverage(
+                volatility,
+                stress_days=int(dynamic["stress_days"]),
+                max_loss_percent=float(dynamic["max_loss_percent"]),
+                max_leverage=float(dynamic["max_leverage"]),
+            )
+            symbol_leverage = float(dynamic_calculation["leverage"])
+
+        effective_leverage = overall_leverage * symbol_leverage * strategy_leverage
+        row["holding_percent"] = target_weight * effective_leverage
+        row["details"]["holding"] = {
+            "available": True,
+            "target_weight_percent": target_weight,
+            "overall_leverage": overall_leverage,
+            "symbol_leverage": symbol_leverage,
+            "strategy_leverage_multiplier": strategy_leverage,
+            "effective_leverage": effective_leverage,
+            "holding_percent": row["holding_percent"],
+            "dynamic_leverage_enabled": dynamic_enabled,
+            "volatility": volatility,
+            "dynamic_calculation": dynamic_calculation,
+            "event": event,
+        }
+
+
 def _visual_row(
     strategy: dict,
     columns: list[dict],
@@ -271,9 +411,10 @@ def _visual_row(
         )
         matched = bool(expression.evaluate(context))
         detail = {
-            "name": rule.get("name"), "action": rule.get("action"),
+            "id": rule.get("id"), "name": rule.get("name"), "action": rule.get("action"),
             "event": rule.get("when"), "matched": matched,
-            "condition": rule.get("condition"),
+            "condition": rule.get("condition"), "sizing_mode": rule.get("sizing_mode"),
+            "value": rule.get("value"),
         }
         details["rules"].append(detail)
         if matched:
@@ -345,8 +486,12 @@ def _visual_row(
 def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
     """Read internal market-overview data and calculate one strategy panel."""
     task = realtime_repository.get_task(task_id)
-    strategy_raw, candidate_snapshot_source = _effective_strategy(task)
+    strategy_raw, settings_raw, candidate_snapshot_source = _effective_strategy(task)
     strategy = validate_strategy_payload(strategy_raw)
+    settings = validate_settings({
+        **strategy.get("default_settings", {}),
+        **settings_raw,
+    })
     overview = repository.list_market_overview()
     signature = _cache_signature(
         task, overview, strategy_raw, candidate_snapshot_source
@@ -365,10 +510,11 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
     if strategy["design_mode"] == "code":
         params = strategy["definition"].get("params", {})
         code_observer = get_code_strategy(strategy["code_key"])(params)
-        columns = [dict(column) for column in code_observer.observation_columns()]
+        columns = _compact_dashboard_columns(code_observer.observation_columns())
         default_sort = {"key": "score", "direction": "desc"}
     else:
         columns, default_sort = _visual_columns(task)
+        columns = _compact_dashboard_columns(columns)
 
     overview_by_symbol = {
         str(item["symbol"]).upper(): item for item in overview.get("items", [])
@@ -394,6 +540,7 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
             "details": {},
             "rank": None,
             "selected_for_target": False,
+            "holding_percent": None,
         }
         if symbol not in event_prices:
             rows.append(row)
@@ -470,7 +617,8 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
                 row["reason"] = "、".join(hard_reasons)
                 continue
             # A hard-filter pass is a candidate pass even when this overview
-            # row is outside the task pool or fails both OR buy conditions.
+            # row is outside the task pool or fails the configured buy-condition
+            # combination.
             row["eligible"] = True
             row["status"] = "通过"
             if row.get("rank") is None:
@@ -486,6 +634,9 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
             )
             details["passes_rank_condition"] = passes_rank
             details["passes_score_condition"] = passes_score
+            details["buy_condition_operator"] = code_observer.params[
+                "buy_condition_operator"
+            ]
             details["buy_condition_passed"] = not condition_codes
             details["buy_condition_codes"] = condition_codes
             details["buy_condition_reasons"] = condition_reasons
@@ -518,6 +669,16 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
         ]
     for row in target_rows:
         row["selected_for_target"] = True
+    _attach_hypothetical_holdings(
+        rows=rows,
+        target_rows=target_rows,
+        strategy=strategy,
+        settings=settings,
+        code_observer=code_observer,
+        dataset=dataset,
+        event_prices=event_prices,
+        trading_date=trading_date,
+    )
 
     payload = {
         "task_id": int(task_id),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Callable
 
 from database import intraday_repository
@@ -9,6 +10,7 @@ from database import intraday_repository
 from services.backtest.code_strategies import get_code_strategy
 from services.backtest.data import HistoricalDataSet, load_historical_dataset
 from services.backtest.dsl import CompiledExpression, compile_expression
+from services.backtest.dynamic_leverage import calculate_dynamic_symbol_leverage
 from services.backtest.errors import (
     BacktestCancelled,
     BacktestDataError,
@@ -167,6 +169,15 @@ class BacktestEngine:
             item["symbol"]: float(item.get("leverage_multiplier", 1))
             for item in self.definition["symbols"]
         }
+        self.dynamic_leverage_enabled = bool(
+            self.definition.get("dynamic_leverage_enabled", False)
+        )
+        self.dynamic_leverage_settings = dict(self.settings["dynamic_leverage"])
+        self.dynamic_leverage_rebalance_on_change = bool(
+            self.dynamic_leverage_settings["rebalance_on_change"]
+        )
+        self._last_dynamic_leverages: dict[str, float] = {}
+        self.last_decision_holdings: dict[str, float] = {}
         self.progress_callback = progress_callback
         self.cancellation_check = cancellation_check or (lambda: False)
         self.logging_enabled = bool(self.settings["generate_logs"])
@@ -187,10 +198,15 @@ class BacktestEngine:
         if self.code_strategy is not None:
             minimum_trade = float(self.code_strategy.params.get("minimum_trade_value_usd", 0))
             holdings = int(self.code_strategy.params.get("holdings_num", 1))
+            minimum_symbol_leverage = (
+                1.0
+                if self.dynamic_leverage_enabled
+                else min(self.symbol_leverages.values(), default=1)
+            )
             if minimum_trade >= (
                 self.settings["initial_capital"]
                 * self.settings["leverage_multiplier"]
-                * min(self.symbol_leverages.values(), default=1)
+                * minimum_symbol_leverage
                 / holdings
             ):
                 raise BacktestValidationError(
@@ -298,6 +314,11 @@ class BacktestEngine:
             self.auxiliary_symbols = list(strategy_type.additional_symbols(params))
             self.early_close_offsets = strategy_type.early_close_offsets(params)
             self.cumulative_volume_events = strategy_type.cumulative_volume_events(params)
+        if self.dynamic_leverage_enabled:
+            lookback = max(
+                lookback,
+                int(self.dynamic_leverage_settings["volatility_period"]) + 1,
+            )
         return {
             "events": sorted(events, key=_event_sort_key),
             "minimum_lookback": lookback,
@@ -398,7 +419,7 @@ class BacktestEngine:
             if self.cancellation_check():
                 raise BacktestCancelled("用户取消了回测。")
 
-            self._apply_corporate_actions(trading_date)
+            self.apply_day_start(trading_date)
             self._update_benchmark(trading_date)
 
             active_tradable = self.dataset.active_symbols(
@@ -421,7 +442,7 @@ class BacktestEngine:
                         self.tradable_symbols, trading_date
                     )
                 }
-                self._execute_intents(
+                self.execute_event_intents(
                     pending_close,
                     trading_date=trading_date,
                     event="OPEN",
@@ -465,7 +486,7 @@ class BacktestEngine:
                     symbol: self.dataset.event_price(symbol, trading_date, event)
                     for symbol in active_tradable
                 }
-                intents = self._strategy_intents(
+                intents = self.strategy_intents_for_event(
                     trading_date=trading_date,
                     event=event,
                     event_prices=event_prices,
@@ -483,7 +504,7 @@ class BacktestEngine:
                     else:
                         pending_close = intents
                 else:
-                    self._execute_intents(
+                    self.execute_event_intents(
                         intents,
                         trading_date=trading_date,
                         event=event,
@@ -869,14 +890,45 @@ class BacktestEngine:
         event_prices: dict,
     ) -> list[OrderIntent]:
         marks = self._marks_for_event(event_prices)
+        previous_targets = (
+            {
+                symbol: float(
+                    self.portfolio.strategy_target_weights.get(
+                        symbol,
+                        min(
+                            Decimal(str(self.max_weights.get(symbol, 100))) / Decimal("100"),
+                            max(Decimal("0"), self.portfolio.weight(symbol, marks)),
+                        ),
+                    )
+                )
+                for symbol in self.universe
+                if symbol in marks and self.portfolio.quantity(symbol) > 0
+            }
+            if self.dynamic_leverage_rebalance_on_change
+            else {}
+        )
+        changed, unavailable = self._apply_dynamic_leverages(
+            trading_date=trading_date,
+            event=event,
+            event_prices=event_prices,
+        )
+        usable_event_prices = {
+            symbol: value
+            for symbol, value in event_prices.items()
+            if symbol not in unavailable
+        }
         if self.code_strategy is not None:
             context = CodeEventContext(
                 dataset=self.dataset,
                 portfolio=self.portfolio,
-                universe=self.dataset.active_symbols(self.universe, trading_date),
+                universe=[
+                    symbol
+                    for symbol in self.dataset.active_symbols(self.universe, trading_date)
+                    if symbol not in unavailable
+                ],
                 trading_date=trading_date,
                 event=event,
-                event_prices=event_prices,
+                event_prices=usable_event_prices,
                 marks=marks,
                 all_candidate_symbols=self.universe,
                 log_callback=self._log,
@@ -887,28 +939,252 @@ class BacktestEngine:
             intents = self._competition_intents(
                 trading_date=trading_date,
                 event=event,
-                event_prices=event_prices,
+                event_prices=usable_event_prices,
                 marks=marks,
             )
         else:
             intents = []
-            for symbol in event_prices:
+            for symbol in usable_event_prices:
                 if symbol not in self.universe:
                     continue
                 intent, _ = self._first_matching_rule(
                     symbol=symbol,
                     trading_date=trading_date,
                     event=event,
-                    event_prices=event_prices,
+                    event_prices=usable_event_prices,
                     marks=marks,
                 )
                 if intent:
                     intents.append(intent)
-        return self._cash_adjusted_intents(
+        # A TARGET BUY normally means "raise this symbol to the requested
+        # strategy weight".  If the dynamic layer has just fallen, however,
+        # the unchanged position can already be above that normalized target.
+        # Turn that target into a SELL so the new leverage is actually applied
+        # instead of letting Portfolio correctly treat the BUY as a no-op.
+        reconciled: list[OrderIntent] = []
+        for intent in intents:
+            if (
+                intent.symbol in changed
+                and intent.action.upper() == "BUY"
+                and intent.sizing_mode.upper() == "TARGET"
+                and self.portfolio.quantity(intent.symbol) > 0
+                and intent.symbol in marks
+                and float(intent.value_percent) / 100
+                < float(self.portfolio.weight(intent.symbol, marks)) - 1e-10
+            ):
+                reconciled.append(OrderIntent(
+                    symbol=intent.symbol,
+                    action="SELL",
+                    sizing_mode="TARGET",
+                    value_percent=intent.value_percent,
+                    reason=f"{intent.reason}；动态单标的杠杆率下降后重设目标仓位",
+                    minimum_trade_value=intent.minimum_trade_value,
+                ))
+            else:
+                reconciled.append(intent)
+        intents = reconciled
+        symbols_with_intents = {intent.symbol for intent in intents}
+        for symbol, target_weight in previous_targets.items():
+            if symbol not in changed or symbol in symbols_with_intents or symbol in unavailable:
+                continue
+            new_weight = float(self.portfolio.weight(symbol, marks))
+            if abs(new_weight - target_weight) <= 1e-10:
+                continue
+            intents.append(OrderIntent(
+                symbol=symbol,
+                action="BUY" if new_weight < target_weight else "SELL",
+                sizing_mode="TARGET",
+                value_percent=target_weight * 100,
+                reason="动态单标的杠杆率变化，保持策略目标仓位",
+            ))
+        adjusted = self._cash_adjusted_intents(
             intents,
             trading_date=trading_date,
             event=event,
         )
+        self._remember_strategy_targets(adjusted, marks)
+        self._attach_decision_positions(
+            trading_date=trading_date,
+            event=event,
+            marks=marks,
+            intents=adjusted,
+        )
+        return adjusted
+
+    def strategy_intents_for_event(
+        self,
+        *,
+        trading_date: str,
+        event: str,
+        event_prices: dict,
+    ) -> list[OrderIntent]:
+        """Canonical strategy-decision entry point shared by backtest and realtime."""
+        return self._strategy_intents(
+            trading_date=trading_date,
+            event=event,
+            event_prices=event_prices,
+        )
+
+    def execute_event_intents(
+        self,
+        intents: list[OrderIntent],
+        *,
+        trading_date: str,
+        event: str,
+        event_prices: dict,
+        reason_prefix: str | None = None,
+    ) -> None:
+        """Canonical simulated-fill entry point shared by backtest and realtime."""
+        self._execute_intents(
+            intents,
+            trading_date=trading_date,
+            event=event,
+            event_prices=event_prices,
+            reason_prefix=reason_prefix,
+        )
+
+    def _remember_strategy_targets(
+        self,
+        intents: list[OrderIntent],
+        marks: dict[str, float],
+    ) -> None:
+        """Persist normalized strategy targets independently of leverage drift."""
+        for intent in intents:
+            current = self.portfolio.strategy_target_weights.get(
+                intent.symbol,
+                self.portfolio.weight(intent.symbol, marks),
+            )
+            requested = Decimal(str(intent.value_percent)) / Decimal("100")
+            if intent.sizing_mode.upper() == "TARGET":
+                target = requested
+            elif intent.action.upper() == "BUY":
+                target = current + requested
+            else:
+                target = current - requested
+            maximum = Decimal(str(self.max_weights.get(intent.symbol, 100))) / Decimal("100")
+            self.portfolio.strategy_target_weights[intent.symbol] = min(
+                maximum,
+                max(Decimal("0"), target),
+            )
+
+    def _apply_dynamic_leverages(
+        self,
+        *,
+        trading_date: str,
+        event: str,
+        event_prices: dict,
+    ) -> tuple[set[str], set[str]]:
+        changed: set[str] = set()
+        unavailable: set[str] = set()
+        if not self.dynamic_leverage_enabled:
+            return changed, unavailable
+        config = self.dynamic_leverage_settings
+        period = int(config["volatility_period"])
+        for symbol in self.universe:
+            value = event_prices.get(symbol)
+            if value is None or is_cash_placeholder_symbol(symbol, self.strategy.get("market")):
+                continue
+            volatility = self.dataset.historical_volatility_value(
+                symbol,
+                trading_date,
+                event,
+                float(value.signal_price),
+                period,
+            )
+            if volatility is None:
+                unavailable.add(symbol)
+                self._log(
+                    "WARN",
+                    "DYNAMIC_LEVERAGE_UNAVAILABLE",
+                    f"{symbol} 数据不足，无法计算 VOLAT({period})。",
+                    event_time=f"{trading_date} {event}",
+                    symbol=symbol,
+                    context={"volatility_period": period},
+                )
+                continue
+            calculation = calculate_dynamic_symbol_leverage(
+                volatility,
+                stress_days=int(config["stress_days"]),
+                max_loss_percent=float(config["max_loss_percent"]),
+                max_leverage=float(config["max_leverage"]),
+            )
+            leverage = float(calculation["leverage"])
+            previous = float(
+                self.portfolio.configured_symbol_leverage_multipliers.get(symbol, 1)
+            )
+            self.portfolio.set_configured_symbol_leverage_multiplier(symbol, leverage)
+            self.symbol_leverages[symbol] = leverage
+            if abs(previous - leverage) > 1e-12:
+                changed.add(symbol)
+            if self._last_dynamic_leverages.get(symbol) != leverage:
+                self._log(
+                    "INFO",
+                    "DYNAMIC_LEVERAGE",
+                    f"{symbol} VOLAT({period})={volatility:.2f}，最终动态杠杆={leverage:.1f}x",
+                    event_time=f"{trading_date} {event}",
+                    symbol=symbol,
+                    context={
+                        **calculation,
+                        "volatility_period": period,
+                        "stress_days": int(config["stress_days"]),
+                        "max_loss_percent": float(config["max_loss_percent"]),
+                        "max_leverage": float(config["max_leverage"]),
+                        "rebalance_on_change": bool(config["rebalance_on_change"]),
+                    },
+                )
+                self._last_dynamic_leverages[symbol] = leverage
+        return changed, unavailable
+
+    def _attach_decision_positions(
+        self,
+        *,
+        trading_date: str,
+        event: str,
+        marks: dict[str, float],
+        intents: list[OrderIntent],
+    ) -> None:
+        equity = float(self.portfolio.equity(marks))
+        holdings = {
+            symbol: (
+                float(self.portfolio.quantity(symbol)) * float(marks[symbol]) / equity * 100
+                if equity > 0 and symbol in marks else 0.0
+            )
+            for symbol in self.universe
+        }
+        for intent in intents:
+            leverage = float(self.portfolio.effective_leverage(intent.symbol))
+            change = float(intent.value_percent) * leverage
+            if intent.sizing_mode.upper() == "TARGET":
+                current = holdings.get(intent.symbol, 0.0)
+                current_normalized = current / leverage if leverage > 0 else 0.0
+                requested = float(intent.value_percent)
+                if (
+                    intent.action.upper() == "BUY"
+                    and requested > current_normalized + 1e-8
+                ) or (
+                    intent.action.upper() == "SELL"
+                    and requested < current_normalized - 1e-8
+                ):
+                    holdings[intent.symbol] = change
+            elif intent.action.upper() == "BUY":
+                holdings[intent.symbol] = holdings.get(intent.symbol, 0.0) + change
+            else:
+                holdings[intent.symbol] = max(0.0, holdings.get(intent.symbol, 0.0) - change)
+        self.last_decision_holdings = dict(holdings)
+        event_time = f"{trading_date} {event}"
+        accepted = {
+            "COMPETITION_ELIGIBILITY",
+            "COMPETITION_SCORE",
+            "RAPID_DROP_ATR_DAILY_SCORE",
+            "RAPID_DROP_WTME_DAILY_SCORE",
+            "SEVENSTAR_DAILY_SCORE",
+        }
+        for log in self.logs:
+            if log.get("event_time") != event_time or log.get("event_type") not in accepted:
+                continue
+            symbol = str(log.get("symbol") or (log.get("context") or {}).get("symbol") or "")
+            if symbol:
+                log.setdefault("context", {})["holding_percent"] = holdings.get(symbol, 0.0)
 
     def _cash_adjusted_intents(
         self,
@@ -1252,7 +1528,8 @@ class BacktestEngine:
                 event_time=f"{trading_date} OPEN",
             )
 
-    def _apply_corporate_actions(self, trading_date: str) -> None:
+    def apply_day_start(self, trading_date: str) -> None:
+        """Apply the same day-start accounting in backtest and realtime."""
         for payment in self.portfolio.settle_receivables(trading_date):
             self._log(
                 "INFO",

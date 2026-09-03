@@ -1160,6 +1160,7 @@ def seed_default_indicators() -> None:
         {"code": "EMA13", "name": "EMA13", "indicator_type": "EMA", "params": {"period": 13}, "description": "指数移动平均"},
         {"code": "MA20", "name": "MA20", "indicator_type": "MA", "params": {"period": 20}, "description": "简单移动平均"},
         {"code": "ATR14", "name": "ATR14", "indicator_type": "ATR", "params": {"period": 14}, "description": "Wilder 绝对 ATR"},
+        {"code": "VOLAT30", "name": "VOLAT(30)", "indicator_type": "VOLAT", "params": {"period": 30}, "description": "30 期对数收益率样本标准差按 252 个交易日年化（%）"},
         {"code": "RATR14", "name": "相对ATR14", "indicator_type": "RATR", "params": {"period": 14}, "description": "(当前收盘价 - 14 个交易日前收盘价) / 前一日 Wilder ATR(14)"},
         {"code": "LINEAR_FIT25", "name": "R²", "indicator_type": "LINEAR_FIT", "params": {"period": 25}, "description": "前 N 根完整 K 线与当前价格的加权对数价格趋势 R²"},
         {"code": "WTME40H15E1e-08", "name": "WTME40(h=15)", "indicator_type": "WTME", "params": {"period": 40, "half_life": 15.0, "epsilon": 1e-8}, "description": "加权真实波幅动量效率"},
@@ -1203,8 +1204,8 @@ def seed_default_indicators() -> None:
 
 def validate_indicator(indicator_type: str, params: dict) -> tuple[str, dict]:
     normalized_type = str(indicator_type or "").strip().upper()
-    if normalized_type not in {"MA", "EMA", "ATR", "RATR", "LINEAR_FIT", "WTME", "RAPID_DROP", "RSI", "MACD"}:
-        raise ValueError("仅支持 MA、EMA、ATR、相对 ATR、R²、WTME、急跌过滤、RSI 和 MACD 指标。")
+    if normalized_type not in {"MA", "EMA", "ATR", "VOLAT", "RATR", "LINEAR_FIT", "WTME", "RAPID_DROP", "RSI", "MACD"}:
+        raise ValueError("仅支持 MA、EMA、ATR、VOLAT、相对 ATR、R²、WTME、急跌过滤、RSI 和 MACD 指标。")
 
     if normalized_type == "MACD":
         try:
@@ -1314,6 +1315,8 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
     params_json = normalize_params(normalized_params)
     if normalized_type == "RATR":
         default_name = f"相对ATR{normalized_params['period']}"
+    elif normalized_type == "VOLAT":
+        default_name = f"VOLAT({normalized_params['period']})"
     elif normalized_type == "LINEAR_FIT":
         default_name = f"R²{normalized_params['period']}"
     elif normalized_type == "MACD":
@@ -1377,6 +1380,8 @@ def get_or_create_indicator(indicator_type: str, params: dict, name: str | None 
                 (
                     "Wilder 绝对 ATR"
                     if normalized_type == "ATR"
+                    else "N 期对数收益率样本标准差按 252 个交易日年化（%）"
+                    if normalized_type == "VOLAT"
                     else "相对 ATR 动量评分（当前价差 / 前一日 Wilder ATR）"
                     if normalized_type == "RATR"
                     else "前 N 根完整 K 线与当前价格的加权对数价格趋势 R²"

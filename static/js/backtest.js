@@ -41,6 +41,7 @@ const btVisualEditor = document.getElementById("backtest-visual-editor");
 const btCompetitionEditor = document.getElementById("backtest-competition-editor");
 const btCodeEditor = document.getElementById("backtest-code-editor");
 const btCodeParams = document.getElementById("backtest-code-params");
+const btDynamicLeverageEnabled = document.getElementById("backtest-dynamic-leverage-enabled");
 const btMetrics = document.getElementById("backtest-metrics");
 const btCanvas = document.getElementById("backtest-equity-chart");
 const btChartEmpty = document.getElementById("backtest-chart-empty");
@@ -258,6 +259,7 @@ function setBacktestReadOnly(readOnly) {
   btWorkspace.querySelectorAll("input, textarea, select").forEach((element) => {
     element.disabled = bt.readOnly;
   });
+  if (!bt.readOnly) updateDynamicLeverageControls();
   const historySection = btRunHistory.closest("section");
   if (historySection) historySection.hidden = bt.readOnly;
   document.getElementById("backtest-mode-badge").textContent = bt.readOnly
@@ -452,6 +454,7 @@ function renderBacktestEditor() {
   document.getElementById("backtest-market-type").value = market.type || "US_EQUITY";
   document.getElementById("backtest-mode-badge").textContent =
     `${strategy.design_mode === "code" ? "代码" : "非代码"} · ${strategy.selection_mode}`;
+  btDynamicLeverageEnabled.checked = Boolean(strategy.definition.dynamic_leverage_enabled);
   document.getElementById("backtest-revision").textContent = `revision ${strategy.revision}`;
   const help = {
     single: "单一标的，规则直接控制该标的仓位。",
@@ -479,6 +482,7 @@ function renderBacktestEditor() {
 }
 
 const BT_CASH_PLACEHOLDER_SYMBOLS = new Set(["USDINDEX", "US10Y"]);
+const BT_PREVIOUS_CLOSE_INTRADAY_SYMBOLS = new Set(["USDINDEX", "US10Y"]);
 
 function btIsCashPlaceholderSymbol(symbol) {
   return document.getElementById("backtest-market-type").value === "US_EQUITY"
@@ -488,7 +492,7 @@ function btIsCashPlaceholderSymbol(symbol) {
 function btCashPlaceholderNote(symbol) {
   const normalized = String(symbol || "").trim().toUpperCase();
   const base = "买入该标的默认为空仓；实际计算不建立该标的持仓，而是持有美元现金。";
-  if (normalized === "US10Y") {
+  if (BT_PREVIOUS_CLOSE_INTRADAY_SYMBOLS.has(normalized)) {
     return `${base} 历史回测需要分钟级价格时，临时使用上一交易日收盘价；实时决策使用当前价格。`;
   }
   return base;
@@ -496,11 +500,12 @@ function btCashPlaceholderNote(symbol) {
 
 function renderBacktestSymbols() {
   const isSevenStar = bt.current.design_mode === "code" && bt.current.code_key === "sevenstar_etf_rotation";
+  const dynamicLeverage = Boolean(bt.current.definition.dynamic_leverage_enabled);
   btSymbols.innerHTML = (bt.current.definition.symbols || []).map((item, index) => `
     <div class="backtest-symbol-row" data-index="${index}">
       <input class="bt-symbol-code" type="text" value="${btEscape(item.symbol)}" placeholder="SPY" aria-label="标的代码">
       <input class="bt-symbol-weight" type="number" min="0.01" max="100" step="0.01" value="${isSevenStar ? 100 : Number(item.max_weight)}" aria-label="最大仓位" ${isSevenStar ? 'disabled title="七星策略按目标数量等权，候选标的上限固定为 100%"' : ""}>
-      <input class="bt-symbol-leverage" type="number" min="1" max="10" step="0.1" value="${Number(item.leverage_multiplier ?? 1)}" aria-label="单标的杠杆倍率" title="最终有效杠杆 = 整体杠杆 × 单标的杠杆">
+      <input class="bt-symbol-leverage" type="number" min="1" max="10" step="0.1" value="${Number(item.leverage_multiplier ?? 1)}" aria-label="单标的杠杆倍率" title="${dynamicLeverage ? '已由 VOLAT 动态杠杆替代，关闭动态杠杆后恢复此值' : '最终有效杠杆 = 整体杠杆 × 单标的杠杆'}" ${dynamicLeverage || bt.readOnly ? "disabled" : ""}>
       <div class="backtest-symbol-order">
         <button class="bt-move-symbol" data-direction="up" type="button" aria-label="上移标的" ${index === 0 ? "disabled" : ""}>↑</button>
         <button class="bt-move-symbol" data-direction="down" type="button" aria-label="下移标的" ${index === bt.current.definition.symbols.length - 1 ? "disabled" : ""}>↓</button>
@@ -572,7 +577,13 @@ function renderBacktestCodeParameters() {
     return;
   }
   const params = bt.current.definition.params || {};
-  btCodeParams.innerHTML = Object.entries(spec.parameter_schema).map(([name, field]) => {
+  const parameterEntries = Array.isArray(spec.parameter_order)
+    ? spec.parameter_order
+      .filter((name) => spec.parameter_schema[name])
+      .map((name) => [name, spec.parameter_schema[name]])
+    : Object.entries(spec.parameter_schema);
+  btCodeParams.innerHTML = parameterEntries.map(([name, field]) => {
+    if (field.render === "inline_prefix") return "";
     const rawValue = params[name] ?? field.default;
     const value = field.value_aliases?.[rawValue] ?? rawValue;
     const maximum = ["holdings_num", "buy_top_n"].includes(name)
@@ -592,7 +603,7 @@ function renderBacktestCodeParameters() {
     if (field.type === "boolean") {
       return `<label class="backtest-code-param backtest-code-param-boolean" data-param="${btEscape(name)}">
         <span class="backtest-code-param-label">${btEscape(field.label)}</span>
-        <input class="bt-code-param" type="checkbox" ${value ? "checked" : ""}>
+        <input class="bt-code-param" data-primary-param="${btEscape(name)}" type="checkbox" ${value ? "checked" : ""}>
         <small>${notes.map(btEscape).join(" · ")}</small>
       </label>`;
     }
@@ -603,19 +614,37 @@ function renderBacktestCodeParameters() {
         </option>`).join("");
       return `<label class="backtest-code-param" data-param="${btEscape(name)}">
         <span class="backtest-code-param-label">${btEscape(field.label)}</span>
-        <select class="bt-code-param" required>${options}</select>
+        <select class="bt-code-param" data-primary-param="${btEscape(name)}" required>${options}</select>
         <small>${notes.map(btEscape).join(" · ")}</small>
       </label>`;
     }
     const type = field.type === "time" ? "time" : field.type === "symbol" ? "text" : "number";
+    const input = `<input class="bt-code-param" data-primary-param="${btEscape(name)}" type="${type}" value="${btEscape(value)}"
+      ${field.minimum != null ? `min="${field.minimum}"` : ""}
+      ${Number.isFinite(maximum) ? `max="${maximum}"` : ""}
+      ${field.step != null ? `step="${field.step}"` : ""}
+      ${field.type === "symbol" ? 'maxlength="24" pattern="[A-Za-z0-9^./=_-]{1,24}"' : ""} required>`;
+    const prefixName = field.inline_prefix_parameter;
+    const prefixField = prefixName ? spec.parameter_schema[prefixName] : null;
+    let valueControl = input;
+    if (prefixField) {
+      const prefixRawValue = params[prefixName] ?? prefixField.default;
+      const prefixValue = prefixField.value_aliases?.[prefixRawValue] ?? prefixRawValue;
+      const prefixOptions = (prefixField.options || []).map((option) => `
+        <option value="${btEscape(option.value)}" ${option.value === prefixValue ? "selected" : ""}>
+          ${btEscape(option.label || option.value)}
+        </option>`).join("");
+      valueControl = `<span class="backtest-code-param-inline-value">
+        <select class="bt-code-param-inline-prefix" data-param="${btEscape(prefixName)}"
+          aria-label="${btEscape(prefixField.label || prefixName)}" required>${prefixOptions}</select>
+        ${input}
+      </span>`;
+      if (prefixField.help) notes.push(prefixField.help);
+    }
     return `
       <label class="backtest-code-param" data-param="${btEscape(name)}">
         <span class="backtest-code-param-label">${btEscape(field.label)}${field.unit ? `（${btEscape(field.unit)}）` : ""}</span>
-        <input class="bt-code-param" type="${type}" value="${btEscape(value)}"
-          ${field.minimum != null ? `min="${field.minimum}"` : ""}
-          ${Number.isFinite(maximum) ? `max="${maximum}"` : ""}
-          ${field.step != null ? `step="${field.step}"` : ""}
-          ${field.type === "symbol" ? 'maxlength="24" pattern="[A-Za-z0-9^./=_-]{1,24}"' : ""} required>
+        ${valueControl}
         <small>${notes.map(btEscape).join(" · ")}</small>
       </label>`;
   }).join("");
@@ -635,6 +664,7 @@ function collectBacktestStrategy() {
     calendar: "XNYS",
     timezone: "America/New_York",
   };
+  strategy.definition.dynamic_leverage_enabled = btDynamicLeverageEnabled.checked;
   strategy.definition.symbols = Array.from(btSymbols.querySelectorAll(".backtest-symbol-row")).map((row) => ({
     symbol: row.querySelector(".bt-symbol-code").value.trim().toUpperCase(),
     max_weight: strategy.code_key === "sevenstar_etf_rotation"
@@ -675,7 +705,7 @@ function collectBacktestStrategy() {
     strategy.definition.params = {};
     btCodeParams.querySelectorAll(".backtest-code-param").forEach((row) => {
       const field = spec.parameter_schema[row.dataset.param];
-      const input = row.querySelector(".bt-code-param");
+      const input = row.querySelector("[data-primary-param]");
       strategy.definition.params[row.dataset.param] = field.type === "boolean"
         ? input.checked
         : field.type === "time"
@@ -685,6 +715,9 @@ function collectBacktestStrategy() {
             : field.type === "symbol"
               ? input.value.trim().toUpperCase()
               : Number(input.value);
+    });
+    btCodeParams.querySelectorAll(".bt-code-param-inline-prefix[data-param]").forEach((input) => {
+      strategy.definition.params[input.dataset.param] = input.value;
     });
     const boundedCount = strategy.definition.params.holdings_num
       ?? strategy.definition.params.buy_top_n;
@@ -727,10 +760,16 @@ function resetBacktestResult() {
 
 function settingsToForm() {
   const value = bt.current.default_settings;
+  const dynamic = value.dynamic_leverage || {};
   document.getElementById("backtest-start-date").value = value.start_date;
   document.getElementById("backtest-end-date").value = value.end_date;
   document.getElementById("backtest-initial-capital").value = value.initial_capital;
   document.getElementById("backtest-leverage").value = value.leverage_multiplier ?? 1;
+  document.getElementById("backtest-dynamic-volatility-period").value = dynamic.volatility_period ?? 30;
+  document.getElementById("backtest-dynamic-stress-days").value = dynamic.stress_days ?? 13;
+  document.getElementById("backtest-dynamic-max-loss").value = dynamic.max_loss_percent ?? 25;
+  document.getElementById("backtest-dynamic-max-leverage").value = dynamic.max_leverage ?? 3;
+  document.getElementById("backtest-dynamic-rebalance-on-change").checked = dynamic.rebalance_on_change !== false;
   document.getElementById("backtest-commission-share").value = value.commission_per_share;
   document.getElementById("backtest-minimum-commission").value = value.minimum_commission;
   document.getElementById("backtest-slippage").value = value.slippage_bps;
@@ -738,6 +777,7 @@ function settingsToForm() {
   document.getElementById("backtest-risk-free").value = value.risk_free_rate;
   document.getElementById("backtest-fractional").checked = Boolean(value.allow_fractional_shares);
   document.getElementById("backtest-generate-logs").checked = value.generate_logs !== false;
+  updateDynamicLeverageControls();
 }
 
 function settingsFromForm() {
@@ -747,6 +787,13 @@ function settingsFromForm() {
     end_date: document.getElementById("backtest-end-date").value,
     initial_capital: Number(document.getElementById("backtest-initial-capital").value),
     leverage_multiplier: Number(document.getElementById("backtest-leverage").value),
+    dynamic_leverage: {
+      volatility_period: Number(document.getElementById("backtest-dynamic-volatility-period").value),
+      stress_days: Number(document.getElementById("backtest-dynamic-stress-days").value),
+      max_loss_percent: Number(document.getElementById("backtest-dynamic-max-loss").value),
+      max_leverage: Number(document.getElementById("backtest-dynamic-max-leverage").value),
+      rebalance_on_change: document.getElementById("backtest-dynamic-rebalance-on-change").checked,
+    },
     commission_per_share: Number(document.getElementById("backtest-commission-share").value),
     minimum_commission: Number(document.getElementById("backtest-minimum-commission").value),
     slippage_bps: Number(document.getElementById("backtest-slippage").value),
@@ -756,6 +803,24 @@ function settingsFromForm() {
     generate_logs: document.getElementById("backtest-generate-logs").checked,
     strict_data: true,
   };
+}
+
+function updateDynamicLeverageControls() {
+  if (!bt.current) return;
+  const enabled = Boolean(btDynamicLeverageEnabled.checked);
+  bt.current.definition.dynamic_leverage_enabled = enabled;
+  btSymbols.querySelectorAll(".bt-symbol-leverage").forEach((input) => {
+    input.disabled = bt.readOnly || enabled;
+    input.title = enabled
+      ? "已由 VOLAT 动态杠杆替代，关闭动态杠杆后恢复此值"
+      : "最终有效杠杆 = 整体杠杆 × 单标的杠杆";
+  });
+  document.querySelectorAll(".backtest-dynamic-leverage-setting").forEach((label) => {
+    label.classList.toggle("is-disabled", !enabled);
+    const input = label.querySelector("input");
+    if (input) input.disabled = bt.readOnly || !enabled;
+  });
+  document.getElementById("backtest-dynamic-leverage-help").classList.toggle("is-disabled", !enabled);
 }
 
 async function runBacktest() {
@@ -1224,7 +1289,9 @@ function btRunSymbols(run) {
   )).join("");
   const details = entries.map((entry) => {
     const leverage = Number(entry.leverage_multiplier);
-    const label = entry.leverage_multiplier != null && Number.isFinite(leverage)
+    const label = entry.dynamic
+      ? "动态"
+      : entry.leverage_multiplier != null && Number.isFinite(leverage)
       ? `${leverage}x`
       : "-";
     return `<span class="backtest-symbol-tooltip-row"><span>${btEscape(entry.symbol)}</span><span>${btEscape(label)}</span></span>`;
@@ -1496,6 +1563,12 @@ function initBacktest() {
       leverage_multiplier: 1,
     });
     renderBacktestSymbols();
+  });
+  btDynamicLeverageEnabled.addEventListener("change", () => {
+    syncBacktestSymbolsFromEditor();
+    bt.current.definition.dynamic_leverage_enabled = btDynamicLeverageEnabled.checked;
+    renderBacktestSymbols();
+    updateDynamicLeverageControls();
   });
   btSymbols.addEventListener("click", (event) => {
     const move = event.target.closest(".bt-move-symbol");

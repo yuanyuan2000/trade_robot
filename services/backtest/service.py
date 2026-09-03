@@ -80,6 +80,8 @@ def _overview_leverage_display(strategy_snapshot: dict, settings: dict) -> str:
     if leverage is None:
         return "-"
     suffix = ""
+    if (strategy_snapshot.get("definition") or {}).get("dynamic_leverage_enabled"):
+        suffix = "×动态单标的"
     if strategy_snapshot.get("design_mode") == "code":
         try:
             strategy_type = get_code_strategy(
@@ -88,7 +90,7 @@ def _overview_leverage_display(strategy_snapshot: dict, settings: dict) -> str:
         except BacktestError:
             strategy_type = None
         if strategy_type is not None:
-            suffix = strategy_type.overview_leverage_suffix(strategy_snapshot)
+            suffix += strategy_type.overview_leverage_suffix(strategy_snapshot)
     return f"{leverage:g}x{suffix}"
 
 
@@ -117,12 +119,14 @@ def list_run_overviews(
         raw_symbols = definition.get("symbols") or []
         if not isinstance(raw_symbols, list):
             raw_symbols = []
+        dynamic_enabled = bool(definition.get("dynamic_leverage_enabled"))
         item["symbol_leverages"] = [
             {
                 "symbol": symbol["symbol"],
                 "leverage_multiplier": _overview_number(
                     symbol.get("leverage_multiplier")
                 ),
+                **({"dynamic": True} if dynamic_enabled else {}),
             }
             for symbol in raw_symbols
             if isinstance(symbol, dict) and symbol.get("symbol")
@@ -239,7 +243,8 @@ def _preflight_engine(strategy: dict, settings: dict) -> BacktestEngine:
     return BacktestEngine(strategy, settings)
 
 
-def _validated_saved_strategy(strategy: dict) -> dict:
+def prepare_strategy_for_execution(strategy: dict) -> dict:
+    """Resolve a saved strategy against the current executable implementation."""
     validated_fields = validate_strategy_payload(strategy)
     return _validate_code_configuration({**strategy, **validated_fields})
 
@@ -289,7 +294,7 @@ def _data_issue_payload(exc: BacktestDataError) -> list[dict]:
 
 def validate_saved_strategy(strategy_id: int) -> dict:
     strategy = backtest_repository.get_strategy(strategy_id)
-    validated = _validated_saved_strategy(strategy)
+    validated = prepare_strategy_for_execution(strategy)
     settings = validate_settings(validated.get("default_settings"))
     try:
         _preflight_engine(validated, settings)
@@ -360,6 +365,17 @@ def build_run_configuration_summary(strategy: dict, settings: dict) -> str:
         "calendar": "XNYS",
         "timezone": "America/New_York",
     }
+    dynamic_text = ""
+    if (strategy.get("definition") or {}).get("dynamic_leverage_enabled"):
+        dynamic = settings.get("dynamic_leverage") or {}
+        dynamic_text = (
+            f"，动态单标的杠杆VOLAT({dynamic.get('volatility_period', 30)})/"
+            f"3σ持续{dynamic.get('stress_days', 13)}日/"
+            f"x={_compact_number(dynamic.get('max_loss_percent', 25))}%/"
+            f"上限{_compact_number(dynamic.get('max_leverage', 3))}倍/"
+            f"杠杆变化自动再平衡"
+            f"{'开' if dynamic.get('rebalance_on_change', True) else '关'}"
+        )
     common = (
         f"{settings['start_date']}至{settings['end_date']}，初始资金"
         f"${settings['initial_capital']:,.2f}，{settings['leverage_multiplier']:g}倍杠杆，"
@@ -368,7 +384,7 @@ def build_run_configuration_summary(strategy: dict, settings: dict) -> str:
         f"{'允许' if settings['allow_fractional_shares'] else '不允许'}碎股，"
         f"基准{settings['benchmark']}，"
         f"{'生成' if settings['generate_logs'] else '不生成'}详细日志，"
-        f"市场美股({market['calendar']})/美东时间"
+        f"市场美股({market['calendar']})/美东时间{dynamic_text}"
     )
     if strategy["design_mode"] == "code":
         strategy_type = get_code_strategy(strategy["code_key"])
@@ -446,7 +462,7 @@ class BacktestRunManager:
             **(settings or {}),
         }
         validated_settings = validate_settings(merged_settings)
-        validated_strategy = _validated_saved_strategy(strategy)
+        validated_strategy = prepare_strategy_for_execution(strategy)
         # A direct run is deliberately read-only: fail before creating a run
         # record and never repair market data implicitly.
         preflight = _preflight_engine(validated_strategy, validated_settings)

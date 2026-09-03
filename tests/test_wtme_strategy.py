@@ -126,6 +126,7 @@ class WtmeStrategyTests(unittest.TestCase):
 
         self.assertEqual(params["allocation_mode"], "equal")
         self.assertEqual(params["buy_top_n"], 1)
+        self.assertEqual(params["buy_condition_operator"], "or")
         self.assertEqual(params["buy_score_threshold"], 9999)
         self.assertEqual(params["max_simultaneous_holdings"], 1)
         for retired in RapidDropWtmeRotationStrategy.retired_parameters:
@@ -144,6 +145,25 @@ class WtmeStrategyTests(unittest.TestCase):
         self.assertEqual(
             RapidDropWtmeRotationStrategy.required_events({}),
             ("09:40", "10:00"),
+        )
+        self.assertEqual(
+            list(RapidDropWtmeRotationStrategy.parameter_schema),
+            [
+                "enable_percent_drop_filter",
+                "drop_threshold_percent",
+                "drop_lookback_sessions",
+                "risk_check_time",
+                "wtme_period",
+                "wtme_half_life",
+                "wtme_epsilon",
+                "selection_time",
+                "buy_top_n",
+                "buy_condition_operator",
+                "buy_score_threshold",
+                "max_simultaneous_holdings",
+                "allocation_mode",
+                "enable_upside_sell_protection",
+            ],
         )
 
     @staticmethod
@@ -330,6 +350,29 @@ class WtmeStrategyTests(unittest.TestCase):
         self.assertIn("未进入买入名单", next(
             item["message"] for item in logs if item["symbol"] == "CCC"
         ))
+
+    def test_buy_conditions_can_require_both_rank_and_score(self) -> None:
+        _strategy, _context, logs, intents = self._select_with_scores(
+            {
+                "buy_top_n": 2,
+                "buy_condition_operator": "and",
+                "buy_score_threshold": 20,
+                "max_simultaneous_holdings": 2,
+            },
+            {"AAA": 30, "BBB": 20, "CCC": 10},
+        )
+
+        self.assertEqual(
+            [(intent.action, intent.symbol, intent.value_percent) for intent in intents],
+            [("BUY", "AAA", 100.0)],
+        )
+        by_symbol = {item["symbol"]: item["context"] for item in logs}
+        self.assertTrue(by_symbol["AAA"]["buy_condition_passed"])
+        self.assertTrue(by_symbol["BBB"]["passes_rank_condition"])
+        self.assertFalse(by_symbol["BBB"]["passes_score_condition"])
+        self.assertFalse(by_symbol["BBB"]["buy_condition_passed"])
+        self.assertEqual(by_symbol["BBB"]["buy_condition_operator"], "and")
+        self.assertIn("采用“且”", by_symbol["BBB"]["buy_condition_reasons"][0])
 
     def test_max_simultaneous_holdings_caps_symbols_passing_buy_conditions(self) -> None:
         _strategy, _context, logs, intents = self._select_with_scores(

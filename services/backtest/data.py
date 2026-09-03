@@ -127,7 +127,7 @@ class ExpressionContext:
                 self.symbol, self.trading_date, name, period
             )
         elif name in {
-            "ma", "ema", "atr", "rsi", "ratr", "r_square", "wtme",
+            "ma", "ema", "atr", "volat", "rsi", "ratr", "r_square", "wtme",
             "rapid_drop", "macd_line", "macd_signal", "macd_hist",
         }:
             value = self.dataset.indicator_value(
@@ -217,6 +217,8 @@ class HistoricalDataSet:
         self._dividend_factors = self._build_dividend_factors()
         self._build_adjustment_indexes()
         self._indicator_series_cache: dict[tuple, object] = {}
+        self._volatility_prefix_cache: dict[str, tuple[list[float], list[float], list[int]]] = {}
+        self._volatility_date_index_cache: dict[str, dict[str, int]] = {}
         self._strategy_atr_cache: dict[tuple, list[float | None]] = {}
         self.manifest = manifest or {}
         self._session_index = {value: index for index, value in enumerate(self.sessions)}
@@ -483,6 +485,103 @@ class HistoricalDataSet:
         self._indicator_series_cache[key] = result
         return result
 
+    def _volatility_prefixes(
+        self,
+        symbol: str,
+    ) -> tuple[list[float], list[float], list[int]]:
+        """Return prefix sums for O(1) point-in-time volatility windows."""
+        cached = self._volatility_prefix_cache.get(symbol)
+        if cached is not None:
+            return cached
+        sums = [0.0]
+        squared = [0.0]
+        invalid = [0]
+        closes = [float(row["close"]) for row in self._canonical_daily[symbol]]
+        self._volatility_date_index_cache[symbol] = {
+            row["date"]: index
+            for index, row in enumerate(self._canonical_daily[symbol])
+        }
+        for previous, current in zip(closes, closes[1:]):
+            valid = (
+                math.isfinite(previous)
+                and math.isfinite(current)
+                and previous > 0
+                and current > 0
+            )
+            value = math.log(current / previous) if valid else 0.0
+            sums.append(sums[-1] + value)
+            squared.append(squared[-1] + value * value)
+            invalid.append(invalid[-1] + (0 if valid else 1))
+        result = (sums, squared, invalid)
+        self._volatility_prefix_cache[symbol] = result
+        return result
+
+    def historical_volatility_value(
+        self,
+        symbol: str,
+        trading_date: str,
+        event: str,
+        event_price: float,
+        period: int,
+    ) -> float | None:
+        """Return VOLAT in O(1) after one O(history) prefix build per symbol.
+
+        CLOSE uses the stored completed close.  OPEN and intraday decisions use
+        ``period - 1`` completed close returns plus the return from the latest
+        completed close to the price known at that event.
+        """
+        if period < 2:
+            return None
+        dates = self.daily_dates[symbol]
+        sums, squared, invalid = self._volatility_prefixes(symbol)
+        current_index = self._volatility_date_index_cache[symbol].get(trading_date)
+        if event == "CLOSE":
+            end_close = (
+                current_index + 1
+                if current_index is not None
+                else bisect_right(dates, trading_date)
+            )
+            if end_close < period + 1:
+                return None
+            start_return = end_close - period - 1
+            end_return = end_close - 1
+            if invalid[end_return] - invalid[start_return]:
+                return None
+            total = sums[end_return] - sums[start_return]
+            total_squared = squared[end_return] - squared[start_return]
+        else:
+            completed_end = (
+                current_index
+                if current_index is not None
+                else bisect_left(dates, trading_date)
+            )
+            if completed_end < period:
+                return None
+            start_return = completed_end - period
+            end_return = completed_end - 1
+            if invalid[end_return] - invalid[start_return]:
+                return None
+            total = sums[end_return] - sums[start_return]
+            total_squared = squared[end_return] - squared[start_return]
+            target_price, _ = self._factors_as_of(symbol, trading_date)
+            current = float(event_price) / target_price
+            previous = float(self._canonical_daily[symbol][completed_end - 1]["close"])
+            if not (
+                math.isfinite(current)
+                and math.isfinite(previous)
+                and current > 0
+                and previous > 0
+            ):
+                return None
+            newest = math.log(current / previous)
+            total += newest
+            total_squared += newest * newest
+        variance = (total_squared - total * total / period) / (period - 1)
+        tolerance = 1e-18 * max(1.0, abs(total_squared))
+        if variance < -tolerance:
+            return None
+        return math.sqrt(max(0.0, variance)) * math.sqrt(252) * 100
+
     def indicator_value(
         self,
         symbol: str,
@@ -496,6 +595,15 @@ class HistoricalDataSet:
         normalized = name.lower()
         period = int(arguments[0])
         include_current = event == "CLOSE"
+
+        if normalized == "volat":
+            return self.historical_volatility_value(
+                symbol,
+                trading_date,
+                event,
+                event_price,
+                period,
+            )
 
         # These intraday indicators deliberately include a synthetic unfinished
         # current bar.  They are finite-window formulas, so only that window is
@@ -1227,7 +1335,7 @@ def load_historical_dataset(
                 intraday_event_minutes[symbol] = resolutions
                 intraday_price_fallbacks[symbol] = {
                     "mode": "previous_session_close",
-                    "reason": "US10Y has no Alpaca minute history",
+                    "reason": f"{symbol} has no Alpaca minute history",
                     "events": list(exact_events),
                 }
                 continue

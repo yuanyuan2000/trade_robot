@@ -280,7 +280,7 @@ def ensure_shipped_strategy_presets() -> None:
                 "rapid-drop-wtme-linear-rank-weights-v1.4.0",
                 code_key="rapid_drop_wtme_rotation",
                 from_versions=("1.3.0",),
-                to_version=payload["code_version"],
+                to_version="1.4.0",
                 parameter_value_replacements={
                     "allocation_mode": {"score_weighted": "linear_rank"},
                 },
@@ -290,7 +290,7 @@ def ensure_shipped_strategy_presets() -> None:
                 "rapid-drop-wtme-or-buy-conditions-v1.5.0",
                 code_key="rapid_drop_wtme_rotation",
                 from_versions=("1.4.0",),
-                to_version=payload["code_version"],
+                to_version="1.5.0",
                 parameter_defaults={
                     "buy_top_n": payload["definition"]["params"]["buy_top_n"],
                     "buy_score_threshold": payload["definition"]["params"][
@@ -328,8 +328,16 @@ def ensure_shipped_strategy_presets() -> None:
                 "rapid-drop-wtme-max-simultaneous-holdings-v1.9.0",
                 code_key="rapid_drop_wtme_rotation",
                 from_versions=("1.8.0",),
-                to_version=payload["code_version"],
+                to_version="1.9.0",
                 parameter_defaults={"max_simultaneous_holdings": 1},
+            )
+            backtest_repository.upgrade_seeded_strategy_code_version_once(
+                seed_key,
+                "rapid-drop-wtme-configurable-buy-operator-v2.0.0",
+                code_key="rapid_drop_wtme_rotation",
+                from_versions=("1.9.0",),
+                to_version=payload["code_version"],
+                parameter_defaults={"buy_condition_operator": "or"},
             )
         backtest_repository.upgrade_seeded_strategy_settings_once(
             seed_key,

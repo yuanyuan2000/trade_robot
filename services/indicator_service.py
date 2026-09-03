@@ -10,6 +10,7 @@ WTME_DEFAULT_HALF_LIFE = 15.0
 WTME_DEFAULT_EPSILON = 1e-8
 INDICATOR_CONTRACT_VERSION = 1
 R_SQUARE_TOLERANCE = 1e-12
+TRADING_DAYS_PER_YEAR = 252
 
 
 def calculate_wilder_atr(
@@ -155,6 +156,8 @@ def calculate_indicator_values(
         return calculate_wilder_rsi(rows, period)
     if normalized_type == "ATR":
         return calculate_wilder_atr(rows, period)
+    if normalized_type == "VOLAT":
+        return calculate_historical_volatility(rows, period)
     if normalized_type == "RATR":
         return _calculate_relative_atr_score(rows, period)
     if normalized_type == "LINEAR_FIT":
@@ -173,6 +176,45 @@ def calculate_indicator_values(
             float(threshold_percent) if threshold_percent is not None else 5.0,
         )
     return [None] * len(rows)
+
+
+def calculate_historical_volatility(
+    rows: list[dict],
+    period: int = 30,
+) -> list[float | None]:
+    """Return annualized historical volatility from rolling log returns.
+
+    Each value uses the latest ``period`` close-to-close log returns (and thus
+    ``period + 1`` closes).  The return volatility is the sample standard
+    deviation and is annualized with 252 trading sessions, expressed as a
+    percentage.
+    """
+    values: list[float | None] = [None] * len(rows)
+    if period < 2 or len(rows) <= period:
+        return values
+
+    closes = np.full(len(rows), np.nan, dtype=float)
+    for index, row in enumerate(rows):
+        try:
+            close = float(row["close"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(close) and close > 0:
+            closes[index] = close
+
+    log_returns = np.log(closes[1:] / closes[:-1])
+    windows = np.lib.stride_tricks.sliding_window_view(log_returns, period)
+    valid_windows = np.all(np.isfinite(windows), axis=1)
+    if not np.any(valid_windows):
+        return values
+
+    volatility = np.std(windows[valid_windows], axis=1, ddof=1)
+    volatility *= math.sqrt(TRADING_DAYS_PER_YEAR) * 100
+    output_indexes = np.flatnonzero(valid_windows) + period
+    for output_index, value in zip(output_indexes, volatility):
+        if math.isfinite(float(value)):
+            values[int(output_index)] = float(value)
+    return values
 
 
 def calculate_wilder_rsi(rows: list[dict], period: int = 14) -> list[float | None]:

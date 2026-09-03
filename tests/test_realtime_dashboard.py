@@ -100,7 +100,12 @@ class RealtimeDashboardTests(unittest.TestCase):
                 for item in task["strategy_snapshot"]["definition"]["symbols"]
             ],
         }}
-        realtime_repository.update_task(task["id"], strategy_snapshot=changed)
+        changed_settings = {**task["settings"], "leverage_multiplier": 3}
+        realtime_repository.update_task(
+            task["id"],
+            strategy_snapshot=changed,
+            settings=changed_settings,
+        )
         realtime_repository.set_task_runtime(task["id"], runtime_state="running")
         clear_realtime_dashboard_cache(task["id"])
         payload = build_realtime_dashboard(task["id"], force=True)
@@ -108,6 +113,10 @@ class RealtimeDashboardTests(unittest.TestCase):
         self.assertEqual(payload["candidate_snapshot_source"], "run_snapshot")
         self.assertTrue(rows["SPY"]["is_candidate"])
         self.assertFalse(rows["OUTSIDE"]["is_candidate"])
+        self.assertEqual(
+            rows["SPY"]["details"]["holding"]["overall_leverage"],
+            run["settings"]["leverage_multiplier"],
+        )
 
     def test_card_recommendations_keep_only_top_three_eligible_rows(self) -> None:
         dashboard = {
@@ -136,7 +145,7 @@ class RealtimeDashboardTests(unittest.TestCase):
         params = task["strategy_snapshot"]["definition"]["params"]
         help_by_key = {column["key"]: column["help"] for column in payload["columns"]}
         label_by_key = {column["key"]: column["label"] for column in payload["columns"]}
-        self.assertTrue(all("策略" in label for label in label_by_key.values()))
+        self.assertTrue(all(not label.startswith("策略") for label in label_by_key.values()))
         self.assertIn(f'{params["lookback_days"] + 1} 个点', help_by_key["annualized_returns"])
         self.assertIn(f'第 {params["short_lookback_days"]} 个完整交易日', help_by_key["short_annualized"])
         self.assertIn(f'{params["min_score_threshold"]:g}', help_by_key["score"])
@@ -214,7 +223,7 @@ class RealtimeDashboardTests(unittest.TestCase):
             row = next(item for item in payload["rows"] if item["symbol"] == "SPY")
             self.assertNotEqual(row["status"], "不可计算")
             if code_key == "rapid_drop_atr_rotation":
-                self.assertEqual(label_by_key["score"], "策略 ATR 评分")
+                self.assertEqual(label_by_key["score"], "ATR 评分")
                 self.assertIn(f'{params["momentum_lookback_sessions"]} 日价格位移', help_by_key["score"])
                 self.assertIn(f'{params["atr_period"]} 日策略 ATR', help_by_key["score"])
                 self.assertAlmostEqual(
@@ -223,7 +232,7 @@ class RealtimeDashboardTests(unittest.TestCase):
                     places=10,
                 )
             else:
-                self.assertEqual(label_by_key["score"], "策略 WTME 评分")
+                self.assertEqual(label_by_key["score"], "WTME 评分")
                 self.assertIn(f'最近 {params["wtme_period"]} 个收益观测', help_by_key["weighted_return"])
                 self.assertIn(f'{params["wtme_half_life"]:g} 个交易日', help_by_key["weighted_return"])
                 epsilon = strategy["definition"]["params"]["wtme_epsilon"]
@@ -233,6 +242,102 @@ class RealtimeDashboardTests(unittest.TestCase):
                     / (row["metrics"]["weighted_true_range"] + epsilon),
                     places=10,
                 )
+
+    def test_dashboard_holding_is_hypothetical_for_every_overview_symbol(self) -> None:
+        strategy = next(
+            item for item in backtest_repository.list_strategies()
+            if item.get("code_key") == "rapid_drop_atr_rotation"
+        )
+        strategy["definition"] = {
+            **strategy["definition"],
+            "dynamic_leverage_enabled": False,
+            "symbols": [
+                {"symbol": "SPY", "max_weight": 100, "leverage_multiplier": 1.5},
+                {"symbol": "GLD", "max_weight": 100, "leverage_multiplier": 2.0},
+            ],
+            "params": {
+                **strategy["definition"]["params"],
+                "holdings_num": 1,
+                "target_weight": 80,
+            },
+        }
+        settings = {
+            **strategy["default_settings"],
+            "leverage_multiplier": 2,
+        }
+        task = realtime_repository.create_task(
+            name="all symbols hypothetical holding",
+            strategy=strategy,
+            follow_strategy=False,
+            settings=settings,
+            notification_settings={"enabled": False},
+            portfolio_state={"cash": 100000, "positions": {}},
+            panel_settings=generate_panel_settings(strategy),
+        )
+
+        payload = build_realtime_dashboard(task["id"], force=True)
+        rows = {row["symbol"]: row for row in payload["rows"]}
+
+        self.assertEqual(rows["SPY"]["holding_percent"], 240)
+        self.assertEqual(rows["GLD"]["holding_percent"], 320)
+        self.assertEqual(rows["OUTSIDE"]["holding_percent"], 160)
+        self.assertTrue(all(row["holding_percent"] is not None for row in rows.values()))
+        self.assertEqual(
+            rows["SPY"]["details"]["holding"]["effective_leverage"],
+            3,
+        )
+
+    def test_dashboard_dynamic_holding_uses_current_volatility_for_all_rows(self) -> None:
+        strategy = next(
+            item for item in backtest_repository.list_strategies()
+            if item.get("code_key") == "rapid_drop_atr_rotation"
+        )
+        strategy["definition"] = {
+            **strategy["definition"],
+            "dynamic_leverage_enabled": True,
+            "symbols": [
+                {"symbol": "SPY", "max_weight": 100, "leverage_multiplier": 9},
+                {"symbol": "GLD", "max_weight": 100, "leverage_multiplier": 9},
+            ],
+            "params": {
+                **strategy["definition"]["params"],
+                "holdings_num": 1,
+                "target_weight": 100,
+            },
+        }
+        settings = {
+            **strategy["default_settings"],
+            "leverage_multiplier": 1.5,
+            "dynamic_leverage": {
+                "volatility_period": 30,
+                "stress_days": 13,
+                "max_loss_percent": 25,
+                "max_leverage": 3,
+            },
+        }
+        task = realtime_repository.create_task(
+            name="dynamic holdings for all rows",
+            strategy=strategy,
+            follow_strategy=False,
+            settings=settings,
+            notification_settings={"enabled": False},
+            portfolio_state={"cash": 100000, "positions": {}},
+            panel_settings=generate_panel_settings(strategy),
+        )
+
+        payload = build_realtime_dashboard(task["id"], force=True)
+        for row in payload["rows"]:
+            holding = row["details"]["holding"]
+            self.assertTrue(holding["available"])
+            self.assertTrue(holding["dynamic_leverage_enabled"])
+            self.assertIsNotNone(holding["volatility"])
+            self.assertEqual(
+                row["holding_percent"],
+                holding["target_weight_percent"]
+                * holding["effective_leverage"],
+            )
+            self.assertLessEqual(holding["symbol_leverage"], 3)
+            self.assertNotEqual(holding["symbol_leverage"], 9)
 
     def test_wtme_dashboard_keeps_buy_condition_failures_in_candidate_list(self) -> None:
         strategy = next(
@@ -282,6 +387,52 @@ class RealtimeDashboardTests(unittest.TestCase):
         self.assertIn("未进入买入名单", ranked[1]["reason"])
         self.assertNotIn("已过滤", ranked[1]["reason"])
 
+    def test_wtme_hypothetical_holding_matches_linear_strategy_leverage(self) -> None:
+        strategy = next(
+            item for item in backtest_repository.list_strategies()
+            if item.get("code_key") == "rapid_drop_wtme_rotation"
+        )
+        strategy["definition"] = {
+            **strategy["definition"],
+            "dynamic_leverage_enabled": False,
+            "symbols": [
+                {"symbol": "SPY", "max_weight": 100, "leverage_multiplier": 1},
+                {"symbol": "GLD", "max_weight": 100, "leverage_multiplier": 1},
+            ],
+            "params": {
+                **strategy["definition"]["params"],
+                "allocation_mode": "leveraged_linear_rank",
+                "buy_top_n": 2,
+                "buy_score_threshold": 9999,
+                "max_simultaneous_holdings": 2,
+            },
+        }
+        task = realtime_repository.create_task(
+            name="WTME dashboard exposure",
+            strategy=strategy,
+            follow_strategy=False,
+            settings={**strategy["default_settings"], "leverage_multiplier": 2},
+            notification_settings={"enabled": False},
+            portfolio_state={"cash": 100000, "positions": {}},
+            panel_settings=generate_panel_settings(strategy),
+        )
+
+        payload = build_realtime_dashboard(task["id"], force=True)
+        ranked = sorted(
+            (row for row in payload["rows"] if row["rank"] is not None),
+            key=lambda row: row["rank"],
+        )
+        outside = next(row for row in payload["rows"] if row["symbol"] == "OUTSIDE")
+
+        self.assertEqual(len(ranked), 2)
+        self.assertAlmostEqual(ranked[0]["holding_percent"], 100 * 2 / 3 * 2 * 2)
+        self.assertAlmostEqual(ranked[1]["holding_percent"], 100 * 1 / 3 * 2 * 2)
+        self.assertAlmostEqual(outside["holding_percent"], ranked[1]["holding_percent"])
+        self.assertEqual(
+            ranked[0]["details"]["holding"]["strategy_leverage_multiplier"],
+            2,
+        )
+
     def test_visual_panel_script_is_generated_for_all_selection_modes(self) -> None:
         strategies = backtest_repository.list_strategies()
         visual_modes = {strategy["selection_mode"]: strategy for strategy in strategies if strategy["design_mode"] == "visual"}
@@ -292,6 +443,23 @@ class RealtimeDashboardTests(unittest.TestCase):
             self.assertLessEqual(len(parsed["columns"]), 12)
             if strategy["selection_mode"] == "competition":
                 self.assertIn("score", {column["key"] for column in parsed["columns"]})
+            task = realtime_repository.create_task(
+                name=f"visual {strategy['selection_mode']} dashboard",
+                strategy=strategy,
+                follow_strategy=False,
+                settings=strategy["default_settings"],
+                notification_settings={"enabled": False},
+                portfolio_state={"cash": 100000, "positions": {}},
+                panel_settings=settings,
+            )
+            payload = build_realtime_dashboard(task["id"], force=True)
+            self.assertTrue(all(
+                row["holding_percent"] is not None for row in payload["rows"]
+            ))
+            self.assertTrue(all(
+                not column["label"].startswith("策略")
+                for column in payload["columns"]
+            ))
 
     def test_visual_task_creation_stores_independent_panel_revision(self) -> None:
         strategy = next(item for item in backtest_repository.list_strategies() if item["design_mode"] == "visual")
@@ -472,6 +640,7 @@ class RealtimeDashboardTests(unittest.TestCase):
         html = client.get("/").get_data(as_text=True)
         self.assertIn('data-realtime-panel="dashboard"', html)
         self.assertIn('data-realtime-tab="parameters"', html)
+        self.assertIn('id="realtime-dynamic-rebalance-on-change"', html)
         self.assertNotIn('class="realtime-dashboard-summary"', html)
         self.assertIn('class="realtime-back-icon"', html)
         self.assertIn("按任务策略模拟最新时点，非正式决策", html)
@@ -481,6 +650,10 @@ class RealtimeDashboardTests(unittest.TestCase):
         self.assertIn('`已过滤 ${summary.filtered ?? 0}`', script)
         self.assertNotIn('<small class="realtime-reason">', script)
         self.assertIn('title="${rtEscape(row.reason', script)
+        self.assertIn('["holding_percent", "仓位"', script)
+        self.assertIn('rtFormatMetric(row.holding_percent, "percent_value")', script)
+        self.assertIn("maximumSignificantDigits: 4", script)
+        self.assertNotIn('["status", "策略状态"', script)
         self.assertIn('market-overview-auto-refresh-changed', script)
         self.assertIn('data-rt-open-symbol', script)
         self.assertIn('returnContext: "realtime-dashboard"', script)

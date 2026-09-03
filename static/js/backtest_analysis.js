@@ -237,12 +237,13 @@ function btaRenderDecision(payload) {
       return `<div class="backtest-analysis-table-row">
         <span class="backtest-analysis-cell" title="${btEscape(row.symbol || "—")}">${btEscape(row.symbol || "—")}</span>
         <span class="backtest-analysis-cell ${row.filtered ? "backtest-analysis-filtered" : "backtest-analysis-passed"}" title="${btEscape(status)}">${btEscape(status)}</span>
+        <span class="backtest-analysis-cell">${Number(row.holding_percent || 0).toFixed(2).replace(/\.00$/, "")}%</span>
         <span class="backtest-analysis-cell">${row.score == null ? "—" : Number(row.score).toFixed(2)}</span>
         <span class="backtest-analysis-cell backtest-analysis-formula" title="${btEscape(row.formula || "—")}">${btEscape(row.formula || "—")}</span>
       </div>`;
     }).join("");
     target.innerHTML = `<div class="backtest-analysis-table">
-      <div class="backtest-analysis-table-row header"><span>标的</span><span>过滤状态</span><span>评分</span><span>评分计算公式${help}</span></div>
+      <div class="backtest-analysis-table-row header"><span>标的</span><span>过滤状态</span><span>持仓</span><span>评分</span><span>评分计算公式${help}</span></div>
       ${rows}
     </div>`;
     return;
@@ -455,8 +456,11 @@ async function btaLoadRange() {
       ? bta.selectedDate : actual.actual_end_date;
     btaRenderMetrics(analysis.metrics);
     const leverageButton = document.getElementById("backtest-analysis-leverage");
-    leverageButton.title = analysis.benchmark_leverage?.dynamic_special_assumed_one
-      ? "各基准按整体杠杆 × 单标的杠杆计算；WTME 动态特殊杠杆按 1 倍假设。期间不调仓，不计融资利息和手续费。"
+    const assumed = [];
+    if (analysis.benchmark_leverage?.dynamic_symbol_assumed_one) assumed.push("VOLAT 动态单标的杠杆");
+    if (analysis.benchmark_leverage?.dynamic_special_assumed_one) assumed.push("策略动态特殊杠杆");
+    leverageButton.title = assumed.length
+      ? `各基准按整体杠杆 × 单标的杠杆 × 特殊杠杆计算；${assumed.join("、")}在固定倍数比较曲线中按 1 倍假设。期间不调仓，不计融资利息和手续费。`
       : "各基准按整体杠杆 × 单标的杠杆 × 特殊杠杆计算。期间不调仓，不计融资利息和手续费。";
     btaRenderLegend();
     btaDrawChart();

@@ -147,6 +147,28 @@ class BacktestAnalysisTests(unittest.TestCase):
         )
         self.assertEqual(payload["benchmark_leverage"]["special_multiplier"], 1)
 
+    def test_fixed_benchmark_does_not_reuse_disabled_manual_dynamic_leverage(self) -> None:
+        dates = _dates("2024-01-01", 2)
+        snapshot = _snapshot(dates=dates)
+        snapshot["run"]["settings"]["leverage_multiplier"] = 2
+        definition = snapshot["run"]["strategy_snapshot"]["definition"]
+        definition["dynamic_leverage_enabled"] = True
+        definition["symbols"] = [
+            {"symbol": "AAA", "leverage_multiplier": 7},
+            {"symbol": "BBB", "leverage_multiplier": 6},
+        ]
+        rows = [
+            {"date": dates[0], "open": 100, "high": 100, "low": 100, "close": 100, "volume": 1},
+            {"date": dates[1], "open": 110, "high": 110, "low": 110, "close": 110, "volume": 1},
+        ]
+
+        with patch.object(analysis, "_daily_rows", return_value=(rows, None)):
+            payload = analysis.build_analysis(snapshot, dates[0], dates[-1])
+
+        aaa = next(item for item in payload["series"] if item["key"] == "asset:AAA")
+        self.assertEqual(aaa["leverage_multiplier"], 2)
+        self.assertTrue(payload["benchmark_leverage"]["dynamic_symbol_assumed_one"])
+
     def test_code_competition_decision_is_sorted_and_uses_compact_formula(self) -> None:
         snapshot = _snapshot(
             design_mode="code",
@@ -163,6 +185,7 @@ class BacktestAnalysisTests(unittest.TestCase):
                     "eligible": True,
                     "annualized_returns": 3.2792,
                     "r_squared": 0.86,
+                    "holding_percent": 150,
                 },
             },
             {
@@ -185,6 +208,7 @@ class BacktestAnalysisTests(unittest.TestCase):
         self.assertEqual([row["symbol"] for row in payload["rows"]], ["BBB", "AAA"])
         self.assertTrue(payload["rows"][0]["filtered"])
         self.assertEqual(payload["rows"][1]["formula"], "327.9% × 0.86")
+        self.assertEqual(payload["rows"][1]["holding_percent"], 150)
         self.assertEqual(payload["formula_help"], "评分 = 长期年化趋势 × R²")
 
     def test_visual_competition_decision_merges_filter_and_resolved_score(self) -> None:
@@ -205,6 +229,7 @@ class BacktestAnalysisTests(unittest.TestCase):
                     "formula": "price / ma(20)",
                     "inputs": {"price": 110, "ma(20)": 100},
                     "passes_minimum_score": True,
+                    "holding_percent": 130,
                 },
             },
             {
@@ -219,6 +244,8 @@ class BacktestAnalysisTests(unittest.TestCase):
 
         self.assertEqual(payload["rows"][0]["symbol"], "AAA")
         self.assertEqual(payload["rows"][0]["formula"], "110 ÷ 100")
+        self.assertEqual(payload["rows"][0]["holding_percent"], 130)
+        self.assertEqual(payload["rows"][1]["holding_percent"], 0)
         self.assertTrue(payload["rows"][1]["filtered"])
 
     def test_visual_non_competition_decision_shows_rule_result(self) -> None:

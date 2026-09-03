@@ -18,6 +18,13 @@ SIZING_MODES = {"DELTA", "TARGET"}
 BENCHMARKS = {"none", "SPY", "GLD", "auto"}
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9^./=_-]{1,24}$")
 TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+DEFAULT_DYNAMIC_LEVERAGE_SETTINGS = {
+    "volatility_period": 30,
+    "stress_days": 13,
+    "max_loss_percent": 25.0,
+    "max_leverage": 3.0,
+    "rebalance_on_change": True,
+}
 
 DEFAULT_BACKTEST_SETTINGS = {
     "start_date": "2020-02-03",
@@ -104,6 +111,43 @@ def validate_settings(settings: dict | None) -> dict:
     value["benchmark"] = str(value["benchmark"]).strip()
     if value["benchmark"] not in BENCHMARKS:
         raise BacktestValidationError("比较基准必须为 none、SPY、GLD 或 auto。")
+    raw_dynamic = value.get("dynamic_leverage") or {}
+    if not isinstance(raw_dynamic, dict):
+        raise BacktestValidationError("dynamic_leverage 必须是设置对象。")
+    dynamic = {**DEFAULT_DYNAMIC_LEVERAGE_SETTINGS, **raw_dynamic}
+    for name, minimum, maximum in (
+        ("volatility_period", 2, 500),
+        ("stress_days", 1, 252),
+    ):
+        raw = dynamic.get(name)
+        if isinstance(raw, bool):
+            raise BacktestValidationError(f"{name} 必须是整数。")
+        try:
+            number = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise BacktestValidationError(f"{name} 必须是整数。") from exc
+        if isinstance(raw, float) and raw != number:
+            raise BacktestValidationError(f"{name} 必须是整数。")
+        if not minimum <= number <= maximum:
+            raise BacktestValidationError(f"{name} 超出允许范围。")
+        dynamic[name] = number
+    for name, minimum, maximum in (
+        ("max_loss_percent", 0.1, 100.0),
+        ("max_leverage", 1.0, 10.0),
+    ):
+        raw = dynamic.get(name)
+        if isinstance(raw, bool):
+            raise BacktestValidationError(f"{name} 必须是数值。")
+        try:
+            number = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise BacktestValidationError(f"{name} 必须是数值。") from exc
+        if not math.isfinite(number) or not minimum <= number <= maximum:
+            raise BacktestValidationError(f"{name} 超出允许范围。")
+        dynamic[name] = number
+    if not isinstance(dynamic.get("rebalance_on_change"), bool):
+        raise BacktestValidationError("rebalance_on_change 必须是布尔值。")
+    value["dynamic_leverage"] = dynamic
     return value
 
 
@@ -248,6 +292,10 @@ def validate_strategy_payload(payload: dict, *, creating: bool = False) -> dict:
         raise BacktestValidationError("选标模式不合法。")
     definition = deepcopy(payload.get("definition") or {})
     definition["symbols"] = _validate_symbols(definition, selection_mode)
+    dynamic_enabled = definition.get("dynamic_leverage_enabled", False)
+    if not isinstance(dynamic_enabled, bool):
+        raise BacktestValidationError("动态杠杆率开关必须是布尔值。")
+    definition["dynamic_leverage_enabled"] = dynamic_enabled
 
     code_key = payload.get("code_key")
     code_version = payload.get("code_version")
@@ -405,6 +453,7 @@ def default_strategy_payload(
     definition: dict[str, Any] = {
         "symbols": symbols,
         "rules": standard_rules,
+        "dynamic_leverage_enabled": False,
     }
     if selection_mode == "competition":
         definition["competition"] = {

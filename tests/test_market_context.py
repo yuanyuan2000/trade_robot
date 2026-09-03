@@ -58,12 +58,13 @@ class MarketContextTests(unittest.TestCase):
         self.assertTrue(is_cash_placeholder_symbol("USDIndex", "US_EQUITY"))
         self.assertTrue(is_cash_placeholder_symbol("us10y", {"type": "US_EQUITY"}))
         self.assertFalse(is_cash_placeholder_symbol("SPY", "US_EQUITY"))
-        self.assertTrue(
-            uses_previous_close_for_historical_intraday("US10Y", "US_EQUITY")
-        )
-        self.assertFalse(
-            uses_previous_close_for_historical_intraday("USDINDEX", "US_EQUITY")
-        )
+        for symbol in ("USDINDEX", "US10Y"):
+            with self.subTest(symbol=symbol):
+                self.assertTrue(
+                    uses_previous_close_for_historical_intraday(
+                        symbol, "US_EQUITY"
+                    )
+                )
 
 
 if __name__ == "__main__":

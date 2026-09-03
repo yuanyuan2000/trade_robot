@@ -13,7 +13,10 @@ from services.market_data_integrity import (
 )
 
 
-def strategy_history_requirements(strategy: dict) -> tuple[list[str], int]:
+def strategy_history_requirements(
+    strategy: dict,
+    settings: dict | None = None,
+) -> tuple[list[str], int]:
     definition = strategy["definition"]
     candidates = [
         str(item["symbol"]).strip().upper()
@@ -42,6 +45,12 @@ def strategy_history_requirements(strategy: dict) -> tuple[list[str], int]:
         params = strategy_type.validate_params(definition.get("params", {}))
         symbols.extend(strategy_type.additional_symbols(params))
         minimum = max(minimum, int(strategy_type.minimum_lookback(params)) + 1)
+    if definition.get("dynamic_leverage_enabled"):
+        dynamic = {
+            **(strategy.get("default_settings", {}).get("dynamic_leverage") or {}),
+            **((settings or {}).get("dynamic_leverage") or {}),
+        }
+        minimum = max(minimum, int(dynamic.get("volatility_period", 30)) + 1)
     return list(dict.fromkeys(symbols)), minimum
 
 
@@ -49,9 +58,10 @@ def prepare_strategy_history(
     strategy: dict,
     *,
     trading_date: str,
+    settings: dict | None = None,
     refresh: Callable[[str, str], object] | None = None,
 ) -> dict:
-    symbols, minimum = strategy_history_requirements(strategy)
+    symbols, minimum = strategy_history_requirements(strategy, settings)
     market = strategy.get("market")
     expected_dates = required_completed_sessions(trading_date, minimum)
     audits: dict[str, dict] = {}

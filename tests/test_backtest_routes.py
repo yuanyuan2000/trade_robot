@@ -46,6 +46,11 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertIn('id="backtest-syntax-help-open"', html)
         self.assertIn("r_square(25)", html)
         self.assertIn("bt-result-select-hitbox", script)
+        self.assertIn(
+            'BT_PREVIOUS_CLOSE_INTRADAY_SYMBOLS = new Set(["USDINDEX", "US10Y"])',
+            script,
+        )
+        self.assertIn("历史回测需要分钟级价格时，临时使用上一交易日收盘价", script)
         overview_renderer = script[
             script.index("async function loadBacktestResultsOverview"):
             script.index("async function openBacktestRunDetail")
@@ -75,6 +80,12 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertIn('id="backtest-analysis-page"', html)
         self.assertIn('id="backtest-analysis-candles"', html)
         self.assertIn('id="backtest-analysis-leverage"', html)
+        self.assertIn('id="backtest-dynamic-leverage-enabled"', html)
+        self.assertIn('id="backtest-dynamic-volatility-period"', html)
+        self.assertIn('id="backtest-dynamic-stress-days"', html)
+        self.assertIn('id="backtest-dynamic-max-loss"', html)
+        self.assertIn('id="backtest-dynamic-max-leverage"', html)
+        self.assertIn('id="backtest-dynamic-rebalance-on-change"', html)
         self.assertIn('data-months="12"', html)
         self.assertIn("backtest-analysis-progress", analysis_script)
         self.assertIn("/analysis/decision", analysis_script)
@@ -83,6 +94,7 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertIn('item.type === "strategy" ? 3.0', analysis_script)
         self.assertIn('data-series-type="${btEscape(item.type)}"', analysis_script)
         self.assertIn("leveragedBenchmarks", analysis_script)
+        self.assertIn("<span>持仓</span><span>评分</span>", analysis_script)
 
     def test_backtest_analysis_routes_forward_range_and_date_parameters(self) -> None:
         snapshot = {"run": {"id": 19}}
@@ -272,9 +284,19 @@ class BacktestRouteTests(unittest.TestCase):
             item for item in catalog.get_json()["strategies"]
             if item["key"] == "rapid_drop_wtme_rotation"
         )
-        self.assertEqual(wtme["version"], "1.9.0")
+        self.assertEqual(wtme["version"], "2.0.0")
         self.assertFalse(
             wtme["parameter_schema"]["enable_upside_sell_protection"]["default"]
+        )
+        wtme_params = wtme["parameter_schema"]
+        self.assertLess(
+            wtme["parameter_order"].index("buy_top_n"),
+            wtme["parameter_order"].index("buy_score_threshold"),
+        )
+        self.assertEqual(wtme_params["buy_condition_operator"]["default"], "or")
+        self.assertEqual(
+            wtme_params["buy_score_threshold"]["inline_prefix_parameter"],
+            "buy_condition_operator",
         )
         self.assertEqual(
             wtme["parameter_schema"]["max_simultaneous_holdings"]["default"],
@@ -353,7 +375,7 @@ class BacktestRouteTests(unittest.TestCase):
             for item in listed
             if item["code_key"] == "rapid_drop_wtme_rotation"
         )
-        self.assertEqual(wtme_strategy["code_version"], "1.9.0")
+        self.assertEqual(wtme_strategy["code_version"], "2.0.0")
         self.assertFalse(
             wtme_strategy["definition"]["params"]["enable_upside_sell_protection"]
         )

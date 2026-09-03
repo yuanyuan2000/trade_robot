@@ -17,7 +17,10 @@ from services.market_data_request_coordinator import (
     PRIORITY_FORMAL_DECISION,
     PRIORITY_OVERVIEW,
 )
-from services.realtime_history_service import prepare_strategy_history
+from services.realtime_history_service import (
+    prepare_strategy_history,
+    strategy_history_requirements,
+)
 
 
 def _daily_row(day: str, close: float, *, complete: bool = True) -> dict:
@@ -47,6 +50,28 @@ class MarketDataIntegrityTests(unittest.TestCase):
         self.data_patcher.stop()
         self.db_patcher.stop()
         self.temp_dir.cleanup()
+
+    def test_dynamic_leverage_period_expands_formal_history_requirement(self) -> None:
+        strategy = {
+            "design_mode": "visual",
+            "selection_mode": "single",
+            "definition": {
+                "symbols": [{"symbol": "SPY"}],
+                "rules": [{"enabled": True, "condition": "true"}],
+                "dynamic_leverage_enabled": True,
+            },
+            "default_settings": {
+                "dynamic_leverage": {"volatility_period": 30},
+            },
+        }
+
+        symbols, minimum = strategy_history_requirements(
+            strategy,
+            {"dynamic_leverage": {"volatility_period": 45}},
+        )
+
+        self.assertEqual(symbols, ["SPY"])
+        self.assertEqual(minimum, 46)
 
     def test_assessment_detects_missing_and_provisional_sessions(self) -> None:
         repository.upsert_symbol("SLV")

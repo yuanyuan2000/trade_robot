@@ -37,7 +37,7 @@ class BacktestIntradayGapTests(unittest.TestCase):
             patcher.stop()
         self.temp_dir.cleanup()
 
-    def test_us10y_exact_event_uses_previous_session_close_without_minutes(self) -> None:
+    def test_non_alpaca_cash_series_use_previous_close_without_minutes(self) -> None:
         trading_date = "2024-01-03"
         sessions = [{
             "trading_date": trading_date,
@@ -55,30 +55,31 @@ class BacktestIntradayGapTests(unittest.TestCase):
                 "low": 4.1, "close": 4.25, "volume": 0, "is_complete": 1,
             },
         ]
-        with (
-            patch("services.backtest.data.repository.get_daily_prices", return_value=daily),
-            patch("services.backtest.data.repository.get_symbol", return_value={"asset_class": "fixed_income"}),
-            patch("services.backtest.data.ensure_market_sessions", return_value=sessions),
-            patch("services.backtest.data.ensure_corporate_actions", return_value=[]),
-            patch("services.backtest.data.intraday_repository.get_sync_state", side_effect=AssertionError("US10Y must not request Alpaca sync state")),
-            patch("services.backtest.data.intraday_repository.get_minute_bars_at", side_effect=AssertionError("US10Y must not request minute bars")),
-        ):
-            dataset = load_historical_dataset(
-                universe=["US10Y"],
-                additional_symbols=[],
-                start_date=trading_date,
-                end_date=trading_date,
-                intraday_events=["10:00"],
-                minimum_lookback=1,
-            )
+        for symbol, asset_class in (("USDINDEX", "index"), ("US10Y", "fixed_income")):
+            with self.subTest(symbol=symbol):
+                with (
+                    patch("services.backtest.data.repository.get_daily_prices", return_value=daily),
+                    patch("services.backtest.data.repository.get_symbol", return_value={"asset_class": asset_class}),
+                    patch("services.backtest.data.ensure_market_sessions", return_value=sessions),
+                    patch("services.backtest.data.ensure_corporate_actions", return_value=[]),
+                    patch("services.backtest.data.intraday_repository.get_sync_state", side_effect=AssertionError(f"{symbol} must not request Alpaca sync state")),
+                    patch("services.backtest.data.intraday_repository.get_minute_bars_at", side_effect=AssertionError(f"{symbol} must not request minute bars")),
+                ):
+                    dataset = load_historical_dataset(
+                        universe=[symbol],
+                        additional_symbols=[],
+                        start_date=trading_date,
+                        end_date=trading_date,
+                        intraday_events=["10:00"],
+                        minimum_lookback=1,
+                    )
 
-        price = dataset.event_price("US10Y", trading_date, "10:00")
-        self.assertEqual(price.signal_price, 4.0)
-        self.assertEqual(price.fill_price, 4.0)
-        self.assertEqual(
-            dataset.manifest["symbols"]["US10Y"]["intraday_price_fallback"]["mode"],
-            "previous_session_close",
-        )
+                price = dataset.event_price(symbol, trading_date, "10:00")
+                self.assertEqual(price.signal_price, 4.0)
+                self.assertEqual(price.fill_price, 4.0)
+                fallback = dataset.manifest["symbols"][symbol]["intraday_price_fallback"]
+                self.assertEqual(fallback["mode"], "previous_session_close")
+                self.assertEqual(fallback["reason"], f"{symbol} has no Alpaca minute history")
 
     def test_sparse_halt_minutes_resolve_to_last_signal_and_first_fill(self) -> None:
         target = _epoch_minute("2020-03-09", "09:40")

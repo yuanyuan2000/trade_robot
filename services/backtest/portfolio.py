@@ -81,6 +81,10 @@ class Portfolio:
             raise BacktestOrderError("单标的杠杆倍率不能小于 1。")
         self.configured_symbol_leverage_multipliers = dict(configured_symbol_leverages)
         self.symbol_leverage_multipliers = dict(configured_symbol_leverages)
+        # Strategy-normalized targets are kept separately from market-value
+        # weights. They remain within 0..1 even when leverage and price drift
+        # push the observed normalized weight above 100%.
+        self.strategy_target_weights: dict[str, Decimal] = {}
         self.commission_per_share = D(commission_per_share)
         self.minimum_commission = D(minimum_commission)
         self.slippage_bps = D(slippage_bps)
@@ -155,6 +159,21 @@ class Portfolio:
         if normalized < ONE or normalized > Decimal("100"):
             raise BacktestOrderError("运行中的单标的杠杆倍率必须在 1 至 100 之间。")
         self.symbol_leverage_multipliers[symbol] = normalized
+
+    def set_configured_symbol_leverage_multiplier(
+        self,
+        symbol: str,
+        multiplier: float,
+    ) -> None:
+        """Replace the configured symbol layer while preserving strategy leverage."""
+        normalized = D(multiplier)
+        if normalized < ONE or normalized > Decimal("10"):
+            raise BacktestOrderError("动态单标的杠杆率必须在 1 至 10 倍之间。")
+        previous_base = self.configured_symbol_leverage_multipliers.get(symbol, ONE)
+        current = self.symbol_leverage_multipliers.get(symbol, previous_base)
+        strategy_multiplier = current / previous_base if previous_base > ZERO else ONE
+        self.configured_symbol_leverage_multipliers[symbol] = normalized
+        self.set_symbol_leverage_multiplier(symbol, normalized * strategy_multiplier)
 
     def apply_strategy_leverage_multiplier(
         self,

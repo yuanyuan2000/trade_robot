@@ -726,7 +726,7 @@ function drawIndicators(ctx, plot, priceRange) {
 }
 
 function isOscillatorIndicator(series) {
-  return ["ATR", "RATR", "LINEAR_FIT", "WTME", "RAPID_DROP", "RSI", "MACD"].includes(series.indicator_type);
+  return ["ATR", "VOLAT", "RATR", "LINEAR_FIT", "WTME", "RAPID_DROP", "RSI", "MACD"].includes(series.indicator_type);
 }
 
 function getVisibleOscillatorSeries() {
@@ -739,6 +739,7 @@ function drawOscillatorIndicators(ctx, plot, seriesList, theme) {
   const slot = plot.width / chartState.visibleCount;
   const ranges = {
     ATR: getIndicatorRange(seriesList, "ATR"),
+    VOLAT: getIndicatorRange(seriesList, "VOLAT"),
     RATR: getIndicatorRange(seriesList, "RATR", true),
     LINEAR_FIT: seriesList.some((series) => series.indicator_type === "LINEAR_FIT") ? { min: 0, max: 1 } : null,
     WTME: getIndicatorRange(seriesList, "WTME", true),
@@ -878,6 +879,11 @@ function drawOscillatorAxes(ctx, plot, ranges, theme) {
       ctx.textAlign = "left";
       ctx.fillText(value.toFixed(2), plot.right + 10, y);
     }
+    if (ranges.VOLAT) {
+      const value = ranges.VOLAT.max - (ranges.VOLAT.max - ranges.VOLAT.min) * (index / 2);
+      ctx.textAlign = "right";
+      ctx.fillText(`${value.toFixed(2)}%`, plot.right - 8, y);
+    }
     if (ranges.LINEAR_FIT) {
       const value = 1 - index / 2;
       ctx.textAlign = "left";
@@ -906,6 +912,10 @@ function drawOscillatorAxes(ctx, plot, ranges, theme) {
   if (ranges.RATR) {
     ctx.textAlign = "right";
     ctx.fillText("相对 ATR", plot.right - 6, plot.top + 4);
+  }
+  if (ranges.VOLAT) {
+    ctx.textAlign = "right";
+    ctx.fillText("VOLAT", plot.right - 6, plot.top + (ranges.RATR ? 18 : 4));
   }
   if (ranges.LINEAR_FIT) {
     ctx.textAlign = "left";
@@ -1716,6 +1726,8 @@ function renderIndicatorLegend() {
     const value = series.values[valueIndex];
     const displayValue = series.indicator_type === "MACD"
       ? `DIF ${formatIndicatorValue(series.componentValues?.line?.[valueIndex])} · DEA ${formatIndicatorValue(series.componentValues?.signal?.[valueIndex])} · 柱 ${formatIndicatorValue(series.componentValues?.histogram?.[valueIndex])}`
+      : series.indicator_type === "VOLAT"
+        ? (value == null ? "-" : `${formatIndicatorValue(value)}%`)
       : series.indicator_type === "LINEAR_FIT"
         ? formatIndicatorValue(value)
       : value == null ? "-" : formatPrice(value);

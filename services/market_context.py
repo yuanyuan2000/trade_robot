@@ -17,7 +17,7 @@ NATIVE_DAILY_SERIES = "NATIVE_DAILY"
 # they are not tradable portfolio assets.  Selecting either one represents
 # keeping the corresponding allocation in US-dollar cash.
 US_CASH_PLACEHOLDER_SYMBOLS = frozenset({"USDINDEX", "US10Y"})
-US_PREVIOUS_CLOSE_INTRADAY_SYMBOLS = frozenset({"US10Y"})
+US_PREVIOUS_CLOSE_INTRADAY_SYMBOLS = frozenset({"USDINDEX", "US10Y"})
 
 
 def is_cash_placeholder_symbol(

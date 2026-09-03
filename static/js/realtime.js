@@ -182,6 +182,9 @@ function renderRealtimeDetail() {
   document.getElementById("realtime-follow").checked = Boolean(task.follow_strategy);
   document.getElementById("realtime-capital").value = task.settings?.initial_capital ?? 100000;
   document.getElementById("realtime-leverage").value = task.settings?.leverage_multiplier ?? 1;
+  const dynamicLeverageEnabled = Boolean(task.strategy_snapshot?.definition?.dynamic_leverage_enabled);
+  document.getElementById("realtime-dynamic-rebalance-field").hidden = !dynamicLeverageEnabled;
+  document.getElementById("realtime-dynamic-rebalance-on-change").checked = task.settings?.dynamic_leverage?.rebalance_on_change !== false;
   document.getElementById("realtime-strategy-summary").textContent = `${task.strategy_snapshot?.name || ""}\n设计模式：${task.strategy_snapshot?.design_mode || ""}\n选标模式：${task.strategy_snapshot?.selection_mode || ""}\n正式候选池：${(task.strategy_snapshot?.definition?.symbols || []).map((item) => item.symbol).join(", ")}`;
   document.getElementById("realtime-definition-json").value = JSON.stringify(task.strategy_snapshot?.definition || {}, null, 2);
   const visual = task.strategy_snapshot?.design_mode === "visual";
@@ -201,7 +204,7 @@ function renderRealtimeDetail() {
   preview.hidden = visual || Boolean(notification.body_template);
   preview.textContent = preview.hidden ? "" : rtCodeBodyPreview(task.strategy_snapshot);
   const running = ["starting", "running", "degraded", "stopping"].includes(task.runtime_state);
-  ["realtime-name", "realtime-capital", "realtime-leverage", "realtime-follow", "realtime-definition-json", "realtime-save"].forEach((id) => {
+  ["realtime-name", "realtime-capital", "realtime-leverage", "realtime-dynamic-rebalance-on-change", "realtime-follow", "realtime-definition-json", "realtime-save"].forEach((id) => {
     document.getElementById(id).disabled = running || (id === "realtime-definition-json" && Boolean(task.follow_strategy));
   });
   ["realtime-mail-enabled", "realtime-channel", "realtime-recipients", "realtime-subject-template", "realtime-body-template", "realtime-save-mail"].forEach((id) => {
@@ -235,9 +238,10 @@ function rtFormatMetric(value, format) {
   if (format === "boolean") return value ? "是" : "否";
   const number = Number(value);
   if (!Number.isFinite(number)) return rtEscape(value);
-  if (format === "percent") return `${(number * 100).toFixed(2)}%`;
-  if (format === "price") return number.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
-  return number.toLocaleString("zh-CN", { maximumFractionDigits: 6 });
+  const formatNumber = (input) => input.toLocaleString("zh-CN", { maximumSignificantDigits: 4 });
+  if (format === "percent") return `${formatNumber(number * 100)}%`;
+  if (format === "percent_value") return `${formatNumber(number)}%`;
+  return formatNumber(number);
 }
 
 function rtSortRows(rows) {
@@ -280,8 +284,9 @@ function renderRealtimeDashboardTable() {
   const columns = dashboard.columns || [];
   const headers = [
     ["symbol", "标的", "展示行情总览中的全部标的；蓝点表示属于当前任务候选池。"],
-    ["status", "策略状态", "仅代表当前价下的面板观察结果，不等同于正式邮件决策。"],
+    ["status", "状态", "仅代表当前价下的面板观察结果，不等同于正式邮件决策。"],
     ["latest_price", "最新价格", "直接读取行情总览内部数据库。"],
+    ["holding_percent", "仓位", "若此刻买入该标的，按当前策略目标权重、整体杠杆、单标的杠杆及策略附加杠杆计算的持仓敞口；正式入选时与决策邮件口径一致。"],
     ...columns.map((column) => [column.key, column.label, column.help]),
     ["rank", "面板排名", "只在行情总览展示范围内排名，不改变正式任务目标。"],
     ["price_updated_at", "更新时间", "内部数据库中该价格的更新时间。"],
@@ -292,6 +297,7 @@ function renderRealtimeDashboardTable() {
       <td><span class="realtime-symbol-cell">${row.is_candidate ? '<i class="realtime-candidate-dot" title="属于当前任务候选池" aria-label="属于当前任务候选池"></i>' : '<i class="realtime-candidate-dot is-empty" aria-hidden="true"></i>'}<button class="realtime-symbol-link" type="button" data-rt-open-symbol="${rtEscape(row.symbol)}" title="查看 ${rtEscape(row.display_symbol || row.symbol)} K线详情"><strong>${rtEscape(row.display_symbol || row.symbol)}</strong>${row.name && row.name !== row.display_symbol ? `<small>${rtEscape(row.name)}</small>` : ""}</button></span></td>
       <td><span class="realtime-status-pill realtime-status-${row.status === "通过" ? "ok" : row.status === "不可计算" ? "na" : row.status === "观察" ? "watch" : "filter"}" title="${rtEscape(row.reason && row.reason !== "—" ? row.reason : row.status)}" aria-label="${rtEscape(row.reason && row.reason !== "—" ? `${row.status}：${row.reason}` : row.status)}">${rtEscape(row.status)}</span></td>
       <td>${rtFormatMetric(row.latest_price, "price")}</td>
+      <td><strong>${rtFormatMetric(row.holding_percent, "percent_value")}</strong></td>
       ${columns.map((column) => `<td>${rtFormatMetric(row.metrics?.[column.key], column.format)}</td>`).join("")}
       <td>${row.rank ? `<strong>#${row.rank}</strong>${row.selected_for_target ? '<span class="realtime-target-badge">面板目标</span>' : ""}` : "—"}</td>
       <td><span class="realtime-updated-at">${rtEscape(rtDate(row.price_updated_at || row.data_date))}</span></td>
@@ -353,7 +359,15 @@ async function saveRealtimeTask() {
     name: document.getElementById("realtime-name").value.trim(),
     follow_strategy: follow,
     strategy_snapshot: snapshot,
-    settings: { ...task.settings, initial_capital: Number(document.getElementById("realtime-capital").value), leverage_multiplier: Number(document.getElementById("realtime-leverage").value) },
+    settings: {
+      ...task.settings,
+      initial_capital: Number(document.getElementById("realtime-capital").value),
+      leverage_multiplier: Number(document.getElementById("realtime-leverage").value),
+      dynamic_leverage: {
+        ...(task.settings?.dynamic_leverage || {}),
+        rebalance_on_change: document.getElementById("realtime-dynamic-rebalance-on-change").checked,
+      },
+    },
     notification_settings: {
       enabled: document.getElementById("realtime-mail-enabled").checked,
       channel_id: Number(document.getElementById("realtime-channel").value) || null,
