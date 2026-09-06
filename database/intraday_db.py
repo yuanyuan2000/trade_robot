@@ -76,6 +76,17 @@ def init_intraday_database() -> None:
                     "ADD COLUMN minute_history_start_verified "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            minute_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(minute_bars)"
+                ).fetchall()
+            }
+            if "is_synthetic" not in minute_columns:
+                conn.execute(
+                    "ALTER TABLE minute_bars "
+                    "ADD COLUMN is_synthetic INTEGER NOT NULL DEFAULT 0"
+                )
             conn.executemany(
                 """
                 UPDATE intraday_instruments

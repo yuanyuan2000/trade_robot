@@ -69,14 +69,9 @@ def _restore_portfolio(portfolio: Portfolio, state: dict | None) -> None:
     New realtime runs use `_restore_recommendation_state`; this narrow helper
     remains for old snapshots and callers that only need leverage migration.
     """
-    raw = dict(state or {})
-    configured = dict(raw.get("configured_symbol_leverage_multipliers") or {})
-    effective = dict(raw.get("symbol_leverage_multipliers") or {})
-    if not configured:
-        configured = {
-            str(symbol): min(10.0, float(multiplier))
-            for symbol, multiplier in effective.items()
-        }
+    normalized = normalize_recommendation_state(state)
+    configured = normalized["configured_symbol_leverage_multipliers"]
+    effective = normalized["symbol_leverage_multipliers"]
     for symbol, multiplier in configured.items():
         portfolio.set_configured_symbol_leverage_multiplier(symbol, float(multiplier))
     for symbol, multiplier in effective.items():
@@ -130,22 +125,22 @@ def _restore_recommendation_state(
 
 def _recommendation_state(
     portfolio: Portfolio,
-    holdings: dict[str, float],
+    exposures: dict[str, float],
 ) -> dict:
     targets = {
         str(symbol): float(weight) * 100.0
         for symbol, weight in portfolio.strategy_target_weights.items()
         if float(weight) > 1e-12
     }
-    exposures = {
+    normalized_exposures = {
         str(symbol): float(percent)
-        for symbol, percent in holdings.items()
+        for symbol, percent in exposures.items()
         if float(percent) > 1e-12
     }
     return {
         "state_version": 2,
         "recommended_targets": targets,
-        "recommended_exposures": exposures,
+        "recommended_exposures": normalized_exposures,
         "configured_symbol_leverage_multipliers": {
             str(symbol): float(value)
             for symbol, value in portfolio.configured_symbol_leverage_multipliers.items()
@@ -494,14 +489,14 @@ class RealtimeDecisionEvaluator:
                 "effective_leverage": float(
                     engine.portfolio.effective_leverage(intent.symbol)
                 ),
-                "holding_percent": float(
-                    engine.last_decision_holdings.get(intent.symbol, 0.0)
+                "target_exposure_percent": float(
+                    engine.last_decision_exposures.get(intent.symbol, 0.0)
                 ),
                 "reason": intent.reason,
             })
         recommendation_state = _recommendation_state(
             engine.portfolio,
-            engine.last_decision_holdings,
+            engine.last_decision_exposures,
         )
         persisted_recommendation_state = recommendation_state
         if event == "CLOSE":

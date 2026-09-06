@@ -359,6 +359,8 @@ CREATE TABLE IF NOT EXISTS backtest_trades (
     cash_after REAL NOT NULL,
     position_quantity_after REAL NOT NULL,
     position_value_after REAL NOT NULL,
+    strategy_position_weight_after REAL,
+    position_exposure_after REAL,
     position_weight_after REAL NOT NULL,
     reason TEXT,
     FOREIGN KEY(run_id) REFERENCES backtest_runs(id),

@@ -238,6 +238,7 @@ def upsert_minute_bars(
                 float(row.get("volume") or 0),
                 int(row["trade_count"]) if row.get("trade_count") is not None else None,
                 scale_price(row["vwap"]) if row.get("vwap") is not None else None,
+                int(bool(row.get("is_synthetic", False))),
             )
         )
 
@@ -248,9 +249,9 @@ def upsert_minute_bars(
                 INSERT INTO minute_bars (
                     instrument_id, minute_utc,
                     open_scaled, high_scaled, low_scaled, close_scaled,
-                    volume, trade_count, vwap_scaled
+                    volume, trade_count, vwap_scaled, is_synthetic
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(instrument_id, minute_utc) DO UPDATE SET
                     open_scaled = excluded.open_scaled,
                     high_scaled = excluded.high_scaled,
@@ -258,7 +259,8 @@ def upsert_minute_bars(
                     close_scaled = excluded.close_scaled,
                     volume = excluded.volume,
                     trade_count = excluded.trade_count,
-                    vwap_scaled = excluded.vwap_scaled
+                    vwap_scaled = excluded.vwap_scaled,
+                    is_synthetic = excluded.is_synthetic
                 """,
                 payload,
             )
@@ -548,6 +550,7 @@ def get_storage_quality_summary(symbol: str) -> dict:
         return {
             "symbol": normalize_symbol(symbol),
             "row_count": 0,
+            "synthetic_row_count": 0,
             "invalid_ohlc_rows": 0,
             "negative_value_rows": 0,
             "fingerprint_months": 0,
@@ -559,6 +562,8 @@ def get_storage_quality_summary(symbol: str) -> dict:
                 COUNT(*) AS row_count,
                 MIN(minute_utc) AS first_minute_utc,
                 MAX(minute_utc) AS last_minute_utc,
+                SUM(CASE WHEN is_synthetic = 1 THEN 1 ELSE 0 END)
+                    AS synthetic_row_count,
                 SUM(CASE
                     WHEN low_scaled > high_scaled
                       OR open_scaled < low_scaled
@@ -589,6 +594,7 @@ def get_storage_quality_summary(symbol: str) -> dict:
     result = dict(row)
     result["symbol"] = instrument["symbol"]
     result["row_count"] = int(result["row_count"] or 0)
+    result["synthetic_row_count"] = int(result["synthetic_row_count"] or 0)
     result["invalid_ohlc_rows"] = int(result["invalid_ohlc_rows"] or 0)
     result["negative_value_rows"] = int(result["negative_value_rows"] or 0)
     result["fingerprint_months"] = fingerprint_months
@@ -634,7 +640,8 @@ def get_minute_bars(
         rows = conn.execute(
             f"""
             SELECT minute_utc, open_scaled, high_scaled, low_scaled,
-                   close_scaled, volume, trade_count, vwap_scaled
+                   close_scaled, volume, trade_count, vwap_scaled,
+                   is_synthetic
             FROM minute_bars
             WHERE {' AND '.join(clauses)}
             ORDER BY minute_utc {order}
@@ -653,6 +660,7 @@ def get_minute_bars(
             "volume": float(row["volume"]),
             "trade_count": row["trade_count"],
             "vwap": unscale_price(row["vwap_scaled"]),
+            "is_synthetic": bool(row["is_synthetic"]),
         }
         for row in rows
     ]
@@ -675,7 +683,8 @@ def get_minute_bars_at(
             rows = conn.execute(
                 f"""
                 SELECT minute_utc, open_scaled, high_scaled, low_scaled,
-                       close_scaled, volume, trade_count, vwap_scaled
+                       close_scaled, volume, trade_count, vwap_scaled,
+                       is_synthetic
                 FROM minute_bars
                 WHERE instrument_id = ?
                   AND minute_utc IN ({placeholders})
@@ -694,6 +703,7 @@ def get_minute_bars_at(
                     "volume": float(row["volume"]),
                     "trade_count": row["trade_count"],
                     "vwap": unscale_price(row["vwap_scaled"]),
+                    "is_synthetic": bool(row["is_synthetic"]),
                 }
     return result
 
@@ -828,7 +838,8 @@ def iter_minute_bars(
         cursor = conn.execute(
             f"""
             SELECT minute_utc, open_scaled, high_scaled, low_scaled,
-                   close_scaled, volume, trade_count, vwap_scaled
+                   close_scaled, volume, trade_count, vwap_scaled,
+                   is_synthetic
             FROM minute_bars
             WHERE {' AND '.join(clauses)}
             ORDER BY minute_utc ASC
@@ -850,6 +861,7 @@ def iter_minute_bars(
                     "volume": float(row["volume"]),
                     "trade_count": row["trade_count"],
                     "vwap": unscale_price(row["vwap_scaled"]),
+                    "is_synthetic": bool(row["is_synthetic"]),
                 }
 
 
@@ -974,7 +986,8 @@ def recompute_monthly_fingerprint(symbol: str, year_month: str) -> dict | None:
         rows = conn.execute(
             """
             SELECT minute_utc, open_scaled, high_scaled, low_scaled,
-                   close_scaled, volume, trade_count, vwap_scaled
+                   close_scaled, volume, trade_count, vwap_scaled,
+                   is_synthetic
             FROM minute_bars
             WHERE instrument_id = ?
               AND minute_utc >= ?
@@ -1003,8 +1016,9 @@ def recompute_monthly_fingerprint(symbol: str, year_month: str) -> dict | None:
             encoded_volume,
             int(row["trade_count"] or 0),
             int(row["vwap_scaled"] or 0),
+            int(row["is_synthetic"] or 0),
         ]
-        digest.update(struct.pack(">8q", *values))
+        digest.update(struct.pack(">9q", *values))
     result = {
         "instrument_id": int(instrument["id"]),
         "year_month": year_month,

@@ -3173,7 +3173,7 @@ td {
 
 .backtest-analysis-table-row {
   display: grid;
-  grid-template-columns: minmax(65px, .8fr) minmax(100px, 1.2fr) minmax(58px, .65fr) minmax(54px, .6fr) minmax(150px, 1.8fr);
+  grid-template-columns: minmax(65px, .8fr) minmax(72px, .75fr) minmax(58px, 1.1fr) minmax(54px, .6fr) minmax(150px, 1.8fr);
   align-items: center;
   min-height: 30px;
   gap: 8px;

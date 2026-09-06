@@ -13,6 +13,7 @@ FUTUBULL_DIR = ROOT / "other_platform" / "futubull"
 STRATEGY_FILES = (
     "rapid_drop_ratr_rotation.py",
     "rapid_drop_wtme_rotation.py",
+    "rapid_drop_wtme_rotation_v2.py",
     "sevenstar_etf_rotation.py",
 )
 
@@ -54,6 +55,7 @@ class FutubullStrategySourceTests(unittest.TestCase):
         expected_counts = {
             "rapid_drop_ratr_rotation.py": 7,
             "rapid_drop_wtme_rotation.py": 8,
+            "rapid_drop_wtme_rotation_v2.py": 8,
             "sevenstar_etf_rotation.py": 8,
         }
         for filename, expected in expected_counts.items():
@@ -157,6 +159,33 @@ class FutubullStrategyFormulaTests(unittest.TestCase):
         project_rows.append({"date": "current", "high": max(previous_close, current), "low": min(previous_close, current), "close": current})
         components = calculate_wtme_components(project_rows, period, half_life, epsilon)
         self.assertAlmostEqual(actual, components["value"], places=12)
+
+    def test_wtme_v2_partial_observation_and_dynamic_leverage(self):
+        strategy_type, _source = _load_strategy("rapid_drop_wtme_rotation_v2.py")
+        strategy = strategy_type()
+        rows = [
+            [101.0, 99.0, 100.0],
+            [103.0, 100.0, 102.0],
+            [104.0, 101.0, 103.0],
+            [106.0, 102.0, 105.0],
+        ]
+        actual = strategy._wtme_score(rows, 104.0, 4, 2.0, 1e-8)
+        project_rows = []
+        for index, row in enumerate(rows):
+            project_rows.append({"date": str(index), "high": row[0], "low": row[1], "close": row[2]})
+        project_rows.append({"date": "current", "high": 105.0, "low": 104.0, "close": 104.0})
+        expected = calculate_wtme_components(project_rows, 4, 2.0, 1e-8)
+        self.assertAlmostEqual(actual, expected["value"], places=12)
+
+        strategy.enable_volat_dynamic_leverage = True
+        strategy.volatility_period = 4
+        strategy.stress_days = 10
+        strategy.max_loss_percent = 40.0
+        strategy.max_dynamic_leverage = 5.0
+        leverage = strategy._dynamic_leverage(rows, 104.0)
+        self.assertGreaterEqual(leverage, 1.0)
+        self.assertLessEqual(leverage, 5.0)
+        self.assertAlmostEqual(leverage * 10, round(leverage * 10), places=10)
 
     def test_sevenstar_consistent_and_legacy_formulas_match_project(self):
         strategy_type, _source = _load_strategy("sevenstar_etf_rotation.py")

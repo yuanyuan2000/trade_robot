@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 from typing import Any
 
 from services.backtest.validation import default_backtest_settings, validate_settings
@@ -105,13 +106,51 @@ def empty_recommendation_state() -> dict:
 
 def normalize_recommendation_state(value: dict | None) -> dict:
     """Read new target state and migrate legacy simulated portfolio snapshots."""
+    def bounded_multiplier(raw_value: Any, maximum: float) -> float:
+        try:
+            number = float(raw_value)
+        except (TypeError, ValueError):
+            return 1.0
+        if not math.isfinite(number):
+            return 1.0
+        return min(maximum, max(1.0, number))
+
     raw = dict(value or {})
     if int(raw.get("state_version") or 0) >= 2:
+        effective = {
+            str(symbol): bounded_multiplier(multiplier, 100.0)
+            for symbol, multiplier in (
+                raw.get("symbol_leverage_multipliers") or {}
+            ).items()
+        }
+        configured = {
+            str(symbol): bounded_multiplier(multiplier, 10.0)
+            for symbol, multiplier in (
+                raw.get("configured_symbol_leverage_multipliers") or {}
+            ).items()
+        }
+        # Early v2 snapshots could contain an effective value but omit its
+        # configured-layer counterpart. Treat each such value as the last
+        # configured dynamic leverage. Otherwise the next recalculation
+        # divides it by an unrelated manual default and can infer a sub-one
+        # (or compounding) strategy layer.
+        for symbol, multiplier in effective.items():
+            if symbol not in configured:
+                # Missing configured state is the signature of early v2. Its
+                # effective value was repeatedly compounded in some runs and
+                # can already exceed Portfolio's 1..100 runtime guard. There
+                # was no separately recoverable strategy layer, so reset both
+                # values to the valid dynamic layer instead of retaining the
+                # corrupted product.
+                configured[symbol] = bounded_multiplier(multiplier, 10.0)
+                effective[symbol] = configured[symbol]
         return {
             **empty_recommendation_state(),
             **raw,
             "recommended_targets": dict(raw.get("recommended_targets") or {}),
             "recommended_exposures": dict(raw.get("recommended_exposures") or {}),
+            "configured_symbol_leverage_multipliers": configured,
+            "symbol_leverage_multipliers": effective,
         }
 
     targets = dict(raw.get("strategy_target_weights") or {})
@@ -134,14 +173,26 @@ def normalize_recommendation_state(value: dict | None) -> dict:
         for symbol, weight in exposures.items()
         if float(weight) > 0
     }
+    legacy_configured = {
+        str(symbol): bounded_multiplier(multiplier, 10.0)
+        for symbol, multiplier in (
+            raw.get("configured_symbol_leverage_multipliers") or {}
+        ).items()
+    }
+    legacy_effective = {
+        str(symbol): bounded_multiplier(multiplier, 100.0)
+        for symbol, multiplier in (
+            raw.get("symbol_leverage_multipliers") or {}
+        ).items()
+    }
+    for symbol, multiplier in legacy_effective.items():
+        if symbol not in legacy_configured:
+            legacy_configured[symbol] = bounded_multiplier(multiplier, 10.0)
+            legacy_effective[symbol] = legacy_configured[symbol]
     return {
         **empty_recommendation_state(),
         "recommended_targets": normalized_targets,
         "recommended_exposures": normalized_exposures,
-        "configured_symbol_leverage_multipliers": dict(
-            raw.get("configured_symbol_leverage_multipliers") or {}
-        ),
-        "symbol_leverage_multipliers": dict(
-            raw.get("symbol_leverage_multipliers") or {}
-        ),
+        "configured_symbol_leverage_multipliers": legacy_configured,
+        "symbol_leverage_multipliers": legacy_effective,
     }

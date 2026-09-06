@@ -6,7 +6,7 @@
 
 | 类型 | 典型输出 | 适合用途 | 本项目示例 |
 | --- | --- | --- | --- |
-| 技术指标公式 | 数值、曲线、文字 | 单标的评分、状态、固定池看板 | `WTMES`、`WTMEPOOLDASHM` |
+| 技术指标公式 | 数值、曲线、文字 | 单标的评分、状态、固定池看板 | `WTMES`、`WTMEPOOLUS`、`WTMEPOOLUSM` |
 | 条件选股公式 | 单一真假条件，通常命名 `XG` | 在入口提供的候选范围内筛选 | `WTMETOPN`、`WTMEAPPXG` |
 | 专家系统公式 | 买卖信号 | 回测或交易信号 | 本目录不需要 |
 
@@ -54,10 +54,10 @@
 - 按输出序号引用时，输出顺序就是接口，不能随意调整。
 - 条件选股公式尽量自包含，减少对子公式、板块和客户端本地状态的依赖。
 
-评分存在合法负数时，不要用 `0` 代表“不合格”。应使用评分范围外的哨兵，例如本项目 WTME 用 `-999`：
+评分存在合法负数时，不要用 `0` 代表“不合格”。本项目 WTME 使用 `-100` 作为哨兵：
 
 ```text
-SORTV:IF(VALID AND ELIG,WTME,-999);
+SORTV:IF(VALID AND ELIG,WTME,-100);
 ```
 
 ## 4. 板块排名与选股
@@ -97,11 +97,37 @@ V:=CALCSTOCKINDEX('SH518880','WTMEAPPSORT',1);
 V:=SH518880$WTMEAPPSORT.SORTV;
 ```
 
+美股不能只把 `SH518880` 改成裸代码 `GLD`。通达信跨证券引用需要市场号，美股统一市场号
+为 `74`。但实机复核发现：部分 PC 版本虽然能编译下面的 `$` 自定义指标命名输出，运行时却会
+把全部结果读成无效值：
+
+```text
+V:="74_GLD$WTMEAPPSORT.WTMEV"; {部分PC版本不可用}
+```
+
+进一步实机复核发现，直接跨标的读取 `CLOSE/HIGH/LOW` 会在该 PC 环境中被扩展为常量序列，
+表现为九只标的 WTME 全为 0、同分规则误选 XLE、零波动对应 500% 敞口。最终方案不增加
+辅助公式，而是完全参照已成功的 A 股 PC 看板读取 `WTMEAPPSORT` 第一个输出：
+
+```text
+WTME:=CALCSTOCKINDEX('74_GLD','WTMEAPPSORT',1);
+```
+
+第一个输出是已完成历史与急跌过滤的 `SORTV`，读取后与 A 股版一样先用 `ISVALID` 检查。
+动态杠杆仍从同一指标第 4 个输出读取，但其无效只会令敞口为 0，不会隐藏 WTME 行。
+
+文件固定读取当前 WTME 美股池：DRAM、FXI、GLD、IBIT、QQQ、SLV、SOXX、SPY、XLE；项目
+中的 BTC/USD 用 IBIT 替代，US10Y 不引入。看板对全部历史
+足够的标的显示原始 WTME 分数，不再因急跌过滤而只显示“无合格标的”；策略真正选中的一只
+显示黄色，并同时输出“建议敞口%”（100% 仓位乘动态杠杆）。使用前必须在通达信下载这些
+证券的日线数据，并确认 `WTMEAPPSORT` 在每只证券的同一日线周期可单独输出。
+
 要点：
 
-1. 先创建并上传被引用的辅助指标 `WTMEAPPSORT`。
-2. 辅助指标最好只有一个稳定输出，降低 APP 解析差异。
-3. 再上传使用 `$` 的看板公式。
+1. 创建或更新现有 `WTMEAPPSORT`，不设置参数。
+2. 在 GLD 日线确认它的 `SORTV` 正常。
+3. PC 创建 `WTMEPOOLUS`；移动端创建 `WTMEPOOLUSM`。两者都不需要其他辅助公式。
+4. 两版均按全局名次分两列显示：第 1—5 名在左，第 6—9 名在右。
 4. 固定小池可在副图内直接比较各证券的输出，无须依赖 APP 条件选股候选宇宙。
 5. 若数值未加载，先逐一打开池内证券的相同周期 K 线。
 
@@ -114,7 +140,7 @@ PC 与 APP 支持情况以本次实测为准：
 | `INBLOCK / INSORT` 自定义板块排名 | 可用 | 本次不可靠 |
 | `CALCSTOCKINDEX` | 可用 | 编译器不支持 |
 | `ISVALID` | 可用 | 编译器不支持 |
-| `代码$指标.输出` | 可用语法 | 本次已验证可用 |
+| `代码$指标.输出` | 可编译，但美股自定义输出实测可能无值 | 本次已验证可用 |
 
 ## 6. APP 条件选股的候选宇宙陷阱
 
@@ -163,7 +189,7 @@ DRAWNUMBER_FIX(COND,X,Y,TYPE,VALUE);
 - “某个操作数没有相应操作符”：常见于公式引用无法解析、中文标点、引号错误或入口不支持该语法。
 - PC 成功、APP 失败：先按两个不同编译器处理，不要假定函数集合相同。
 - APP 仍运行旧代码：新建一个公式名测试，可避开上传缓存；确认后再整理名称。
-- 分数全是 `-999`：检查历史长度、急跌条件、参数缺省值以及被引用指标能否单独运行。
+- 分数全是 `-100`：检查历史长度、急跌条件、参数缺省值以及目标证券行情能否读取。
 - 选股结果少于预期：先做 `XG:1` 候选宇宙测试。
 - 公式编译成功但跨证券无数值：打开对应证券 K 线并检查相同周期数据。
 
@@ -180,7 +206,7 @@ DRAWNUMBER_FIX(COND,X,Y,TYPE,VALUE);
 ## 11. 官方语法参考
 
 - [通达信官方函数列表](https://help.tdx.com.cn/gspt/docs/markdown/redword/functionlist.html)
+- [通达信官方市场枚举（美股市场号 74）](https://help.tdx.com.cn/quant/docs/markdown/Dict.html)
 - [技术指标公式](https://help.tdx.com.cn/gspt/docs/markdown/tdxgs-gsxt/tdxgs-1d1knga9g35l0.html)
 - [条件选股公式](https://help.tdx.com.cn/gspt/docs/markdown/tdxgs-gsxt/tdxgs-1d1kngjqe0gck.html)
 - [固定位置显示文字和数字](https://help.tdx.com.cn/gspt/docs/markdown/tdxgs-1d1k7biu16p6s/tdxgs-1d1p8n2edn4io.html)
-

@@ -208,8 +208,41 @@ class BacktestAnalysisTests(unittest.TestCase):
         self.assertEqual([row["symbol"] for row in payload["rows"]], ["BBB", "AAA"])
         self.assertTrue(payload["rows"][0]["filtered"])
         self.assertEqual(payload["rows"][1]["formula"], "327.9% × 0.86")
-        self.assertEqual(payload["rows"][1]["holding_percent"], 150)
+        self.assertEqual(payload["rows"][1]["exposure_percent"], 150)
         self.assertEqual(payload["formula_help"], "评分 = 长期年化趋势 × R²")
+
+    def test_dynamic_without_rebalance_exposes_calculated_and_actual_exposure(self) -> None:
+        snapshot = _snapshot(
+            design_mode="code",
+            code_key="rapid_drop_wtme_rotation",
+        )
+        snapshot["run"]["settings"]["dynamic_leverage"] = {
+            "rebalance_on_change": False,
+        }
+        snapshot["run"]["strategy_snapshot"]["definition"][
+            "dynamic_leverage_enabled"
+        ] = True
+        snapshot["logs"] = [{
+            "event_time": "2024-01-03 10:00",
+            "event_type": "RAPID_DROP_WTME_DAILY_SCORE",
+            "symbol": "AAA",
+            "context": {
+                "symbol": "AAA",
+                "score": 1,
+                "eligible": True,
+                "weighted_return": 0.1,
+                "weighted_true_range": 0.2,
+                "exposure_percent": 189.87,
+                "actual_exposure_percent": 189.87,
+                "calculated_exposure_percent": 170.0,
+            },
+        }]
+
+        payload = analysis.build_decision(snapshot, "2024-01-03")
+
+        self.assertTrue(payload["show_calculated_and_actual_exposure"])
+        self.assertEqual(payload["rows"][0]["calculated_exposure_percent"], 170)
+        self.assertEqual(payload["rows"][0]["actual_exposure_percent"], 189.87)
 
     def test_visual_competition_decision_merges_filter_and_resolved_score(self) -> None:
         snapshot = _snapshot()
@@ -229,7 +262,7 @@ class BacktestAnalysisTests(unittest.TestCase):
                     "formula": "price / ma(20)",
                     "inputs": {"price": 110, "ma(20)": 100},
                     "passes_minimum_score": True,
-                    "holding_percent": 130,
+                    "exposure_percent": 130,
                 },
             },
             {
@@ -244,8 +277,8 @@ class BacktestAnalysisTests(unittest.TestCase):
 
         self.assertEqual(payload["rows"][0]["symbol"], "AAA")
         self.assertEqual(payload["rows"][0]["formula"], "110 ÷ 100")
-        self.assertEqual(payload["rows"][0]["holding_percent"], 130)
-        self.assertEqual(payload["rows"][1]["holding_percent"], 0)
+        self.assertEqual(payload["rows"][0]["exposure_percent"], 130)
+        self.assertEqual(payload["rows"][1]["exposure_percent"], 0)
         self.assertTrue(payload["rows"][1]["filtered"])
 
     def test_visual_non_competition_decision_shows_rule_result(self) -> None:

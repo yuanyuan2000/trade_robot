@@ -357,6 +357,171 @@ def get_chart_bars(
     }
 
 
+def repair_sparse_regular_session_minutes(
+    symbol: str,
+    *,
+    completed_through: str | None = None,
+) -> dict:
+    """Forward-fill zero-trade US-equity minutes without inventing trades.
+
+    Alpaca trade bars omit minutes in which no trade occurred.  A flat,
+    zero-volume synthetic bar makes the last observable price available to
+    point-in-time signals and to an explicitly simulated last-price fill.
+    ``is_synthetic`` preserves that assumption for audit and keeps these rows
+    out of daily OHLCV derivation.
+    """
+    normalized = symbol.strip().upper()
+    instrument = intraday_repository.get_instrument(normalized) or {}
+    sync_state = intraday_repository.get_sync_state(normalized)
+    if (
+        not instrument
+        or instrument.get("asset_class") != "us_equity"
+        or not sync_state.get("earliest_minute_at")
+        or not sync_state.get("latest_minute_at")
+    ):
+        return {
+            "symbol": normalized,
+            "synthetic_rows_added": 0,
+            "sessions_repaired": 0,
+            "sessions_without_trades": 0,
+        }
+
+    start_date = str(sync_state["earliest_minute_at"])[:10]
+    end_date = str(sync_state["latest_minute_at"])[:10]
+    from services.backtest.market_calendar import ensure_market_sessions
+
+    sessions = ensure_market_sessions(start_date, end_date)
+    completed_minute = (
+        intraday_repository.iso_to_epoch_minute(completed_through)
+        if completed_through
+        else int(sync_state.get("latest_complete_minute_utc") or 0)
+    )
+    sessions = [
+        item for item in sessions
+        if int(item["close_minute_utc"]) <= completed_minute
+    ]
+    if not sessions:
+        return {
+            "symbol": normalized,
+            "synthetic_rows_added": 0,
+            "sessions_repaired": 0,
+            "sessions_without_trades": 0,
+        }
+
+    daily_rows = repository.get_daily_prices(normalized)
+    daily_rows = sorted(
+        (
+            row for row in daily_rows
+            if row.get("date") and row.get("close") is not None
+        ),
+        key=lambda row: str(row["date"]),
+    )
+    prior_close_by_date: dict[str, float] = {}
+    daily_index = 0
+    prior_close = None
+    for session in sessions:
+        trading_date = str(session["trading_date"])
+        while (
+            daily_index < len(daily_rows)
+            and str(daily_rows[daily_index]["date"]) < trading_date
+        ):
+            close = float(daily_rows[daily_index]["close"])
+            if close > 0:
+                prior_close = close
+            daily_index += 1
+        if prior_close is not None:
+            prior_close_by_date[trading_date] = prior_close
+
+    first_minute = int(sessions[0]["open_minute_utc"])
+    last_minute = int(sessions[-1]["close_minute_utc"]) - 1
+    source = iter(
+        intraday_repository.iter_minute_bars(
+            normalized,
+            start_minute=first_minute,
+            end_minute=last_minute,
+        )
+    )
+    current = next(source, None)
+    pending: list[dict] = []
+    added_rows = 0
+    touched_months: set[str] = set()
+    sessions_repaired = 0
+    sessions_without_trades = 0
+    previous_session_close = None
+
+    def flush_pending() -> None:
+        if not pending:
+            return
+        intraday_repository.upsert_minute_bars(normalized, list(pending))
+        pending.clear()
+
+    for session in sessions:
+        session_open = int(session["open_minute_utc"])
+        session_close = int(session["close_minute_utc"])
+        while current is not None and int(current["minute_utc"]) < session_open:
+            current = next(source, None)
+        stored: dict[int, dict] = {}
+        while current is not None and int(current["minute_utc"]) < session_close:
+            stored[int(current["minute_utc"])] = current
+            current = next(source, None)
+        if not any(not row.get("is_synthetic") for row in stored.values()):
+            sessions_without_trades += 1
+            continue
+
+        last_price = prior_close_by_date.get(
+            str(session["trading_date"]),
+            previous_session_close,
+        )
+        added_this_session = 0
+        for minute in range(session_open, session_close):
+            row = stored.get(minute)
+            if row is not None:
+                last_price = float(row["close"])
+                continue
+            if last_price is None or last_price <= 0:
+                continue
+            pending.append({
+                "minute_utc": minute,
+                "open": last_price,
+                "high": last_price,
+                "low": last_price,
+                "close": last_price,
+                "volume": 0.0,
+                "trade_count": 0,
+                "vwap": last_price,
+                "is_synthetic": True,
+            })
+            added_this_session += 1
+            added_rows += 1
+            touched_months.add(
+                intraday_repository.epoch_minute_to_iso(minute)[:7]
+            )
+            if len(pending) >= 10_000:
+                flush_pending()
+        if added_this_session:
+            sessions_repaired += 1
+        actual_rows = [
+            row for row in stored.values() if not row.get("is_synthetic")
+        ]
+        if actual_rows:
+            previous_session_close = float(actual_rows[-1]["close"])
+    flush_pending()
+    if added_rows:
+        for year_month in sorted(touched_months):
+            intraday_repository.recompute_monthly_fingerprint(
+                normalized,
+                year_month,
+            )
+        intraday_repository.mark_sync_result(normalized, "success")
+    return {
+        "symbol": normalized,
+        "synthetic_rows_added": added_rows,
+        "sessions_repaired": sessions_repaired,
+        "sessions_without_trades": sessions_without_trades,
+        "method": "last_observable_price_zero_volume",
+    }
+
+
 def derive_daily_prices_from_minutes(
     symbol: str,
     *,
@@ -396,6 +561,8 @@ def derive_daily_prices_from_minutes(
         normalized,
         start_minute=start_minute,
     ):
+        if row.get("is_synthetic"):
+            continue
         parts = _regular_session_parts(row)
         if not parts:
             continue

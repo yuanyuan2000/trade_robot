@@ -11,6 +11,7 @@ from services.corporate_action_adjustment_service import adjusted_daily_payload
 from services.alpaca_data_client import fetch_stock_bars, fetch_stock_snapshots
 from services.intraday_bar_service import (
     derive_daily_prices_from_minutes,
+    repair_sparse_regular_session_minutes,
     refresh_alpaca_capability,
 )
 from services.intraday_import_service import import_symbol_history
@@ -398,12 +399,24 @@ def _update_full_market_data_uncoordinated(
         def import_and_derive() -> dict:
             import_result = import_symbol_history(normalized, **import_kwargs)
             emit(
+                stage="repairing_intraday",
+                progress=0.91,
+                current_date=(
+                    str(import_result.get("end") or "")[:10] or None
+                ),
+                message="分钟数据下载完成，正在补齐零成交分钟",
+            )
+            intraday_repair = repair_sparse_regular_session_minutes(
+                normalized,
+                completed_through=import_result.get("end"),
+            )
+            emit(
                 stage="deriving_daily",
                 progress=0.93,
                 current_date=(
                     str(import_result.get("end") or "")[:10] or None
                 ),
-                message="分钟数据下载完成，正在重建日线",
+                message="分钟数据补齐完成，正在重建日线",
             )
             derived = derive_daily_prices_from_minutes(
                 normalized,
@@ -411,6 +424,7 @@ def _update_full_market_data_uncoordinated(
             )
             return {
                 "import_result": import_result,
+                "intraday_repair": intraday_repair,
                 "derived": derived,
             }
 
@@ -420,6 +434,7 @@ def _update_full_market_data_uncoordinated(
             callback=import_and_derive,
         )
         import_result = minute_result["import_result"]
+        intraday_repair = minute_result["intraday_repair"]
         derived = minute_result["derived"]
         native_daily_refresh = None
         if normalized == "BTC/USD":
@@ -461,6 +476,7 @@ def _update_full_market_data_uncoordinated(
             "warning": adjusted["warning"],
             "symbol_settings": settings,
             "intraday_sync": import_result["sync_state"],
+            "intraday_repair": intraday_repair,
             "derived_daily": derived,
             "native_daily_refresh": native_daily_refresh,
             "data": adjusted["rows"],

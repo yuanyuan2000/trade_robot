@@ -97,6 +97,15 @@ def migrate_database(conn: sqlite3.Connection) -> None:
     ensure_column(
         conn, "backtest_equity_points", "gross_leverage", "REAL NOT NULL DEFAULT 0"
     )
+    ensure_column(conn, "backtest_trades", "strategy_position_weight_after", "REAL")
+    ensure_column(conn, "backtest_trades", "position_exposure_after", "REAL")
+    conn.execute(
+        """
+        UPDATE backtest_trades
+        SET position_exposure_after = position_weight_after
+        WHERE position_exposure_after IS NULL
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS symbol_aliases (

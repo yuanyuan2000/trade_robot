@@ -21,6 +21,7 @@ from services.backtest.service import create_default_strategy, update_strategy
 from services.realtime_decision_service import (
     RealtimeDecisionEvaluator,
     _restore_portfolio,
+    _restore_recommendation_state,
     _restore_strategy_state,
     _strategy_state,
 )
@@ -164,6 +165,60 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
 
         self.assertEqual(float(portfolio.configured_symbol_leverage_multipliers["GLD"]), 1)
         self.assertEqual(float(portfolio.symbol_leverage_multipliers["GLD"]), 3)
+
+    def test_early_v2_empty_configured_leverage_layer_is_repaired(self) -> None:
+        state = normalize_recommendation_state({
+            "state_version": 2,
+            "recommended_targets": {},
+            "recommended_exposures": {},
+            "configured_symbol_leverage_multipliers": {},
+            "symbol_leverage_multipliers": {"GLD": 2.0, "SPY": 3.0},
+        })
+
+        self.assertEqual(
+            state["configured_symbol_leverage_multipliers"],
+            {"GLD": 2.0, "SPY": 3.0},
+        )
+        portfolio = Portfolio(
+            100_000,
+            symbol_leverage_multipliers={"GLD": 3.0, "SPY": 3.0},
+        )
+        _restore_portfolio(portfolio, state)
+        portfolio.set_configured_symbol_leverage_multiplier("GLD", 1.0)
+        self.assertEqual(float(portfolio.symbol_leverage_multipliers["GLD"]), 1.0)
+
+    def test_early_v2_partial_configured_leverage_layer_repairs_each_symbol(self) -> None:
+        state = normalize_recommendation_state({
+            "state_version": 2,
+            "configured_symbol_leverage_multipliers": {"GLD": 2.0},
+            "symbol_leverage_multipliers": {"GLD": 2.0, "SPY": 1.7},
+        })
+
+        self.assertEqual(
+            state["configured_symbol_leverage_multipliers"],
+            {"GLD": 2.0, "SPY": 1.7},
+        )
+
+    def test_compounded_early_v2_leverage_is_repaired_before_restore(self) -> None:
+        state = normalize_recommendation_state({
+            "state_version": 2,
+            "configured_symbol_leverage_multipliers": {},
+            "symbol_leverage_multipliers": {"GLD": 243.0},
+        })
+        self.assertEqual(state["configured_symbol_leverage_multipliers"], {"GLD": 10.0})
+        self.assertEqual(state["symbol_leverage_multipliers"], {"GLD": 10.0})
+
+        portfolio = Portfolio(100_000, symbol_leverage_multipliers={"GLD": 1.0})
+        restored = _restore_recommendation_state(portfolio, state, {"GLD": 100.0})
+        self.assertEqual(float(portfolio.symbol_leverage_multipliers["GLD"]), 10.0)
+        self.assertEqual(restored["recommended_exposures"], {})
+
+    def test_compounded_legacy_leverage_is_repaired_before_restore(self) -> None:
+        state = normalize_recommendation_state({
+            "symbol_leverage_multipliers": {"GLD": 243.0},
+        })
+        self.assertEqual(state["configured_symbol_leverage_multipliers"], {"GLD": 10.0})
+        self.assertEqual(state["symbol_leverage_multipliers"], {"GLD": 10.0})
 
     def test_runtime_state_never_overwrites_current_code_strategy_parameters(self) -> None:
         for key, strategy_type in STRATEGY_REGISTRY.items():
@@ -898,7 +953,7 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
                     "symbol": "GLD",
                     "target_weight_percent": 100,
                     "effective_leverage": 2,
-                    "holding_percent": 200,
+                    "target_exposure_percent": 200,
                     "reason": "WTME 买入条件通过",
                 }],
             },
@@ -911,7 +966,7 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
                     "context": {
                         "score": 12.34567,
                         "rank": 1,
-                        "holding_percent": 200,
+                        "exposure_percent": 200,
                         "score_formula": "100 × Rw ÷ Aw",
                     },
                 },
@@ -922,7 +977,7 @@ class RealtimeDecisionSafetyTests(unittest.TestCase):
                     "context": {
                         "score": 8.2,
                         "rank": 2,
-                        "holding_percent": 0,
+                        "exposure_percent": 0,
                         "score_formula": "100 × Rw ÷ Aw",
                     },
                 },

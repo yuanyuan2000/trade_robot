@@ -394,6 +394,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
     @patch.object(service.repository, "get_symbol")
     @patch.object(service.repository, "get_daily_prices")
     @patch.object(service, "derive_daily_prices_from_minutes")
+    @patch.object(service, "repair_sparse_regular_session_minutes")
     @patch.object(service, "import_symbol_history")
     @patch.object(service.intraday_repository, "get_sync_state")
     @patch.object(service, "_ensure_alpaca_capability")
@@ -404,6 +405,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
         capability,
         get_sync_state,
         import_history,
+        repair_minutes,
         derive_daily,
         get_daily_prices,
         _get_symbol,
@@ -423,6 +425,10 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
                 "row_count": 100,
             }
         }
+        repair_minutes.return_value = {
+            "synthetic_rows_added": 12,
+            "sessions_repaired": 1,
+        }
         derive_daily.return_value = {"updated_rows": 10}
         get_daily_prices.return_value = [{"date": "2020-01-02"}]
 
@@ -432,7 +438,7 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
             "_manual_integrity",
             return_value={"complete": True},
         ):
-            service.update_full_market_data(
+            result = service.update_full_market_data(
                 "GLD",
                 initialize_intraday=True,
                 progress_callback=progress_updates.append,
@@ -444,7 +450,9 @@ class MarketDataAlpacaRoutingTests(unittest.TestCase):
             service.FULL_HISTORY_START_DATE,
         )
         self.assertTrue(callable(import_history.call_args.kwargs["progress"]))
+        repair_minutes.assert_called_once_with("GLD", completed_through=None)
         derive_daily.assert_called_once_with("GLD", start_at=None)
+        self.assertEqual(result["intraday_repair"]["synthetic_rows_added"], 12)
         self.assertEqual(progress_updates[0]["stage"], "checking")
         self.assertEqual(progress_updates[-1]["stage"], "completed")
 

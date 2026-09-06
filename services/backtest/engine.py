@@ -177,7 +177,7 @@ class BacktestEngine:
             self.dynamic_leverage_settings["rebalance_on_change"]
         )
         self._last_dynamic_leverages: dict[str, float] = {}
-        self.last_decision_holdings: dict[str, float] = {}
+        self.last_decision_exposures: dict[str, float] = {}
         self.progress_callback = progress_callback
         self.cancellation_check = cancellation_check or (lambda: False)
         self.logging_enabled = bool(self.settings["generate_logs"])
@@ -1127,7 +1127,7 @@ class BacktestEngine:
         intents: list[OrderIntent],
     ) -> None:
         equity = float(self.portfolio.equity(marks))
-        holdings = {
+        exposures = {
             symbol: (
                 float(self.portfolio.quantity(symbol)) * float(marks[symbol]) / equity * 100
                 if equity > 0 and symbol in marks else 0.0
@@ -1138,7 +1138,7 @@ class BacktestEngine:
             leverage = float(self.portfolio.effective_leverage(intent.symbol))
             change = float(intent.value_percent) * leverage
             if intent.sizing_mode.upper() == "TARGET":
-                current = holdings.get(intent.symbol, 0.0)
+                current = exposures.get(intent.symbol, 0.0)
                 current_normalized = current / leverage if leverage > 0 else 0.0
                 requested = float(intent.value_percent)
                 if (
@@ -1148,12 +1148,12 @@ class BacktestEngine:
                     intent.action.upper() == "SELL"
                     and requested < current_normalized - 1e-8
                 ):
-                    holdings[intent.symbol] = change
+                    exposures[intent.symbol] = change
             elif intent.action.upper() == "BUY":
-                holdings[intent.symbol] = holdings.get(intent.symbol, 0.0) + change
+                exposures[intent.symbol] = exposures.get(intent.symbol, 0.0) + change
             else:
-                holdings[intent.symbol] = max(0.0, holdings.get(intent.symbol, 0.0) - change)
-        self.last_decision_holdings = dict(holdings)
+                exposures[intent.symbol] = max(0.0, exposures.get(intent.symbol, 0.0) - change)
+        self.last_decision_exposures = dict(exposures)
         event_time = f"{trading_date} {event}"
         accepted = {
             "COMPETITION_ELIGIBILITY",
@@ -1167,7 +1167,19 @@ class BacktestEngine:
                 continue
             symbol = str(log.get("symbol") or (log.get("context") or {}).get("symbol") or "")
             if symbol:
-                log.setdefault("context", {})["holding_percent"] = holdings.get(symbol, 0.0)
+                context = log.setdefault("context", {})
+                actual_exposure = exposures.get(symbol, 0.0)
+                strategy_target = float(
+                    self.portfolio.strategy_target_weights.get(symbol, Decimal("0"))
+                )
+                calculated_exposure = (
+                    strategy_target
+                    * float(self.portfolio.effective_leverage(symbol))
+                    * 100
+                )
+                context["exposure_percent"] = actual_exposure
+                context["actual_exposure_percent"] = actual_exposure
+                context["calculated_exposure_percent"] = calculated_exposure
 
     def _cash_adjusted_intents(
         self,

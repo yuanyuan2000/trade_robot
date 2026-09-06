@@ -181,7 +181,7 @@ class RealtimeDashboardTests(unittest.TestCase):
         self.assertTrue(rows["SPY"]["is_candidate"])
         self.assertFalse(rows["OUTSIDE"]["is_candidate"])
         self.assertEqual(
-            rows["SPY"]["details"]["holding"]["overall_leverage"],
+            rows["SPY"]["details"]["exposure"]["overall_leverage"],
             run["settings"]["leverage_multiplier"],
         )
 
@@ -345,12 +345,12 @@ class RealtimeDashboardTests(unittest.TestCase):
         payload = build_realtime_dashboard(task["id"], force=True)
         rows = {row["symbol"]: row for row in payload["rows"]}
 
-        self.assertEqual(rows["SPY"]["holding_percent"], 240)
-        self.assertEqual(rows["GLD"]["holding_percent"], 320)
-        self.assertEqual(rows["OUTSIDE"]["holding_percent"], 160)
-        self.assertTrue(all(row["holding_percent"] is not None for row in rows.values()))
+        self.assertEqual(rows["SPY"]["target_exposure_percent"], 240)
+        self.assertEqual(rows["GLD"]["target_exposure_percent"], 320)
+        self.assertEqual(rows["OUTSIDE"]["target_exposure_percent"], 160)
+        self.assertTrue(all(row["target_exposure_percent"] is not None for row in rows.values()))
         self.assertEqual(
-            rows["SPY"]["details"]["holding"]["effective_leverage"],
+            rows["SPY"]["details"]["exposure"]["effective_leverage"],
             3,
         )
 
@@ -394,17 +394,17 @@ class RealtimeDashboardTests(unittest.TestCase):
 
         payload = build_realtime_dashboard(task["id"], force=True)
         for row in payload["rows"]:
-            holding = row["details"]["holding"]
-            self.assertTrue(holding["available"])
-            self.assertTrue(holding["dynamic_leverage_enabled"])
-            self.assertIsNotNone(holding["volatility"])
+            exposure = row["details"]["exposure"]
+            self.assertTrue(exposure["available"])
+            self.assertTrue(exposure["dynamic_leverage_enabled"])
+            self.assertIsNotNone(exposure["volatility"])
             self.assertEqual(
-                row["holding_percent"],
-                holding["target_weight_percent"]
-                * holding["effective_leverage"],
+                row["target_exposure_percent"],
+                exposure["target_weight_percent"]
+                * exposure["effective_leverage"],
             )
-            self.assertLessEqual(holding["symbol_leverage"], 3)
-            self.assertNotEqual(holding["symbol_leverage"], 9)
+            self.assertLessEqual(exposure["symbol_leverage"], 3)
+            self.assertNotEqual(exposure["symbol_leverage"], 9)
 
     def test_wtme_dashboard_keeps_buy_condition_failures_in_candidate_list(self) -> None:
         strategy = next(
@@ -492,11 +492,11 @@ class RealtimeDashboardTests(unittest.TestCase):
         outside = next(row for row in payload["rows"] if row["symbol"] == "OUTSIDE")
 
         self.assertEqual(len(ranked), 2)
-        self.assertAlmostEqual(ranked[0]["holding_percent"], 100 * 2 / 3 * 2 * 2)
-        self.assertAlmostEqual(ranked[1]["holding_percent"], 100 * 1 / 3 * 2 * 2)
-        self.assertAlmostEqual(outside["holding_percent"], ranked[1]["holding_percent"])
+        self.assertAlmostEqual(ranked[0]["target_exposure_percent"], 100 * 2 / 3 * 2 * 2)
+        self.assertAlmostEqual(ranked[1]["target_exposure_percent"], 100 * 1 / 3 * 2 * 2)
+        self.assertAlmostEqual(outside["target_exposure_percent"], ranked[1]["target_exposure_percent"])
         self.assertEqual(
-            ranked[0]["details"]["holding"]["strategy_leverage_multiplier"],
+            ranked[0]["details"]["exposure"]["strategy_leverage_multiplier"],
             2,
         )
 
@@ -521,7 +521,7 @@ class RealtimeDashboardTests(unittest.TestCase):
             )
             payload = build_realtime_dashboard(task["id"], force=True)
             self.assertTrue(all(
-                row["holding_percent"] is not None for row in payload["rows"]
+                row["target_exposure_percent"] is not None for row in payload["rows"]
             ))
             self.assertTrue(all(
                 not column["label"].startswith("策略")
@@ -725,8 +725,8 @@ class RealtimeDashboardTests(unittest.TestCase):
         self.assertIn('`已过滤 ${summary.filtered ?? 0}`', script)
         self.assertNotIn('<small class="realtime-reason">', script)
         self.assertIn('title="${rtEscape(row.reason', script)
-        self.assertIn('["holding_percent", "目标敞口"', script)
-        self.assertIn('rtFormatMetric(row.holding_percent, "percent_value")', script)
+        self.assertIn('["target_exposure_percent", "目标敞口"', script)
+        self.assertIn('rtFormatMetric(row.target_exposure_percent, "percent_value")', script)
         self.assertIn("maximumSignificantDigits: 4", script)
         self.assertNotIn('["status", "策略状态"', script)
         self.assertIn('market-overview-auto-refresh-changed', script)

@@ -212,6 +212,11 @@ class Portfolio:
                 "average_cost": float(position.average_cost),
                 "price": float(price),
                 "market_value": float(market_value),
+                "exposure_weight": (
+                    float(market_value / equity) if equity > ZERO else 0.0
+                ),
+                # Kept for persisted snapshots created before the terminology
+                # split. New consumers use exposure_weight.
                 "weight": float(market_value / equity) if equity > ZERO else 0.0,
                 "strategy_weight": (
                     float(market_value / equity / self.effective_leverage(symbol))
@@ -635,6 +640,12 @@ class Portfolio:
         equity = self.equity(marks)
         mark_price = D(marks[intent.symbol])
         position_value = position.quantity * mark_price
+        exposure_after = float(position_value / equity) if equity > ZERO else 0.0
+        strategy_position_after = (
+            exposure_after / float(self.effective_leverage(intent.symbol))
+            if self.effective_leverage(intent.symbol) > ZERO
+            else 0.0
+        )
         return {
             "event_time": event_time,
             "symbol": intent.symbol,
@@ -649,8 +660,9 @@ class Portfolio:
             "cash_after": float(self.cash),
             "position_quantity_after": float(position.quantity),
             "position_value_after": float(position_value),
-            "position_weight_after": (
-                float(position_value / equity) if equity > ZERO else 0.0
-            ),
+            "strategy_position_weight_after": strategy_position_after,
+            "position_exposure_after": exposure_after,
+            # Legacy persistence field; its value is exposure, not strategy position.
+            "position_weight_after": exposure_after,
             "reason": intent.reason,
         }

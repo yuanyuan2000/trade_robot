@@ -75,6 +75,9 @@ class BacktestRouteTests(unittest.TestCase):
         analysis_script = (
             Path(app_module.app.static_folder) / "js" / "backtest_analysis.js"
         ).read_text(encoding="utf-8")
+        styles = (
+            Path(app_module.app.static_folder) / "css" / "app.css"
+        ).read_text(encoding="utf-8")
 
         self.assertIn('id="backtest-analysis-open"', html)
         self.assertIn('id="backtest-analysis-page"', html)
@@ -94,7 +97,9 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertIn('item.type === "strategy" ? 3.0', analysis_script)
         self.assertIn('data-series-type="${btEscape(item.type)}"', analysis_script)
         self.assertIn("leveragedBenchmarks", analysis_script)
-        self.assertIn("<span>持仓</span><span>评分</span>", analysis_script)
+        self.assertIn("计算敞口/实际敞口", analysis_script)
+        self.assertIn('title="${btEscape(exposureText(row))}"', analysis_script)
+        self.assertIn("minmax(72px, .75fr) minmax(58px, 1.1fr)", styles)
 
     def test_backtest_analysis_routes_forward_range_and_date_parameters(self) -> None:
         snapshot = {"run": {"id": 19}}

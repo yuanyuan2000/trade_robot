@@ -230,6 +230,13 @@ function btaRenderDecision(payload) {
     return;
   }
   if (payload.mode === "competition") {
+    const exposureText = (row) => {
+      const format = (value) => Number(value || 0).toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+      if (payload.show_calculated_and_actual_exposure) {
+        return `${format(row.calculated_exposure_percent)}%/${format(row.actual_exposure_percent)}%`;
+      }
+      return `${format(row.exposure_percent)}%`;
+    };
     const help = payload.formula_help
       ? `<span class="backtest-analysis-help" title="${btEscape(payload.formula_help)}">?</span>` : "";
     const rows = payload.rows.map((row) => {
@@ -237,13 +244,13 @@ function btaRenderDecision(payload) {
       return `<div class="backtest-analysis-table-row">
         <span class="backtest-analysis-cell" title="${btEscape(row.symbol || "—")}">${btEscape(row.symbol || "—")}</span>
         <span class="backtest-analysis-cell ${row.filtered ? "backtest-analysis-filtered" : "backtest-analysis-passed"}" title="${btEscape(status)}">${btEscape(status)}</span>
-        <span class="backtest-analysis-cell">${Number(row.holding_percent || 0).toFixed(2).replace(/\.00$/, "")}%</span>
+        <span class="backtest-analysis-cell" title="${btEscape(exposureText(row))}">${btEscape(exposureText(row))}</span>
         <span class="backtest-analysis-cell">${row.score == null ? "—" : Number(row.score).toFixed(2)}</span>
         <span class="backtest-analysis-cell backtest-analysis-formula" title="${btEscape(row.formula || "—")}">${btEscape(row.formula || "—")}</span>
       </div>`;
     }).join("");
     target.innerHTML = `<div class="backtest-analysis-table">
-      <div class="backtest-analysis-table-row header"><span>标的</span><span>过滤状态</span><span>持仓</span><span>评分</span><span>评分计算公式${help}</span></div>
+      <div class="backtest-analysis-table-row header"><span>标的</span><span>过滤状态</span><span title="${payload.show_calculated_and_actual_exposure ? "计算敞口/实际敞口" : "实际敞口"}">${payload.show_calculated_and_actual_exposure ? "计算敞口/实际敞口" : "实际敞口"}</span><span>评分</span><span>评分计算公式${help}</span></div>
       ${rows}
     </div>`;
     return;

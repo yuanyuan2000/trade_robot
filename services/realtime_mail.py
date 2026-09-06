@@ -267,9 +267,10 @@ def _wtme_score_table(score_logs: list[dict]) -> list[str]:
         context = log.get("context") or {}
         score = context.get("score")
         rank = context.get("rank")
+        exposure = context.get("exposure_percent", context.get("holding_percent", 0))
         lines.append(
             f"| {log.get('symbol') or context.get('symbol') or '—'} "
-            f"| {_format_number(context.get('holding_percent', 0))}% "
+            f"| {_format_number(exposure)}% "
             f"| {_format_number(score) if score is not None else '—'} "
             f"| {int(rank) if rank is not None else '—'} |"
         )
@@ -303,7 +304,7 @@ def _decision_template_text(recommendations: list[dict]) -> str:
     return "\n".join(
         f"{item['action']} {item['symbol']} "
         f"{_format_number(item.get('target_weight_percent', 0))}%，"
-        f"目标敞口 {_format_number(item.get('holding_percent', 0))}%"
+        f"目标敞口 {_format_number(item.get('target_exposure_percent', item.get('holding_percent', 0)))}%"
         for item in recommendations
     )
 
@@ -403,7 +404,7 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
             for item in recommendations[:12]:
                 lines.append(
                     f"- {item['action']} {item['symbol']}，目标仓位 {item['target_weight_percent']:.2f}%，"
-                    f"目标敞口 {item.get('holding_percent', 0):.2f}%；{item['reason']}"
+                    f"目标敞口 {item.get('target_exposure_percent', item.get('holding_percent', 0)):.2f}%；{item['reason']}"
                 )
         else:
             lines.append("- 没有模型目标触发风险退出。")
@@ -433,18 +434,18 @@ def render_message(task: dict, result: dict) -> tuple[str, str]:
             for item in recommendations[:12]:
                 lines.append(
                     f"- {item['action']} {item['symbol']}，目标仓位 {item['target_weight_percent']:.2f}%，"
-                    f"目标敞口 {item.get('holding_percent', 0):.2f}%，"
+                    f"目标敞口 {item.get('target_exposure_percent', item.get('holding_percent', 0)):.2f}%，"
                     f"有效杠杆 {item['effective_leverage']:.2f}×；{item['reason']}"
                 )
         else:
-            lines.append("- 目标持仓未变化，无需调仓。")
+            lines.append("- 目标仓位与敞口未变化，无需调仓。")
     else:
         lines.extend(["", "建议："])
         if recommendations:
             for item in recommendations[:12]:
                 lines.append(
                     f"- {item['action']} {item['symbol']}，目标仓位 {item['target_weight_percent']:.2f}%，"
-                    f"目标敞口 {item.get('holding_percent', 0):.2f}%，"
+                    f"目标敞口 {item.get('target_exposure_percent', item.get('holding_percent', 0)):.2f}%，"
                     f"有效杠杆 {item['effective_leverage']:.2f}×；{item['reason']}"
                 )
         else:

@@ -329,7 +329,7 @@ function renderRealtimeDashboardTable() {
     ["symbol", "标的", "展示行情总览中的全部标的；蓝点表示属于当前任务候选池。"],
     ["status", "状态", "仅代表当前价下的面板观察结果，不等同于正式邮件决策。"],
     ["latest_price", "最新价格", "直接读取行情总览内部数据库。"],
-    ["holding_percent", "目标敞口", "若此刻入选，按策略目标权重、整体杠杆、单标的杠杆及策略附加杠杆计算的模型目标敞口；不代表实际账户持仓。"],
+    ["target_exposure_percent", "目标敞口", "若此刻入选，按策略目标仓位、整体杠杆、单标的杠杆及策略附加杠杆计算的模型目标敞口；仓位最高为100%，敞口可因杠杆超过100%。"],
     ...columns.map((column) => [column.key, column.label, column.help]),
     ["rank", "面板排名", "只在行情总览展示范围内排名，不改变正式任务目标。"],
     ["price_updated_at", "更新时间", "内部数据库中该价格的更新时间。"],
@@ -340,7 +340,7 @@ function renderRealtimeDashboardTable() {
       <td><span class="realtime-symbol-cell">${row.is_candidate ? '<i class="realtime-candidate-dot" title="属于当前任务候选池" aria-label="属于当前任务候选池"></i>' : '<i class="realtime-candidate-dot is-empty" aria-hidden="true"></i>'}<button class="realtime-symbol-link" type="button" data-rt-open-symbol="${rtEscape(row.symbol)}" title="查看 ${rtEscape(row.display_symbol || row.symbol)} K线详情"><strong>${rtEscape(row.display_symbol || row.symbol)}</strong>${row.name && row.name !== row.display_symbol ? `<small>${rtEscape(row.name)}</small>` : ""}</button></span></td>
       <td><span class="realtime-status-pill realtime-status-${row.status === "通过" ? "ok" : row.status === "不可计算" ? "na" : row.status === "观察" ? "watch" : "filter"}" title="${rtEscape(row.reason && row.reason !== "—" ? row.reason : row.status)}" aria-label="${rtEscape(row.reason && row.reason !== "—" ? `${row.status}：${row.reason}` : row.status)}">${rtEscape(row.status)}</span></td>
       <td>${rtFormatMetric(row.latest_price, "price")}</td>
-      <td><strong>${rtFormatMetric(row.holding_percent, "percent_value")}</strong></td>
+      <td><strong>${rtFormatMetric(row.target_exposure_percent, "percent_value")}</strong></td>
       ${columns.map((column) => `<td>${rtFormatMetric(row.metrics?.[column.key], column.format)}</td>`).join("")}
       <td>${row.rank ? `<strong>#${row.rank}</strong>${row.selected_for_target ? '<span class="realtime-target-badge">面板目标</span>' : ""}` : "—"}</td>
       <td><span class="realtime-updated-at">${rtEscape(rtDate(row.price_updated_at || row.data_date))}</span></td>

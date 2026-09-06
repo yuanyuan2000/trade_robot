@@ -1,7 +1,7 @@
 {公式名称：WTMENOWRANK}
 {公式类型：技术指标公式 / 副图；只在日线周期使用}
 {便捷动态流程：在“WTME池”中按当前急跌状态和 WTME 排名}
-{WTMES 的第 6 个输出 SORTV 对过滤标的返回 -999}
+{WTMES 的第 6 个输出 SORTV 对过滤标的返回 -100}
 
 IRANK:=INSORT('WTME池','WTMES',6,0);
 RANK:IF(INBLOCK('WTME池') AND WTMES.ELIG=1,IRANK,DRAWNULL),COLORYELLOW,LINETHICK2;

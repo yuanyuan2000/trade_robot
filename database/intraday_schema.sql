@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS minute_bars (
     volume REAL NOT NULL DEFAULT 0,
     trade_count INTEGER,
     vwap_scaled INTEGER,
+    is_synthetic INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (instrument_id, minute_utc),
     FOREIGN KEY (instrument_id) REFERENCES intraday_instruments(id)
 ) WITHOUT ROWID;

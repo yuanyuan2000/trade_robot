@@ -1141,15 +1141,18 @@ function renderBacktestChart() {
     const holdings = positionEntries.length
       ? positionEntries.map(([symbol, position]) => {
         const marketValue = Number(position.market_value || 0);
-        const weight = Number(point.equity) ? marketValue / Number(point.equity) : 0;
-        return `${symbol} ${btPercent(weight)}`;
+        const exposure = Number(position.exposure_weight ?? position.weight ?? (
+          Number(point.equity) ? marketValue / Number(point.equity) : 0
+        ));
+        const strategyPosition = Number(position.strategy_weight ?? exposure);
+        return `${symbol} 仓位 ${btPercent(strategyPosition)} / 敞口 ${btPercent(exposure)}`;
       }).join(" · ")
       : "空仓";
     const lines = [
       point.trading_date,
       `权益 ${btMoney(point.equity)} · 现金 ${btMoney(point.cash)}`,
       `收益率 ${btPercent(point.return_rate)}`,
-      `持仓 ${holdings}`,
+      `持有标的 ${holdings}`,
     ];
     context.font = "12px system-ui";
     const boxWidth = Math.min(

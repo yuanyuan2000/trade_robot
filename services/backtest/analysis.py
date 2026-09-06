@@ -457,6 +457,15 @@ def build_decision(snapshot: dict, trading_date: str) -> dict:
         raise BacktestValidationError("决策日期不在已完成回测区间内。")
     run = snapshot["run"]
     strategy = run.get("strategy_snapshot", {})
+    definition = strategy.get("definition", {})
+    dynamic_without_rebalance = bool(
+        definition.get("dynamic_leverage_enabled")
+        and not (
+            run.get("settings", {})
+            .get("dynamic_leverage", {})
+            .get("rebalance_on_change", True)
+        )
+    )
     logs = [log for log in snapshot.get("logs", []) if _iso(log.get("event_time")) == target_date]
     trades = [trade for trade in snapshot.get("trades", []) if _iso(trade.get("event_time")) == target_date]
     if strategy.get("design_mode") == "code":
@@ -478,13 +487,30 @@ def build_decision(snapshot: dict, trading_date: str) -> dict:
                 "symbol": context.get("symbol") or context.get("etf") or log.get("symbol"),
                 "filtered": not bool(context.get("eligible", not reasons)),
                 "filter_reasons": reasons,
-                "holding_percent": context.get("holding_percent", 0.0),
+                "exposure_percent": context.get(
+                    "exposure_percent", context.get("holding_percent", 0.0)
+                ),
+                "actual_exposure_percent": context.get(
+                    "actual_exposure_percent",
+                    context.get("actual_holding_percent", context.get("holding_percent", 0.0)),
+                ),
+                "calculated_exposure_percent": context.get(
+                    "calculated_exposure_percent",
+                    context.get("calculated_holding_percent", context.get("holding_percent", 0.0)),
+                ),
                 "score": context.get("score"),
                 "formula": formula,
                 "rank": context.get("rank"),
             })
         rows.sort(key=lambda item: (item["score"] is None, -(float(item["score"]) if item["score"] is not None else 0), str(item["symbol"])))
-        return {"date": target_date, "mode": "competition", "rows": rows, "formula_help": help_text, "trades": trades}
+        return {
+            "date": target_date,
+            "mode": "competition",
+            "rows": rows,
+            "formula_help": help_text,
+            "trades": trades,
+            "show_calculated_and_actual_exposure": dynamic_without_rebalance,
+        }
 
     if strategy.get("selection_mode") == "competition":
         by_symbol: dict[str, dict] = {}
@@ -496,14 +522,35 @@ def build_decision(snapshot: dict, trading_date: str) -> dict:
                 "symbol": symbol,
                 "filtered": False,
                 "filter_reasons": [],
-                "holding_percent": 0.0,
+                "exposure_percent": 0.0,
+                "actual_exposure_percent": 0.0,
+                "calculated_exposure_percent": 0.0,
                 "score": None,
                 "formula": "—",
                 "rank": None,
             })
             context = log.get("context") or {}
-            if context.get("holding_percent") is not None:
-                row["holding_percent"] = context.get("holding_percent")
+            legacy_exposure = context.get("holding_percent")
+            if context.get("exposure_percent") is not None:
+                row["exposure_percent"] = context.get("exposure_percent")
+            elif legacy_exposure is not None:
+                row["exposure_percent"] = legacy_exposure
+            if context.get("actual_exposure_percent") is not None:
+                row["actual_exposure_percent"] = context.get(
+                    "actual_exposure_percent"
+                )
+            elif context.get("actual_holding_percent") is not None:
+                row["actual_exposure_percent"] = context.get("actual_holding_percent")
+            elif legacy_exposure is not None:
+                row["actual_exposure_percent"] = legacy_exposure
+            if context.get("calculated_exposure_percent") is not None:
+                row["calculated_exposure_percent"] = context.get(
+                    "calculated_exposure_percent"
+                )
+            elif context.get("calculated_holding_percent") is not None:
+                row["calculated_exposure_percent"] = context.get("calculated_holding_percent")
+            elif legacy_exposure is not None:
+                row["calculated_exposure_percent"] = legacy_exposure
             if log.get("event_type") == "COMPETITION_ELIGIBILITY":
                 if not context.get("matched"):
                     row["filtered"] = True
@@ -516,7 +563,14 @@ def build_decision(snapshot: dict, trading_date: str) -> dict:
                     row["filter_reasons"] = ["低于最低可入选评分"]
         rows = list(by_symbol.values())
         rows.sort(key=lambda item: (item["score"] is None, -(float(item["score"]) if item["score"] is not None else 0), item["symbol"]))
-        return {"date": target_date, "mode": "competition", "rows": rows, "formula_help": "评分公式中的变量和指标均为该决策时点的实际值。", "trades": trades}
+        return {
+            "date": target_date,
+            "mode": "competition",
+            "rows": rows,
+            "formula_help": "评分公式中的变量和指标均为该决策时点的实际值。",
+            "trades": trades,
+            "show_calculated_and_actual_exposure": dynamic_without_rebalance,
+        }
 
     rule_map = {
         rule.get("id"): rule

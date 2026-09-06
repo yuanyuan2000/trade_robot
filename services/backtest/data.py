@@ -1495,6 +1495,7 @@ def load_historical_dataset(
                     "volume",
                     "trade_count",
                     "vwap",
+                    "is_synthetic",
                 )
             }
             for _, row in sorted(minute.get(symbol, {}).items())

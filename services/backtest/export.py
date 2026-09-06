@@ -124,7 +124,7 @@ def _trade_rows(trades: list[dict], logs: list[dict]) -> tuple[list[str], list[l
         "序号", "日志等级", "日志类型", "时间", "交易日期", "标的", "操作",
         "数量", "参考点位", "成交点位", "成交金额", "手续费", "滑点成本",
         "已实现PnL", "成交后现金", "成交后持仓数量", "成交后持仓市值",
-        "成交后仓位", "交易原因", "日志消息",
+        "成交后策略仓位", "成交后敞口", "交易原因", "日志消息",
     ]
     rows = []
     for index, trade in enumerate(trades, start=1):
@@ -141,7 +141,9 @@ def _trade_rows(trades: list[dict], logs: list[dict]) -> tuple[list[str], list[l
                 trade.get("commission"), trade.get("slippage_amount"),
                 trade.get("realized_pnl") if trade.get("side") == "SELL" else None,
                 trade.get("cash_after"), trade.get("position_quantity_after"),
-                trade.get("position_value_after"), trade.get("position_weight_after"),
+                trade.get("position_value_after"),
+                trade.get("strategy_position_weight_after"),
+                trade.get("position_exposure_after", trade.get("position_weight_after")),
                 trade.get("reason"), log.get("message"),
             ]
         )
@@ -447,7 +449,7 @@ def build_run_xls(run_id: int) -> bytes:
             "成交金额", "手续费", "滑点成本", "已实现PnL", "成交后现金",
             "成交后持仓市值",
         },
-        percent_columns={"成交后仓位"},
+        percent_columns={"成交后策略仓位", "成交后敞口"},
     )
 
     pnl_headers, pnl_rows = _symbol_pnl_rows(run, trades)

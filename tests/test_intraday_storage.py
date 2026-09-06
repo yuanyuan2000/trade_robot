@@ -8,6 +8,7 @@ from unittest.mock import patch
 import database.db as main_db
 import database.intraday_db as intraday_db
 import database.intraday_repository as repository
+import services.intraday_bar_service as bar_service
 
 
 class IntradayStorageTests(unittest.TestCase):
@@ -53,6 +54,119 @@ class IntradayStorageTests(unittest.TestCase):
         self.assertEqual(rows[0]["timestamp"], "2020-01-02T14:30:00Z")
         self.assertEqual(state["row_count"], 1)
         self.assertEqual(state["status"], "success")
+
+    def test_sparse_session_repair_supports_signal_and_simulated_execution(self) -> None:
+        session_open = repository.iso_to_epoch_minute("2024-01-03T14:30:00Z")
+        session_close = session_open + 390
+        first_trade = session_open + 92
+        later_trade = session_open + 110
+        repository.upsert_minute_bars(
+            "MAGS",
+            [
+                {
+                    "minute_utc": first_trade,
+                    "open": 25,
+                    "high": 25,
+                    "low": 25,
+                    "close": 25,
+                    "volume": 100,
+                },
+                {
+                    "minute_utc": later_trade,
+                    "open": 26,
+                    "high": 26,
+                    "low": 26,
+                    "close": 26,
+                    "volume": 200,
+                },
+            ],
+        )
+        repository.mark_sync_result("MAGS", "success")
+        sessions = [{
+            "trading_date": "2024-01-03",
+            "open_minute_utc": session_open,
+            "close_minute_utc": session_close,
+            "is_early_close": False,
+        }]
+        daily = [{
+            "date": "2024-01-02", "open": 24, "high": 24,
+            "low": 24, "close": 24, "volume": 1,
+        }]
+
+        with (
+            patch(
+                "services.backtest.market_calendar.ensure_market_sessions",
+                return_value=sessions,
+            ),
+            patch.object(bar_service.repository, "get_daily_prices", return_value=daily),
+        ):
+            repaired = bar_service.repair_sparse_regular_session_minutes(
+                "MAGS",
+                completed_through="2024-01-04T00:00:00Z",
+            )
+
+        self.assertEqual(repaired["synthetic_rows_added"], 388)
+        leading = repository.get_minute_bars_at("MAGS", [session_open])[session_open]
+        self.assertTrue(leading["is_synthetic"])
+        self.assertEqual(leading["close"], 24)
+        resolved = repository.resolve_minute_event_gaps(
+            "MAGS",
+            [{
+                "target_minute": session_open + 20,
+                "open_minute": session_open,
+                "close_minute": session_close,
+            }],
+        )[session_open + 20]
+        self.assertEqual(resolved["signal_minute"], session_open + 19)
+        self.assertEqual(resolved["fill_minute"], session_open + 20)
+
+        with (
+            patch(
+                "services.backtest.market_calendar.ensure_market_sessions",
+                return_value=sessions,
+            ),
+            patch.object(bar_service.repository, "get_daily_prices", return_value=daily),
+        ):
+            repeated = bar_service.repair_sparse_regular_session_minutes(
+                "MAGS",
+                completed_through="2024-01-04T00:00:00Z",
+            )
+        self.assertEqual(repeated["synthetic_rows_added"], 0)
+
+    @patch.object(bar_service.repository, "upsert_daily_prices")
+    @patch.object(bar_service.intraday_repository, "iter_minute_bars")
+    def test_daily_derivation_ignores_synthetic_minutes(
+        self,
+        iter_rows,
+        upsert_daily,
+    ) -> None:
+        synthetic = {
+            "minute_utc": repository.iso_to_epoch_minute("2024-01-03T14:30:00Z"),
+            "open": 90,
+            "high": 90,
+            "low": 90,
+            "close": 90,
+            "volume": 0,
+            "is_synthetic": True,
+        }
+        actual = {
+            "minute_utc": repository.iso_to_epoch_minute("2024-01-03T16:00:00Z"),
+            "open": 100,
+            "high": 101,
+            "low": 99,
+            "close": 100,
+            "volume": 10,
+            "is_synthetic": False,
+        }
+        iter_rows.return_value = iter([synthetic, actual])
+        upsert_daily.return_value = 1
+
+        bar_service.derive_daily_prices_from_minutes("MAGS")
+
+        row = upsert_daily.call_args.args[1][0]
+        self.assertEqual(row["open"], 100)
+        self.assertEqual(row["low"], 99)
+        self.assertEqual(row["volume"], 10)
 
     def test_daily_and_minute_history_starts_are_separate(self) -> None:
         instrument = repository.get_instrument("BTC/USD")

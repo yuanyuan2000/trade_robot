@@ -104,9 +104,11 @@ E_t = (1-d)X_t + dE_(t-1)
 | `WTMENOWRANK.txt` | PC | 技术指标 | 在本地“WTME池”显示当前动态名次 |
 | `WTMETOPN.txt` | PC | 条件选股 | 用 `Ctrl+T` 从本地“WTME池”选当前前 `TOPN` 名 |
 | `WTMEAPPXG.txt` | PC/APP | 条件选股 | 自包含的纯急跌过滤模板；入口候选宇宙包含目标证券时才有效 |
-| `WTMEAPPSORT.txt` | PC/APP | 技术指标 | 只有一个 `SORTV` 输出的跨证券辅助指标 |
+| `WTMEAPPSORT.txt` | PC/APP | 技术指标 | 固定当前实际策略参数，输出过滤分数、原始分数、资格和动态杠杆 |
 | `WTMEPOOLDASH.txt` | PC | 技术指标 | 用 `CALCSTOCKINDEX` 读取固定五标的并显示分数和最高者 |
 | `WTMEPOOLDASHM.txt` | APP | 技术指标 | 用 `$` 读取固定五标的，在副图内降序显示合格名称与评分 |
+| `WTMEPOOLUS.txt` | PC | 技术指标 | 参照 A 股 PC 看板读取 `WTMEAPPSORT`，两列显示九只美股 |
+| `WTMEPOOLUSM.txt` | APP | 技术指标 | 参照 A 股移动端看板用 `$` 引用，两列显示九只美股 |
 | `validate_formula_parity.py` | 开发验证 | Python | 对照项目实现验证有限 DMA、盘中 WTME 和急跌结果 |
 
 ## 6. `WTMES` 输出接口
@@ -120,9 +122,9 @@ E_t = (1-d)X_t + dE_(t-1)
 | 3 | `AW` | 加权标准化真实波幅 |
 | 4 | `RDROP` | 是否命中急跌 |
 | 5 | `ELIG` | 历史足够且未急跌 |
-| 6 | `SORTV` | 合格时为评分，否则为 `-999` |
+| 6 | `SORTV` | 合格时为评分，否则为 `-100` |
 
-`-999` 位于 WTME 正常范围外，用来确保过滤项排在所有真实评分之后。真实负分仍然是合法评分，不能误当成不合格。
+`-100` 用作过滤或历史不足的哨兵值。真实负分仍然是合法评分，不能用 `0` 代替哨兵。
 
 ## 7. PC 使用流程
 
@@ -144,8 +146,8 @@ SZ159915  创业板ETF
 
 ## 8. APP 使用流程
 
-1. 在指标平台创建并上传 `WTMEAPPSORT`，参数缺省值设为 `13 / 6 / 5 / 5`。
-2. 确认它在单个证券日 K 上能计算 `SORTV`。
+1. 在指标平台创建并上传 `WTMEAPPSORT`。参数已在公式内固定为当前实际配置，无须另设参数表。
+2. 确认它在单个证券日 K 上能计算 `WTMEV` 和 `DLEV`。
 3. 创建并上传 `WTMEPOOLDASHM`，不设置参数。
 4. 在任意日 K 副图加载 `WTMEPOOLDASHM`。
 5. 看板通过下列语法直接读取固定证券：
@@ -159,9 +161,35 @@ SH518880$WTMEAPPSORT.SORTV
 
 这一方案是为绕过 APP 指标选股入口对部分 LOF 的预先剔除。它不依赖 APP 把两只 LOF 放入条件选股候选宇宙。
 
+### 美股固定池
+
+美股跨证券引用不能写裸代码，也不能沿用沪市前缀；通达信的美股市场号为 `74`。实机复核发现
+部分 PC 版本的 `$自定义指标.命名输出` 能通过编译，但运行时会把九只美股全部读成无效值；
+直接跨标的读取 `CLOSE/HIGH/LOW` 又可能成为常量序列，表现为 WTME 全为 0、XLE 误选且敞口
+500%。PC 最终不增加辅助公式，而是完全参照已成功的 A 股 PC 看板：
+
+```text
+WTME:=CALCSTOCKINDEX('74_GLD','WTMEAPPSORT',1);
+```
+
+第一个输出 `SORTV` 已包含历史和急跌过滤，并用 `ISVALID` 做与 A 股 PC 版相同的检查。
+动态杠杆第 4 输出单独容错；无效时只令敞口为 0。历史不足使用 `-100` 哨兵。
+
+`WTMEPOOLUS` 和 `WTMEPOOLUSM` 均包含 DRAM、FXI、GLD、IBIT、QQQ、SLV、SOXX、SPY、XLE。该集合对应当前
+WTME 策略的美股标的，BTC/USD 以 IBIT 替代，US10Y 明确省略。使用步骤为：
+
+1. 先下载九只美股的日线历史；
+2. 创建或更新 `WTMEAPPSORT`，不设置参数，并在 GLD 日线确认 `SORTV` 正常；
+3. PC 创建 `WTMEPOOLUS`；APP 创建 `WTMEPOOLUSM`，均设为日线副图；
+4. 两版按急跌过滤后的 WTME 全局降序，第 1—5 名显示在左列，第 6—9 名显示在右列；
+5. 第一名且评分大于 -15 时显示黄色建议；若全部无值，检查辅助指标名称、周期和行情权限。
+
+跨证券计算依赖本地已有的对应周期行情；看板本身不会替用户下载美股数据。
+
 ## 9. 修改固定池
 
-PC 修改 `WTMEPOOLDASH` 中五条 `CALCSTOCKINDEX`；APP 修改 `WTMEPOOLDASHM` 中五条 `$` 引用。与此同时还要同步：
+PC 修改 `WTMEPOOLDASH` 或 `WTMEPOOLUS` 中的 `CALCSTOCKINDEX`；APP 修改
+`WTMEPOOLDASHM` 或 `WTMEPOOLUSM` 中的 `$` 引用。与此同时还要同步：
 
 - 变量名称与显示名称；
 - 排名比较式；
@@ -188,3 +216,5 @@ python other_platform/TDX/validate_formula_parity.py
 - APP 不支持本次 PC 公式使用的 `CALCSTOCKINDEX / ISVALID`，因此保留独立手机版。
 - APP 条件选股入口可能在公式执行前排除某些 LOF；固定池看板是最终可用方案。
 
+语法依据见[通达信官方函数列表](https://help.tdx.com.cn/gspt/docs/markdown/redword/functionlist.html)
+和[官方市场枚举](https://help.tdx.com.cn/quant/docs/markdown/Dict.html)；后者将美股市场列为 `74`。

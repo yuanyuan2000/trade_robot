@@ -363,7 +363,7 @@ def _visual_buy_profile(strategy: dict, row: dict) -> tuple[float, str]:
     return float(rule.get("value", 0)), str(rule.get("when") or "OPEN")
 
 
-def _attach_hypothetical_holdings(
+def _attach_hypothetical_exposures(
     *,
     rows: list[dict],
     target_rows: list[dict],
@@ -428,8 +428,8 @@ def _attach_hypothetical_holdings(
                 if price is not None else None
             )
             if volatility is None:
-                row["holding_percent"] = None
-                row["details"].setdefault("holding", {
+                row["target_exposure_percent"] = None
+                row["details"].setdefault("exposure", {
                     "available": False,
                     "reason": f"数据不足，无法计算 VOLAT({int(dynamic['volatility_period'])})",
                 })
@@ -443,15 +443,15 @@ def _attach_hypothetical_holdings(
             symbol_leverage = float(dynamic_calculation["leverage"])
 
         effective_leverage = overall_leverage * symbol_leverage * strategy_leverage
-        row["holding_percent"] = target_weight * effective_leverage
-        row["details"]["holding"] = {
+        row["target_exposure_percent"] = target_weight * effective_leverage
+        row["details"]["exposure"] = {
             "available": True,
             "target_weight_percent": target_weight,
             "overall_leverage": overall_leverage,
             "symbol_leverage": symbol_leverage,
             "strategy_leverage_multiplier": strategy_leverage,
             "effective_leverage": effective_leverage,
-            "holding_percent": row["holding_percent"],
+            "target_exposure_percent": row["target_exposure_percent"],
             "dynamic_leverage_enabled": dynamic_enabled,
             "volatility": volatility,
             "dynamic_calculation": dynamic_calculation,
@@ -614,11 +614,18 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
     }
     rows: list[dict] = []
     for symbol, item in overview_by_symbol.items():
+        decision_price = event_prices.get(symbol)
         row = {
             "symbol": symbol,
             "display_symbol": item.get("display_symbol") or symbol,
             "name": item.get("name"),
-            "latest_price": _finite(item.get("latest_price")),
+            # Keep the displayed observation identical to the price actually
+            # consumed by the strategy. The overview can contain a row on a
+            # market holiday, which is excluded from the strategy series.
+            "latest_price": _finite(
+                decision_price.signal_price
+                if decision_price is not None else item.get("latest_price")
+            ),
             "price_updated_at": item.get("latest_price_updated_at"),
             "price_is_provisional": item.get("latest_price_is_provisional"),
             "price_source": item.get("latest_price_source"),
@@ -633,7 +640,7 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
             "details": {},
             "rank": None,
             "selected_for_target": False,
-            "holding_percent": None,
+            "target_exposure_percent": None,
         }
         if symbol not in event_prices:
             rows.append(row)
@@ -762,7 +769,7 @@ def build_realtime_dashboard(task_id: int, *, force: bool = False) -> dict:
         ]
     for row in target_rows:
         row["selected_for_target"] = True
-    _attach_hypothetical_holdings(
+    _attach_hypothetical_exposures(
         rows=rows,
         target_rows=target_rows,
         strategy=strategy,

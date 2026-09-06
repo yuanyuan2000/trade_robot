@@ -773,9 +773,10 @@ def replace_run_output(
                 reference_price, fill_price, gross_amount, commission,
                 slippage_amount, realized_pnl, cash_after,
                 position_quantity_after, position_value_after,
+                strategy_position_weight_after, position_exposure_after,
                 position_weight_after, reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -794,7 +795,9 @@ def replace_run_output(
                     trade["cash_after"],
                     trade["position_quantity_after"],
                     trade["position_value_after"],
-                    trade["position_weight_after"],
+                    trade.get("strategy_position_weight_after"),
+                    trade.get("position_exposure_after", trade.get("position_weight_after", 0)),
+                    trade.get("position_weight_after", trade.get("position_exposure_after", 0)),
                     trade.get("reason"),
                 )
                 for index, trade in enumerate(trades)
